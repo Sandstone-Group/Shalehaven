@@ -1,15 +1,26 @@
 ## Shalehaven Main Scripts
 ## Developed by Michael Tanner
 
+# Imports - SHEM Scripts
 import shalehavenscripts.production as production
+import shalehavenscripts.combocurve as combocurve
 
+# Imports - General
 import pandas as pd
 import numpy as np
+import os
+from dotenv import load_dotenv
 
-pathProduction = r"C:\Users\Michael Tanner\OneDrive - Sandstone Group\Clients - Documents\# Shalehaven Partners\# A&D\Wolfcamp A - Pecos County MBX Operating\Data\mbx drill baby drill E_W orentation-20250826161203344-production.csv"
-pathHeader = r"C:\Users\Michael Tanner\OneDrive - Sandstone Group\Clients - Documents\# Shalehaven Partners\# A&D\Wolfcamp A - Pecos County MBX Operating\Data\mbx drill baby drill E_W orentation-20250826161203344-header.csv"
+print("Begin Shalehaven ETL Process")
 
-dataOil = pd.read_csv(pathProduction)
-dataHeader = pd.read_csv(pathHeader)
+load_dotenv()  # load enviroment variables
 
-twelveMonthOilPerFt = production.tweleveMonthOilPerFt(dataOil,dataHeader)
+# Paths to data
+pathToAdmiralData = os.getenv("SHALEHAVEN_ADMIRAL_PATH")
+pathToHuntData = os.getenv("SHALEHAVEN_HUNT_PATH")
+
+# Get & Format Production Data
+admiralPermianProductionData = production.admiralPermianProductionData(pathToAdmiralData)
+huntOilProductionData = production.huntOilProductionData(pathToHuntData)
+
+x = 5
