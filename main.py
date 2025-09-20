@@ -10,6 +10,8 @@ import pandas as pd
 import numpy as np
 import os
 from dotenv import load_dotenv
+sandstoneComboCurveServiceAccount = os.getenv("SANDSTONE_COMBOCURVE_API_SEC_CODE")
+sandstoneComboCurveApiKey = os.getenv("SANDSTONE_COMBOCURVE_API_KEY_PASS")
 
 print("Begin Shalehaven ETL Process")
 
@@ -19,8 +21,13 @@ load_dotenv()  # load enviroment variables
 pathToAdmiralData = os.getenv("SHALEHAVEN_ADMIRAL_PATH")
 pathToHuntData = os.getenv("SHALEHAVEN_HUNT_PATH")
 
+# Get Wells From ComboCurve
+wells = combocurve.getWellsFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
+huntWells = wells[wells['currentOperator'] == 'HUNT OIL COMPANY']
+admiralWells = wells[wells['currentOperator'] == 'ADMIRAL PERMIAN OPERATING LLC']
+
 # Get & Format Production Data
 admiralPermianProductionData = production.admiralPermianProductionData(pathToAdmiralData)
-huntOilProductionData = production.huntOilProductionData(pathToHuntData)
+huntOilProductionData = production.huntOilProductionData(pathToHuntData,huntWells)
 
 x = 5

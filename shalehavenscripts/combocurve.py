@@ -4,7 +4,7 @@ import requests as requests
 import json
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from combocurve_api_v1 import ComboCurveAuth
+from combocurve_api_v1 import ComboCurveAuth, ServiceAccount
 
 """
 
@@ -92,3 +92,38 @@ def putJoynWellProductionData(data, serviceAccount, comboCurveApi, daysToLookbac
     )
 
     return text
+
+def getWellsFromComboCurve(serviceAccount, comboCurveApi):
+    
+    load_dotenv()  # load enviroment variables
+    
+    print("Start get wells from ComboCurve")
+
+    # connect to service account
+    service_account = ServiceAccount.from_file(serviceAccount)
+    # set API Key from enviroment variable
+    api_key = comboCurveApi
+    # specific Python ComboCurve authentication
+    combocurve_auth = ComboCurveAuth(service_account, api_key)
+
+    url = "https://api.combocurve.com/v1/wells?take=200"
+    auth_headers = combocurve_auth.get_auth_headers()  # authenticates ComboCurve
+
+    response = requests.get(url, headers=auth_headers)
+
+    responseCode = response.status_code  # sets response code to the current state
+    responseText = response.text  # sets response text to the current state
+    
+    if responseCode != 200:
+        print("Error: Unable to fetch wells from ComboCurve")
+    else:
+        print("Successfully fetched wells from ComboCurve")
+
+    wellsData = json.loads(responseText)
+    
+    wellsDataDf = pd.DataFrame(wellsData)
+    
+    # drop wells not in company "Shalehaven Asset Management"
+    wellsDataDf = wellsDataDf[wellsDataDf["customString0"] == "Shalehaven Asset Management"]
+    
+    return wellsDataDf

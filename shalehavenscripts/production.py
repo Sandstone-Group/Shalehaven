@@ -45,15 +45,29 @@ def admiralPermianProductionData(pathToData):
     
     return data
 
-def huntOilProductionData(pathToData):
+def huntOilProductionData(pathToData, huntWells):
     
     load_dotenv()  # load enviroment variables
+    
+    #drop all columns from huntWells except for 'wellName' and 'chosenID'
+    huntWells = huntWells[['wellName','chosenID']]
     
     # Update path to include the last file in the directory based on time modified
     pathToData = max([os.path.join(pathToData, f) for f in os.listdir(pathToData)], key=os.path.getmtime)
     
-    data = pd.read_excel(pathToData)    
+    # read in excel data
+    data = pd.read_excel(pathToData)
     
-    x = 5
+    # put chosenID from huntWells into data based on wellName
+    for i in range(len(huntWells)):
+        huntWellData = huntWells[huntWells["chosenID"]].copy()
+        wellName = huntWellData.iloc[i]['wellName']
+        chosenId = huntWellData.iloc[i]['chosenID']
+        for j in range(len(data)):
+            dataWellName = data.iloc[j]['LEASE']
+            if dataWellName == wellName:
+                data.loc[j, 'API'] = chosenId
+    
+    data = data[['D_DATE', 'API', 'OIL_BBLS', 'GAS_MCF', 'WATER_BBLS']]
     
     return data
