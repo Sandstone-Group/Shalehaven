@@ -133,3 +133,67 @@ def getWellsFromComboCurve(serviceAccount, comboCurveApi):
     wellsDataDf = wellsDataDf[wellsDataDf["customString0"] == "Shalehaven Asset Management"]
     
     return wellsDataDf
+
+"""
+
+    Getting Daily Productions from ComboCurve for Shalehaven - production-ready    
+    
+"""
+
+def getDailyProductionsFromComboCurve(serviceAccount, comboCurveApi, wellList):
+    
+    load_dotenv()  # load enviroment variables
+    
+    print("Getting Daily Productions from ComboCurve")
+
+    # connect to service account
+    service_account = ServiceAccount.from_file(serviceAccount)
+    # set API Key from enviroment variable
+    api_key = comboCurveApi
+    # specific Python ComboCurve authentication
+    combocurve_auth = ComboCurveAuth(service_account, api_key)
+    
+    # paginate through all daily productions 1000 at a time
+    all_daily_productions = []
+    take = 1000
+    skip = 0
+    while True:
+        url = f"https://api.combocurve.com/v1/daily-productions?take={take}&skip={skip}"
+        auth_headers = combocurve_auth.get_auth_headers()  # authenticates ComboCurve
+
+        response = requests.get(url, headers=auth_headers)
+
+        responseCode = response.status_code  # sets response code to the current state
+        responseText = response.text  # sets response text to the current state
+        
+        if responseCode != 200:
+            print("Error: Unable to fetch daily productions from ComboCurve")
+            break
+        else:
+            print(f"Successfully fetched {take} daily productions from ComboCurve (skip={skip})")
+
+        dailyProductionsData = json.loads(responseText)
+        
+        if not dailyProductionsData:
+            break
+        
+        all_daily_productions.extend(dailyProductionsData)
+        skip += take
+    
+    dailyProductionsDf = pd.DataFrame(all_daily_productions)
+
+    # filter dailyProductionsDf by wellList chosenID
+    dailyProductionsDf = dailyProductionsDf[dailyProductionsDf["well"].isin(wellList["id"])]
+    
+    # add wellName and API column to dailyProductionsDf by matching well in dailyProductionsDf with id in wellList not using merge
+    dailyProductionsDf["wellName"] = dailyProductionsDf["well"].map(wellList.set_index("id")["wellName"])
+    dailyProductionsDf["API"] = dailyProductionsDf["well"].map(wellList.set_index("id")["chosenID"])
+    
+    # drop createdAt, updatedAt columns
+    dailyProductionsDf = dailyProductionsDf.drop(columns=["createdAt", "updatedAt"])
+
+    # reset index
+    dailyProductionsDf = dailyProductionsDf.reset_index(drop=True)
+    
+    return dailyProductionsDf
+
