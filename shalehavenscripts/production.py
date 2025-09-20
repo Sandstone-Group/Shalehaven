@@ -24,7 +24,9 @@ Script to import production data and format for ComboCurve upload. For Admiral P
 """
 
 def admiralPermianProductionData(pathToData):
-    
+
+    print("Getting Admiral Permian Production Data")
+
     load_dotenv()  # load enviroment variables
     
     # Update path to include the last file in the directory based on time modified
@@ -43,9 +45,25 @@ def admiralPermianProductionData(pathToData):
     # keep only columns: Date, API, Oil, Gas, Water
     data = data[['Date', 'API', 'Oil Prod', 'Gas Prod', 'Water Prod']]
     
+    # add new column to data called 'dataSource' and set all values to "other" 
+    data['dataSource'] = "other"
+    
+    columnsComboCurve = [
+        "date",
+        "chosenID",
+        "oil",
+        "gas",
+        "water",
+        "dataSource",
+    ]
+    
+    data.columns = columnsComboCurve
+    
     return data
 
 def huntOilProductionData(pathToData, huntWells):
+    
+    print("Getting Hunt Oil Production Data")
     
     load_dotenv()  # load enviroment variables
     
@@ -60,14 +78,28 @@ def huntOilProductionData(pathToData, huntWells):
     
     # put chosenID from huntWells into data based on wellName
     for i in range(len(huntWells)):
-        huntWellData = huntWells[huntWells["chosenID"]].copy()
-        wellName = huntWellData.iloc[i]['wellName']
-        chosenId = huntWellData.iloc[i]['chosenID']
+        wellName = huntWells.iloc[i]['wellName']
+        chosenId = huntWells.iloc[i]['chosenID']
         for j in range(len(data)):
             dataWellName = data.iloc[j]['LEASE']
             if dataWellName == wellName:
+                data["API"] = data["API"].astype(str)
                 data.loc[j, 'API'] = chosenId
     
     data = data[['D_DATE', 'API', 'OIL_BBLS', 'GAS_MCF', 'WATER_BBLS']]
     
+    # add new column to data called 'dataSource' and set all values to "other" 
+    data['dataSource'] = "other"
+    
+    columnsComboCurve = [
+        "date",
+        "chosenID",
+        "oil",
+        "gas",
+        "water",
+        "dataSource",
+    ]
+    
+    data.columns = columnsComboCurve
+
     return data

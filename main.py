@@ -30,4 +30,8 @@ admiralWells = wells[wells['currentOperator'] == 'ADMIRAL PERMIAN OPERATING LLC'
 admiralPermianProductionData = production.admiralPermianProductionData(pathToAdmiralData)
 huntOilProductionData = production.huntOilProductionData(pathToHuntData,huntWells)
 
-x = 5
+# Put Production Data to ComboCurve
+combocurve.putDataComboCurve(admiralPermianProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
+combocurve.putDataComboCurve(huntOilProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
+
+print("End Shalehaven ETL Process")

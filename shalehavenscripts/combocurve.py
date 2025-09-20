@@ -13,14 +13,14 @@ from combocurve_api_v1 import ComboCurveAuth, ServiceAccount
 """
 
 
-def putJoynWellProductionData(data, serviceAccount, comboCurveApi, daysToLookback):
+def putDataComboCurve(data, serviceAccount, comboCurveApi):
     
     load_dotenv()  # load enviroment variables
     
     print("Start upsert of daily well production data for update records from excel")
 
     # connect to service account
-    service_account = serviceAccount
+    service_account = ServiceAccount.from_file(serviceAccount)
     # set API Key from enviroment variable
     api_key = comboCurveApi
     # specific Python ComboCurve authentication
@@ -38,7 +38,7 @@ def putJoynWellProductionData(data, serviceAccount, comboCurveApi, daysToLookbac
         "dataSource",
     ]
     
-    cleanComboCurveData = pd.DataFrame(columns=columnsComboCurve)
+    cleanComboCurveData = data
     
     # drop all rows with chosenId = 123456789
     cleanComboCurveData = cleanComboCurveData[cleanComboCurveData["chosenID"] != "123456789"]
@@ -93,11 +93,17 @@ def putJoynWellProductionData(data, serviceAccount, comboCurveApi, daysToLookbac
 
     return text
 
+"""
+    
+    Getting Wells from ComboCurve (company list) and filtering by Shalehaven - production-ready
+    
+"""
+
 def getWellsFromComboCurve(serviceAccount, comboCurveApi):
     
     load_dotenv()  # load enviroment variables
     
-    print("Start get wells from ComboCurve")
+    print("Getting Shalehaven Wells from ComboCurve")
 
     # connect to service account
     service_account = ServiceAccount.from_file(serviceAccount)
@@ -117,7 +123,7 @@ def getWellsFromComboCurve(serviceAccount, comboCurveApi):
     if responseCode != 200:
         print("Error: Unable to fetch wells from ComboCurve")
     else:
-        print("Successfully fetched wells from ComboCurve")
+        print("Successfully fetched Shalehaven wells from ComboCurve")
 
     wellsData = json.loads(responseText)
     
