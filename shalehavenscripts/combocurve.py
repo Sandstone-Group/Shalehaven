@@ -140,7 +140,7 @@ def getWellsFromComboCurve(serviceAccount, comboCurveApi):
     
 """
 
-def getDailyProductionsFromComboCurve(serviceAccount, comboCurveApi, wellList):
+def getDailyProductionFromComboCurve(serviceAccount, comboCurveApi, wellList):
     
     load_dotenv()  # load enviroment variables
     
@@ -195,5 +195,68 @@ def getDailyProductionsFromComboCurve(serviceAccount, comboCurveApi, wellList):
     # reset index
     dailyProductionsDf = dailyProductionsDf.reset_index(drop=True)
     
+    print("Finished Getting Daily Productions from ComboCurve")
+    
     return dailyProductionsDf
 
+"""
+  
+  Get Daily Forecast From ComboCurve - production-ready  
+    
+"""
+ 
+def getDailyForecastFromComboCurve(serviceAccount, comboCurveApi, projectId, forecastId):
+    
+    load_dotenv()  # load enviroment variables
+    
+    print("Getting Daily Forecast from ComboCurve")
+
+    # connect to service account
+    service_account = ServiceAccount.from_file(serviceAccount)
+    # set API Key from enviroment variable
+    api_key = comboCurveApi
+    # specific Python ComboCurve authentication
+    combocurve_auth = ComboCurveAuth(service_account, api_key)
+    
+    # paginate through all daily forecasts 200 at a time
+    all_daily_forecasts = []
+    take = 200  # max take is 200
+    skip = 0
+    while True:
+        url = f"https://api.combocurve.com/v1/forecast-daily-volumes?project={projectId}&forecast={forecastId}&take={take}&skip={skip}"
+        auth_headers = combocurve_auth.get_auth_headers()  # authenticates ComboCurve
+
+        response = requests.get(url, headers=auth_headers)
+
+        responseCode = response.status_code  # sets response code to the current state
+        responseText = response.text  # sets response text to the current state
+        
+        if responseCode != 200:
+            print("Error: Unable to fetch daily forecasts from ComboCurve")
+            break
+        else:
+            print(f"Successfully fetched {take} daily forecasts from ComboCurve (skip={skip})")
+
+        dailyForecastData = json.loads(responseText)
+        
+        if not dailyForecastData:
+            break
+        
+        all_daily_forecasts.extend(dailyForecastData)
+        skip += take
+
+    
+    dailyForecastDataDf = pd.DataFrame(all_daily_forecasts)
+    
+    cleanDailyForecastDataDf = pd.DataFrame()
+
+    # loop through each row in dailyForecastDataDf["phases"] and unpack the phases (in a json format) into separate rows and add to cleanDailyForecastDataDf
+    for i in range(len(dailyForecastDataDf)):
+        phases = dailyForecastDataDf["phases"][i]
+        for j in range(len(phases)):
+            phase = phases[j]
+            phase
+
+    x = 5
+    
+    return dailyForecastDataDf

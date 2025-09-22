@@ -103,3 +103,9 @@ def huntOilProductionData(pathToData, huntWells):
     data.columns = columnsComboCurve
 
     return data
+
+"""
+    
+    Merge daily production data with forecasted production data from ComboCurve.
+    
+"""

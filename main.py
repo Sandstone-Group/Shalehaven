@@ -12,6 +12,9 @@ import os
 from dotenv import load_dotenv
 sandstoneComboCurveServiceAccount = os.getenv("SANDSTONE_COMBOCURVE_API_SEC_CODE")
 sandstoneComboCurveApiKey = os.getenv("SANDSTONE_COMBOCURVE_API_KEY_PASS")
+shalehavenProjectId = os.getenv("SHALEHAVEN_PROJECT_ID")
+shalehavenForcastIdUpdatedTypeCurve = os.getenv("SHALEHAVEN_FORCAST_ID_UPDATED_TYPE_CURVE")
+shalehavenForcastIdOriginalTypeCurve = os.getenv("SHALEHAVEN_FORCAST_ID_ORIGINAL_TYPE_CURVE")
 
 print("Begin Shalehaven ETL Process")
 
@@ -37,6 +40,10 @@ combocurve.putDataComboCurve(admiralPermianProductionData,sandstoneComboCurveSer
 combocurve.putDataComboCurve(huntOilProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
 
 # Get Daily Productions from ComboCurve for Shalehaven
-dailyProductions = combocurve.getDailyProductionsFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, allWells)
+dailyProductions = combocurve.getDailyProductionFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, allWells)
+
+# Get Updated and Original Type Curves from ComboCurve for Shalehaven
+updatedTypeCurves = combocurve.getDailyForecastFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, shalehavenProjectId, shalehavenForcastIdUpdatedTypeCurve)
+originalTypeCurves = combocurve.getDailyForecastFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, shalehavenProjectId, shalehavenForcastIdOriginalTypeCurve)
 
 print("End Shalehaven ETL Process")
