@@ -93,14 +93,22 @@ def huntOilProductionData(pathToData, huntWells):
 """
     
     Merge daily production data with updated and original type curves from ComboCurve.
+
 """
 
-def mergeProductionWithTypeCurves(updated, original, wellList):
+def mergeProductionWithTypeCurves(dailyprod, updated, original, wellList):
     
-    print("Begin Merging Orginal and Updated Type Curves")
-    # Merge updated and original type curves on date and well
-    mergedData = pd.merge(updated, original, how='left', on=['date', 'well'], suffixes=('', '_original'))
+    print("Begin Merging dailyprod with  Orginal and Updated Type Curves")
     
+    # ensure date columns are datetime64[ns]
+    dailyprod['date'] = pd.to_datetime(dailyprod['date'], format="%Y-%m-%dT%H:%M:%S.%fZ", utc=True).dt.tz_localize(None)
+    updated['date'] = pd.to_datetime(updated['date'], format="%Y-%m-%dT%H:%M:%S.%fZ", utc=True).dt.tz_localize(None)
+    original['date'] = pd.to_datetime(original['date'], format="%Y-%m-%dT%H:%M:%S.%fZ", utc=True).dt.tz_localize(None)
+
+    # Merge dailyprod with updated and original type curves on date and well but keep all rows from updated type curve - if no daily production data, fill with NaN
+    mergedData = pd.merge(updated, dailyprod, how='left', on=['date', 'well'], suffixes=('', '_dailyprod'))
+    mergedData = pd.merge(mergedData, original, how='left', on=['date', 'well'], suffixes=('', '_original'))
+
     # change columns names from oil, gas, water to oil_updated, gas_updated, water_updated
     mergedData = mergedData.rename(columns={
         'oil': 'oil_updated',
@@ -108,21 +116,25 @@ def mergeProductionWithTypeCurves(updated, original, wellList):
         'water': 'water_updated'
     })
 
-    # any _original columns that are NaN should be filled with 0
-    mergedData['oil_original'] = mergedData['oil_original'].fillna(0)
-    mergedData['gas_original'] = mergedData['gas_original'].fillna(0)
-    mergedData['water_original'] = mergedData['water_original'].fillna(0)
-    
+    # any _original columns that are NaN should be filled with ""
+    mergedData['oil_original'] = mergedData['oil_original'].fillna("")
+    mergedData['gas_original'] = mergedData['gas_original'].fillna("")
+    mergedData['water_original'] = mergedData['water_original'].fillna("")
+    # any _updated columns that are NaN should be filled with ""
+    mergedData['oil_dailyprod'] = mergedData['oil_dailyprod'].fillna("")
+    mergedData['gas_dailyprod'] = mergedData['gas_dailyprod'].fillna("")
+    mergedData['water_dailyprod'] = mergedData['water_dailyprod'].fillna("")
+
     # sort by well and date
     mergedData = mergedData.sort_values(by=['wellName', 'date'])
     
     # drop wellName_original and API_original columns
-    mergedData = mergedData.drop(columns=['wellName_original', 'API_original'])
+    mergedData = mergedData.drop(columns=['wellName_original', 'API_original', 'wellName_dailyprod', 'API_dailyprod'])
     
     # drop index
     mergedData = mergedData.reset_index(drop=True)
     
-    mergedData.to_excel(r"C:\Users\Michael Tanner\OneDrive - Sandstone Group\Clients - Documents\# Shalehaven Partners\# Production\database\daily_forecast.xlsx")
+    mergedData.to_excel(r"C:\Users\Michael Tanner\OneDrive - Sandstone Group\Clients - Documents\# Shalehaven Partners\# Production\database\daily_merge.xlsx")
 
     print("Finished Merging Original and Updated Type Curves")
 

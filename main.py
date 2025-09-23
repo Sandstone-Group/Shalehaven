@@ -47,6 +47,6 @@ updatedTypeCurves = combocurve.getDailyForecastFromComboCurve(sandstoneComboCurv
 originalTypeCurves = combocurve.getDailyForecastFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, shalehavenProjectId, shalehavenForcastIdOriginalTypeCurve, allWells)
 
 # Merge Type Curves Updated and Orginal
-mergedUpdatedTypeCurves = production.mergeProductionWithTypeCurves(updatedTypeCurves, originalTypeCurves, allWells)
+mergedUpdatedTypeCurves = production.mergeProductionWithTypeCurves(dailyProductions,updatedTypeCurves, originalTypeCurves, allWells)
 
 print("End Shalehaven ETL Process")
