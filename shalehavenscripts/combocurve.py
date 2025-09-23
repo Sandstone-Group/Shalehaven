@@ -192,8 +192,8 @@ def getDailyProductionFromComboCurve(serviceAccount, comboCurveApi, wellList):
     # drop createdAt, updatedAt columns
     dailyProductionsDf = dailyProductionsDf.drop(columns=["createdAt", "updatedAt"])
 
-    # reset index
-    dailyProductionsDf = dailyProductionsDf.reset_index(drop=True)
+    dailyProductionsDf.to_excel(r"C:\Users\Michael Tanner\OneDrive - Sandstone Group\Clients - Documents\# Shalehaven Partners\# Production\database\daily_production.xlsx")
+
     
     print("Finished Getting Daily Productions from ComboCurve")
     
@@ -204,9 +204,9 @@ def getDailyProductionFromComboCurve(serviceAccount, comboCurveApi, wellList):
   Get Daily Forecast From ComboCurve - production-ready  
     
 """
- 
-def getDailyForecastFromComboCurve(serviceAccount, comboCurveApi, projectId, forecastId):
-    
+
+def getDailyForecastFromComboCurve(serviceAccount, comboCurveApi, projectId, forecastId, wellList):
+
     load_dotenv()  # load enviroment variables
     
     print("Getting Daily Forecast from ComboCurve")
@@ -245,18 +245,66 @@ def getDailyForecastFromComboCurve(serviceAccount, comboCurveApi, projectId, for
         all_daily_forecasts.extend(dailyForecastData)
         skip += take
 
+    # Initialize lists to store DataFrame data
+    wells = []
+    dates = []
+    phases = []
+    volumes = []
     
-    dailyForecastDataDf = pd.DataFrame(all_daily_forecasts)
-    
-    cleanDailyForecastDataDf = pd.DataFrame()
+    for entry in all_daily_forecasts:
+        wellId = entry["well"]
+        for phaseData in entry["phases"]:
+            phase = phaseData["phase"]
+            series = phaseData["series"][0] # Assuming best series
+            startDate = datetime.strptime(series["startDate"], "%Y-%m-%dT%H:%M:%S.%fZ")
+            endDate = datetime.strptime(series["endDate"], "%Y-%m-%dT%H:%M:%S.%fZ")
+            volumeList = series["volumes"]
+            
+            # generate dates from startDate to endDate
+            currentDate = startDate
+            dayIndex = 0
+            while currentDate <= endDate:
+                wells.append(wellId)
+                dates.append(currentDate)
+                phases.append(phase)
+                # assigned volume if avaiable, else 0
+                volume = volumeList[dayIndex] if dayIndex < len(volumeList) else 0
+                volumes.append(volume)
 
-    # loop through each row in dailyForecastDataDf["phases"] and unpack the phases (in a json format) into separate rows and add to cleanDailyForecastDataDf
-    for i in range(len(dailyForecastDataDf)):
-        phases = dailyForecastDataDf["phases"][i]
-        for j in range(len(phases)):
-            phase = phases[j]
-            phase
-
-    x = 5
+                currentDate += timedelta(days=1)
+                dayIndex += 1
     
-    return dailyForecastDataDf
+    # Create DataFrame from lists
+    dailyForecastDf = pd.DataFrame({
+        "well": wells,
+        "date": dates,
+        "phase": phases,
+        "volume": volumes
+    })
+    
+    # add wellName and API column by matching wellId with wellList
+    dailyForecastDf["wellName"] = dailyForecastDf["well"].map(wellList.set_index("id")["wellName"])
+    dailyForecastDf["API"] = dailyForecastDf["well"].map(wellList.set_index("id")["chosenID"])
+    
+    # Pivot the DataFrame to have separate columns for oil, gas, and water, well, date, wellName, API
+    pivotDailyForecast = dailyForecastDf.pivot_table(
+        index=["date", "well", "wellName", "API"],
+        columns=["phase"],
+        values="volume",
+        fill_value=0
+    ).reset_index()
+
+    # Rename columns to match requested format
+    pivotDailyForecast.columns.name = None  # Remove the pivot_table column name
+    pivotDailyForecast = pivotDailyForecast.rename(columns={
+        "oil": "oil",
+        "gas": "gas",
+        "water": "water"
+    })
+
+    # Reorder columns to match requested order
+    pivotDailyForecast = pivotDailyForecast[["date", "well", "oil", "gas", "water", "wellName", "API"]]
+    
+    print("Finished Getting Daily Forecast from ComboCurve")
+
+    return pivotDailyForecast

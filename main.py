@@ -43,7 +43,10 @@ combocurve.putDataComboCurve(huntOilProductionData,sandstoneComboCurveServiceAcc
 dailyProductions = combocurve.getDailyProductionFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, allWells)
 
 # Get Updated and Original Type Curves from ComboCurve for Shalehaven
-updatedTypeCurves = combocurve.getDailyForecastFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, shalehavenProjectId, shalehavenForcastIdUpdatedTypeCurve)
-originalTypeCurves = combocurve.getDailyForecastFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, shalehavenProjectId, shalehavenForcastIdOriginalTypeCurve)
+updatedTypeCurves = combocurve.getDailyForecastFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, shalehavenProjectId, shalehavenForcastIdUpdatedTypeCurve, allWells)
+originalTypeCurves = combocurve.getDailyForecastFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, shalehavenProjectId, shalehavenForcastIdOriginalTypeCurve, allWells)
+
+# Merge Type Curves Updated and Orginal
+mergedUpdatedTypeCurves = production.mergeProductionWithTypeCurves(updatedTypeCurves, originalTypeCurves, allWells)
 
 print("End Shalehaven ETL Process")

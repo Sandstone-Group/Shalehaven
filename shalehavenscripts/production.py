@@ -5,20 +5,6 @@ import os
 
 """
     
-Calculate the first 12 month oil production per foot of lateral.
-    
-"""
-
-def tweleveMonthOilPerFt(dataOil,dataHeader):
-    
-    ## keep Well Name, Chosen ID, 
-    
-    x= 5
-    
-    return x
-
-"""
-    
 Script to import production data and format for ComboCurve upload. For Admiral Permian wells in 2024 LP portfolio.    
     
 """
@@ -106,6 +92,39 @@ def huntOilProductionData(pathToData, huntWells):
 
 """
     
-    Merge daily production data with forecasted production data from ComboCurve.
-    
+    Merge daily production data with updated and original type curves from ComboCurve.
 """
+
+def mergeProductionWithTypeCurves(updated, original, wellList):
+    
+    print("Begin Merging Orginal and Updated Type Curves")
+    # Merge updated and original type curves on date and well
+    mergedData = pd.merge(updated, original, how='left', on=['date', 'well'], suffixes=('', '_original'))
+    
+    # change columns names from oil, gas, water to oil_updated, gas_updated, water_updated
+    mergedData = mergedData.rename(columns={
+        'oil': 'oil_updated',
+        'gas': 'gas_updated',
+        'water': 'water_updated'
+    })
+
+    # any _original columns that are NaN should be filled with 0
+    mergedData['oil_original'] = mergedData['oil_original'].fillna(0)
+    mergedData['gas_original'] = mergedData['gas_original'].fillna(0)
+    mergedData['water_original'] = mergedData['water_original'].fillna(0)
+    
+    # sort by well and date
+    mergedData = mergedData.sort_values(by=['wellName', 'date'])
+    
+    # drop wellName_original and API_original columns
+    mergedData = mergedData.drop(columns=['wellName_original', 'API_original'])
+    
+    # drop index
+    mergedData = mergedData.reset_index(drop=True)
+    
+    mergedData.to_excel(r"C:\Users\Michael Tanner\OneDrive - Sandstone Group\Clients - Documents\# Shalehaven Partners\# Production\database\daily_forecast.xlsx")
+
+    print("Finished Merging Original and Updated Type Curves")
+
+
+    return mergedData
