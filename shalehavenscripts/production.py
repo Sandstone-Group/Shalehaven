@@ -140,3 +140,89 @@ def mergeProductionWithTypeCurves(dailyprod, updated, original, wellList):
 
 
     return mergedData
+
+"""
+    
+    Create cumulative production from daily production data, updated type curves, and original type curves.  The data should have a index column (1 through n) then date, well, oil, gas, water columns for daily production, updated type curves, and original type curve cumulative.    
+    
+"""
+
+def cumulativeProduction(data):
+    
+    print("Begin Creating Cumulative Production Data")
+    
+    # create new dataframe to hold cumulative production data
+    cumulativeData = pd.DataFrame(columns=["day", "well", "wellName", "API", "oil_dailyprod_cum", "gas_dailyprod_cum", "water_dailyprod_cum", "oil_updated_cum", "gas_updated_cum", "water_updated_cum", "oil_original_cum", "gas_original_cum", "water_original_cum"])
+
+    # get unique wells from data
+    uniqueWells = data['well'].unique()
+
+    # split dataframe into each well
+    for well in uniqueWells:
+        wellData = data[data['well'] == well]
+        
+        # if oil_dailyprod, gas_dailyprod, water_dailyprod are "", replace with 0
+        wellData['oil_dailyprod'] = wellData['oil_dailyprod'].replace("", 0).astype(float)
+        wellData['gas_dailyprod'] = wellData['gas_dailyprod'].replace("", 0).astype(float)
+        wellData['water_dailyprod'] = wellData['water_dailyprod'].replace("", 0).astype(float)
+        # if oil_updated, gas_updated, water_updated are "", replace with 0
+        wellData['oil_updated'] = wellData['oil_updated'].replace("", 0).astype(float)
+        wellData['gas_updated'] = wellData['gas_updated'].replace("", 0).astype(float)
+        wellData['water_updated'] = wellData['water_updated'].replace("", 0).astype(float)
+        # if oil_original, gas_original, water_original are "", replace with 0
+        wellData['oil_original'] = wellData['oil_original'].replace("", 0).astype(float)
+        wellData['gas_original'] = wellData['gas_original'].replace("", 0).astype(float)
+        wellData['water_original'] = wellData['water_original'].replace("", 0).astype(float)
+
+        # create cumulative sum for oil_dailyprod, gas_dailyprod, water_dailyprod
+        wellData['oil_dailyprod_cum'] = wellData['oil_dailyprod'].cumsum()
+        wellData['gas_dailyprod_cum'] = wellData['gas_dailyprod'].cumsum()
+        wellData['water_dailyprod_cum'] = wellData['water_dailyprod'].cumsum()
+        
+        # create cumulative sum for oil_updated, gas_updated, water_updated
+        wellData['oil_updated_cum'] = wellData['oil_updated'].cumsum()
+        wellData['gas_updated_cum'] = wellData['gas_updated'].cumsum()
+        wellData['water_updated_cum'] = wellData['water_updated'].cumsum()
+        
+        # create cumulative sum for oil_original, gas_original, water_original
+        wellData['oil_original_cum'] = wellData['oil_original'].cumsum()
+        wellData['gas_original_cum'] = wellData['gas_original'].cumsum()
+        wellData['water_original_cum'] = wellData['water_original'].cumsum()
+        
+        # if a list starts with 0's, delete zeros and shift the list so that the first non-zero value is at day 1
+        wellData['oil_dailyprod_cum'] = wellData['oil_dailyprod_cum'].where(wellData['oil_dailyprod_cum'] != 0).ffill().fillna(0)
+        wellData['gas_dailyprod_cum'] = wellData['gas_dailyprod_cum'].where(wellData['gas_dailyprod_cum'] != 0).ffill().fillna(0)
+        wellData['water_dailyprod_cum'] = wellData['water_dailyprod_cum'].where(wellData['water_dailyprod_cum'] != 0).ffill().fillna(0)
+        wellData['oil_updated_cum'] = wellData['oil_updated_cum'].where(wellData['oil_updated_cum'] != 0).ffill().fillna(0)
+        wellData['gas_updated_cum'] = wellData['gas_updated_cum'].where(wellData['gas_updated_cum'] != 0).ffill().fillna(0)
+        wellData['water_updated_cum'] = wellData['water_updated_cum'].where(wellData['water_updated_cum'] != 0).ffill().fillna(0)
+        wellData['oil_original_cum'] = wellData['oil_original_cum'].where(wellData['oil_original_cum'] != 0).ffill().fillna(0)
+        wellData['gas_original_cum'] = wellData['gas_original_cum'].where(wellData['gas_original_cum'] != 0).ffill().fillna(0).fillna(0)
+        wellData['water_original_cum'] = wellData['water_original_cum'].where(wellData['water_original_cum'] != 0).ffill().fillna(0)
+        
+        # shift list so that if there are 0's to begin with, the production is shifted so the first day of production is day 1
+        wellData['oil_dailyprod_cum'] = wellData['oil_dailyprod_cum'].shift(fill_value=0)
+        wellData['gas_dailyprod_cum'] = wellData['gas_dailyprod_cum'].shift(fill_value=0)
+        wellData['water_dailyprod_cum'] = wellData['water_dailyprod_cum'].shift(fill_value=0)
+        wellData['oil_updated_cum'] = wellData['oil_updated_cum'].shift(fill_value=0)
+        wellData['gas_updated_cum'] = wellData['gas_updated_cum'].shift(fill_value=0)
+        wellData['water_updated_cum'] = wellData['water_updated_cum'].shift(fill_value=0)
+        wellData['oil_original_cum'] = wellData['oil_original_cum'].shift(fill_value=0)
+        wellData['gas_original_cum'] = wellData['gas_original_cum'].shift(fill_value=0)
+        wellData['water_original_cum'] = wellData['water_original_cum'].shift(fill_value=0)
+
+        # create a list for day number starting at 0 to n
+        wellData['day'] = np.arange(len(wellData))
+        
+        # select only necessary columns
+        wellCumulativeData = wellData[["day", "well", "wellName", "API", "oil_dailyprod_cum", "gas_dailyprod_cum", "water_dailyprod_cum", "oil_updated_cum", "gas_updated_cum", "water_updated_cum", "oil_original_cum", "gas_original_cum", "water_original_cum"]]
+        
+        # append to cumulativeData dataframe
+        cumulativeData = pd.concat([cumulativeData, wellCumulativeData], ignore_index=True)
+ 
+    # print cumulativeData to excel for review
+    cumulativeData.to_excel(r"C:\Users\Michael Tanner\OneDrive - Sandstone Group\Clients - Documents\# Shalehaven Partners\# Production\database\cumulative_production.xlsx")
+     
+    print("Finished Creating Cumulative Production Data")
+
+    return cumulativeData
