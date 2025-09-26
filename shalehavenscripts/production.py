@@ -156,11 +156,14 @@ def cumulativeProduction(data):
 
     # get unique wells from data
     uniqueWells = data['well'].unique()
-
+    
     # split dataframe into each well
     for well in uniqueWells:
         wellData = data[data['well'] == well]
         
+        ## count the number of rows in wellData[wellData['oil_dailyprod'] != ""]
+        numProductionDays = len(wellData[wellData['oil_dailyprod'] != ""])
+    
         # if oil_dailyprod, gas_dailyprod, water_dailyprod are "", replace with 0
         wellData['oil_dailyprod'] = wellData['oil_dailyprod'].replace("", 0).astype(float)
         wellData['gas_dailyprod'] = wellData['gas_dailyprod'].replace("", 0).astype(float)
@@ -213,6 +216,11 @@ def cumulativeProduction(data):
 
         # create a list for day number starting at 0 to n
         wellData['day'] = np.arange(len(wellData))
+        
+        # for oil_dailyprod_cum, gas_dailyprod_cum, water_dailyprod_cum, if day number is greater than numProductionDays, set cumulative production to ""
+        wellData.loc[wellData['day'] >= numProductionDays, 'oil_dailyprod_cum'] = ""
+        wellData.loc[wellData['day'] >= numProductionDays, 'gas_dailyprod_cum'] = ""
+        wellData.loc[wellData['day'] >= numProductionDays, 'water_dailyprod cum'] = ""
         
         # select only necessary columns
         wellCumulativeData = wellData[["day", "well", "wellName", "API", "oil_dailyprod_cum", "gas_dailyprod_cum", "water_dailyprod_cum", "oil_updated_cum", "gas_updated_cum", "water_updated_cum", "oil_original_cum", "gas_original_cum", "water_original_cum"]]
