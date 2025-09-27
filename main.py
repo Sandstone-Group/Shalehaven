@@ -31,6 +31,9 @@ admiralWells = wells[wells['currentOperator'] == 'ADMIRAL PERMIAN OPERATING LLC'
 aethonWells = wells[wells['currentOperator'] == 'AETHON ENERGY OPERATING LLC']
 allWells = pd.concat([huntWells, admiralWells, aethonWells]) # merge huntWells with admiralWells and aethonWells
 
+# print allWells to database
+allWells.to_excel(r"C:\Users\Michael Tanner\OneDrive - Sandstone Group\Clients - Documents\# Shalehaven Partners\# Production\database\wells.xlsx")
+
 # Get & Format Production Data
 admiralPermianProductionData = production.admiralPermianProductionData(pathToAdmiralData)
 huntOilProductionData = production.huntOilProductionData(pathToHuntData,huntWells)
