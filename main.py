@@ -54,8 +54,6 @@ dailyProductions = combocurve.getDailyProductionFromComboCurve(sandstoneComboCur
 updatedTypeCurves = combocurve.getDailyForecastFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, shalehavenProjectId, shalehavenForcastIdUpdatedTypeCurve, allWells)
 originalTypeCurves = combocurve.getDailyForecastFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, shalehavenProjectId, shalehavenForcastIdOriginalTypeCurve, allWells)
 
-
-
 # Merge Type Curves Updated and Orginal
 mergedUpdatedTypeCurves = production.mergeProductionWithTypeCurves(dailyProductions,updatedTypeCurves, originalTypeCurves, allWells)
 
