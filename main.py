@@ -10,6 +10,7 @@ import pandas as pd
 import numpy as np
 import os
 from dotenv import load_dotenv
+
 sandstoneComboCurveServiceAccount = os.getenv("SANDSTONE_COMBOCURVE_API_SEC_CODE")
 sandstoneComboCurveApiKey = os.getenv("SANDSTONE_COMBOCURVE_API_KEY_PASS")
 shalehavenProjectId = os.getenv("SHALEHAVEN_PROJECT_ID")
@@ -23,6 +24,7 @@ load_dotenv()  # load enviroment variables
 # Paths to data
 pathToAdmiralData = os.getenv("SHALEHAVEN_ADMIRAL_PATH")
 pathToHuntData = os.getenv("SHALEHAVEN_HUNT_PATH")
+pathToAethonData = os.getenv("SHALEHAVEN_AETHON_PATH")
 
 # Get Wells From ComboCurve and Split by Operator
 wells = combocurve.getWellsFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
@@ -33,21 +35,26 @@ allWells = pd.concat([huntWells, admiralWells, aethonWells]) # merge huntWells w
 
 # print allWells to database
 allWells.to_excel(r"C:\Users\Michael Tanner\OneDrive - Sandstone Group\Clients - Documents\# Shalehaven Partners\# Production\database\wells.xlsx")
+wells.to_excel(r"C:\Users\Michael Tanner\OneDrive - Sandstone Group\Clients - Documents\# Shalehaven Partners\# Production\database\allWells.xlsx")
 
 # Get & Format Production Data
 admiralPermianProductionData = production.admiralPermianProductionData(pathToAdmiralData)
 huntOilProductionData = production.huntOilProductionData(pathToHuntData,huntWells)
+aethonProductionData = production.aethonProductionData(pathToAethonData)
 
 # Put Production Data to ComboCurve
 combocurve.putDataComboCurve(admiralPermianProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
 combocurve.putDataComboCurve(huntOilProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
+combocurve.putDataComboCurve(aethonProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
 
 # Get Daily Productions from ComboCurve for Shalehaven
 dailyProductions = combocurve.getDailyProductionFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, allWells)
 
-# Get Updated and Original Type Curves from ComboCurve for Shalehaven
+# Get Updated and Original Type Curves from ComboCurve for Shalehaven LP 2024
 updatedTypeCurves = combocurve.getDailyForecastFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, shalehavenProjectId, shalehavenForcastIdUpdatedTypeCurve, allWells)
 originalTypeCurves = combocurve.getDailyForecastFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, shalehavenProjectId, shalehavenForcastIdOriginalTypeCurve, allWells)
+
+
 
 # Merge Type Curves Updated and Orginal
 mergedUpdatedTypeCurves = production.mergeProductionWithTypeCurves(dailyProductions,updatedTypeCurves, originalTypeCurves, allWells)

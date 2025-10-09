@@ -91,6 +91,47 @@ def huntOilProductionData(pathToData, huntWells):
     return data
 
 """
+
+Get Aethon Production Data
+
+"""
+
+def aethonProductionData(pathToData):
+    
+    print("Getting Aethon Production Data")
+
+    load_dotenv()  # load enviroment variables
+    
+    # Update path to include the last file in the directory based on time modified
+    pathToData = max([os.path.join(pathToData, f) for f in os.listdir(pathToData)], key=os.path.getmtime)
+    
+    data = pd.read_excel(pathToData) 
+    
+    data['API'] = data['API'].astype(str)
+    
+    data = data[['Date', 'API', 'Oil', 'Gas', 'Water']]
+    
+    # add new column to data called 'dataSource' and set all values to "other"
+    data['dataSource'] = "other"
+    
+    columnsComboCurve = [
+        "date",
+        "chosenID",
+        "oil",
+        "gas",
+        "water",
+        "dataSource",
+    ]
+    
+    data.columns = columnsComboCurve
+    
+    return data
+
+
+
+
+
+"""
     
     Merge daily production data with updated and original type curves from ComboCurve.
 
