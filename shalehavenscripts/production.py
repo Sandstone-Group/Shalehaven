@@ -3,6 +3,8 @@ import numpy as np
 from dotenv import load_dotenv
 import os
 
+pathToDatabase = os.getenv("SANDSTONE_DATABASE_PATH")
+
 """
     
 Script to import production data and format for ComboCurve upload. For Admiral Permian wells in 2024 LP portfolio.    
@@ -174,8 +176,8 @@ def mergeProductionWithTypeCurves(dailyprod, updated, original, wellList):
     
     # drop index
     mergedData = mergedData.reset_index(drop=True)
-    
-    mergedData.to_excel(r"C:\Users\Michael Tanner\OneDrive - Sandstone Group\Clients - Documents\# Shalehaven Partners\# Production\database\daily_merge.xlsx")
+
+    mergedData.to_excel(os.path.join(pathToDatabase, r"daily_merge.xlsx"))
 
     print("Finished Merging Original and Updated Type Curves")
 
@@ -270,7 +272,7 @@ def cumulativeProduction(data):
         cumulativeData = pd.concat([cumulativeData, wellCumulativeData], ignore_index=True)
  
     # print cumulativeData to excel for review
-    cumulativeData.to_excel(r"C:\Users\Michael Tanner\OneDrive - Sandstone Group\Clients - Documents\# Shalehaven Partners\# Production\database\cumulative_production.xlsx")
+    cumulativeData.to_excel(os.path.join(pathToDatabase, r"cumulative_production.xlsx"))
      
     print("Finished Creating Cumulative Production Data")
 

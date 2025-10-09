@@ -25,6 +25,7 @@ load_dotenv()  # load enviroment variables
 pathToAdmiralData = os.getenv("SHALEHAVEN_ADMIRAL_PATH")
 pathToHuntData = os.getenv("SHALEHAVEN_HUNT_PATH")
 pathToAethonData = os.getenv("SHALEHAVEN_AETHON_PATH")
+pathToDatabase = os.getenv("SANDSTONE_DATABASE_PATH")
 
 # Get Wells From ComboCurve and Split by Operator
 wells = combocurve.getWellsFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
@@ -34,8 +35,8 @@ aethonWells = wells[wells['currentOperator'] == 'AETHON ENERGY OPERATING LLC']
 allWells = pd.concat([huntWells, admiralWells, aethonWells]) # merge huntWells with admiralWells and aethonWells
 
 # print allWells to database
-allWells.to_excel(r"C:\Users\Michael Tanner\OneDrive - Sandstone Group\Clients - Documents\# Shalehaven Partners\# Production\database\wells.xlsx")
-wells.to_excel(r"C:\Users\Michael Tanner\OneDrive - Sandstone Group\Clients - Documents\# Shalehaven Partners\# Production\database\allWells.xlsx")
+allWells.to_excel(os.path.join(pathToDatabase, r"wells.xlsx"))
+wells.to_excel(os.path.join(pathToDatabase, r"allWells.xlsx"))
 
 # Get & Format Production Data
 admiralPermianProductionData = production.admiralPermianProductionData(pathToAdmiralData)
