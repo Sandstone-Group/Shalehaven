@@ -25,6 +25,7 @@ load_dotenv()  # load enviroment variables
 pathToAdmiralData = os.getenv("SHALEHAVEN_ADMIRAL_PATH")
 pathToHuntData = os.getenv("SHALEHAVEN_HUNT_PATH")
 pathToAethonData = os.getenv("SHALEHAVEN_AETHON_PATH")
+pathToDevonData = os.getenv("SHALEHAVEN_DEVON_PATH")
 pathToDatabase = os.getenv("SANDSTONE_DATABASE_PATH")
 
 # Get Wells From ComboCurve and Split by Operator
@@ -32,31 +33,34 @@ wells = combocurve.getWellsFromComboCurve(sandstoneComboCurveServiceAccount,sand
 huntWells = wells[wells['currentOperator'] == 'HUNT OIL COMPANY']
 admiralWells = wells[wells['currentOperator'] == 'ADMIRAL PERMIAN OPERATING LLC']
 aethonWells = wells[wells['currentOperator'] == 'AETHON ENERGY OPERATING LLC']
-allWells = pd.concat([huntWells, admiralWells, aethonWells]) # merge huntWells with admiralWells and aethonWells
+devonWells = wells[wells['currentOperator'] == 'DEVON ENERGY PRODUCTION COMPANY LP']
+fundWells = pd.concat([huntWells, admiralWells, aethonWells, devonWells]) # merge huntWells with admiralWells, devonWells and aethonWells
 
-# print allWells to database
-allWells.to_excel(os.path.join(pathToDatabase, r"wells.xlsx"))
+# print fundWells to database
+fundWells.to_excel(os.path.join(pathToDatabase, r"fundWells.xlsx"))
 wells.to_excel(os.path.join(pathToDatabase, r"allWells.xlsx"))
 
 # Get & Format Production Data
 admiralPermianProductionData = production.admiralPermianProductionData(pathToAdmiralData)
 huntOilProductionData = production.huntOilProductionData(pathToHuntData,huntWells)
 aethonProductionData = production.aethonProductionData(pathToAethonData)
+devonProductionData = production.devonProductionData(pathToDevonData)
 
 # Put Production Data to ComboCurve
 combocurve.putDataComboCurve(admiralPermianProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
 combocurve.putDataComboCurve(huntOilProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
 combocurve.putDataComboCurve(aethonProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
+combocurve.putDataComboCurve(devonProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
 
 # Get Daily Productions from ComboCurve for Shalehaven
-dailyProductions = combocurve.getDailyProductionFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, allWells)
+dailyProductions = combocurve.getDailyProductionFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, fundWells)
 
 # Get Updated and Original Type Curves from ComboCurve for Shalehaven LP 2024
-updatedTypeCurves = combocurve.getDailyForecastFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, shalehavenProjectId, shalehavenForcastIdUpdatedTypeCurve, allWells)
-originalTypeCurves = combocurve.getDailyForecastFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, shalehavenProjectId, shalehavenForcastIdOriginalTypeCurve, allWells)
+updatedTypeCurves = combocurve.getDailyForecastFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, shalehavenProjectId, shalehavenForcastIdUpdatedTypeCurve, fundWells)
+originalTypeCurves = combocurve.getDailyForecastFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, shalehavenProjectId, shalehavenForcastIdOriginalTypeCurve, fundWells)
 
 # Merge Type Curves Updated and Orginal
-mergedUpdatedTypeCurves = production.mergeProductionWithTypeCurves(dailyProductions,updatedTypeCurves, originalTypeCurves, allWells)
+mergedUpdatedTypeCurves = production.mergeProductionWithTypeCurves(dailyProductions,updatedTypeCurves, originalTypeCurves, fundWells)
 
 # Cumulative Summaries
 cumulativeProduction = production.cumulativeProduction(mergedUpdatedTypeCurves)

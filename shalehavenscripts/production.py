@@ -107,11 +107,11 @@ def aethonProductionData(pathToData):
     # Update path to include the last file in the directory based on time modified
     pathToData = max([os.path.join(pathToData, f) for f in os.listdir(pathToData)], key=os.path.getmtime)
     
-    data = pd.read_excel(pathToData) 
+    data = pd.read_csv(pathToData) 
     
     data['API'] = data['API'].astype(str)
     
-    data = data[['Date', 'API', 'Oil', 'Gas', 'Water']]
+    data = data[['Production Date', 'API', 'Oil Production', 'Gas Production', 'Water Production']]
     
     # add new column to data called 'dataSource' and set all values to "other"
     data['dataSource'] = "other"
@@ -129,8 +129,49 @@ def aethonProductionData(pathToData):
     
     return data
 
+"""
 
+Get Devon Production Data
 
+"""
+
+def devonProductionData(pathToData):
+    
+    print("Getting Devon Production Data")
+
+    load_dotenv()  # load enviroment variables
+    
+    # Update path to include the last file in the directory based on time modified
+    pathToData = max([os.path.join(pathToData, f) for f in os.listdir(pathToData)], key=os.path.getmtime)
+    
+    data = pd.read_csv(pathToData) 
+    
+    # drop last row
+    data = data[:-1]
+    
+    data['API'] = data['API'].astype(str)
+    #drop last two characters from API
+    data['API'] = data['API'].str[:-2]
+    # add two more trailing zeros to API
+    data['API'] = data['API'] + '00'
+
+    data = data[['Prod Date', 'API', 'Oil Prod', 'Gas Prod', 'Water Prod']]
+    
+    # add new column to data called 'dataSource' and set all values to "other"
+    data['dataSource'] = "other"
+    
+    columnsComboCurve = [
+        "date",
+        "chosenID",
+        "oil",
+        "gas",
+        "water",
+        "dataSource",
+    ]
+    
+    data.columns = columnsComboCurve
+    
+    return data
 
 
 """
