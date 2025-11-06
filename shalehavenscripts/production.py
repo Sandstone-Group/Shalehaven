@@ -111,6 +111,9 @@ def aethonProductionData(pathToData):
     
     data['API'] = data['API'].astype(str)
     
+    # drop operatorID rows that are not 9724
+    data = data[data['OperatorID'] == 9724]
+    
     data = data[['Production Date', 'API', 'Oil Production', 'Gas Production', 'Water Production']]
     
     # add new column to data called 'dataSource' and set all values to "other"
