@@ -10,6 +10,14 @@ import pandas as pd
 import numpy as np
 import os
 from dotenv import load_dotenv
+import warnings
+
+# disable `SettingWithCopyWarning
+pd.options.mode.chained_assignment = None  # default='warn'
+
+# disable future and user warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
+warnings.simplefilter(action='ignore', category=UserWarning)
 
 sandstoneComboCurveServiceAccount = os.getenv("SANDSTONE_COMBOCURVE_API_SEC_CODE")
 sandstoneComboCurveApiKey = os.getenv("SANDSTONE_COMBOCURVE_API_KEY_PASS")
