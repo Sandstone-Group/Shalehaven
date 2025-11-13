@@ -183,7 +183,7 @@ def devonProductionData(pathToData):
 
 """
 
-def mergeProductionWithTypeCurves(dailyprod, updated, original, wellList):
+def mergeProductionWithTypeCurves(dailyprod, updated, original, wellList, pathToDatabase):
     
     print("Begin Merging dailyprod with  Orginal and Updated Type Curves")
     
@@ -234,7 +234,7 @@ def mergeProductionWithTypeCurves(dailyprod, updated, original, wellList):
     
 """
 
-def cumulativeProduction(data):
+def cumulativeProduction(data, pathToDatabase):
     
     print("Begin Creating Cumulative Production Data")
     

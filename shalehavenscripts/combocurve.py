@@ -5,6 +5,7 @@ import json
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from combocurve_api_v1 import ComboCurveAuth, ServiceAccount
+import os
 
 """
 
@@ -140,7 +141,7 @@ def getWellsFromComboCurve(serviceAccount, comboCurveApi):
     
 """
 
-def getDailyProductionFromComboCurve(serviceAccount, comboCurveApi, wellList):
+def getDailyProductionFromComboCurve(serviceAccount, comboCurveApi, wellList, pathToDatabase):
     
     load_dotenv()  # load enviroment variables
     
@@ -192,7 +193,7 @@ def getDailyProductionFromComboCurve(serviceAccount, comboCurveApi, wellList):
     # drop createdAt, updatedAt columns
     dailyProductionsDf = dailyProductionsDf.drop(columns=["createdAt", "updatedAt"])
 
-    dailyProductionsDf.to_excel(r"C:\Users\Michael Tanner\OneDrive - Sandstone Group\Clients - Documents\# Shalehaven Partners\# Production\database\daily_production.xlsx")
+    dailyProductionsDf.to_excel(os.path.join(pathToDatabase, r"daily_production.xlsx"))
 
     
     print("Finished Getting Daily Productions from ComboCurve")

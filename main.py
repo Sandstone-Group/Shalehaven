@@ -34,7 +34,7 @@ pathToAdmiralData = os.getenv("SHALEHAVEN_ADMIRAL_PATH")
 pathToHuntData = os.getenv("SHALEHAVEN_HUNT_PATH")
 pathToAethonData = os.getenv("SHALEHAVEN_AETHON_PATH")
 pathToDevonData = os.getenv("SHALEHAVEN_DEVON_PATH")
-pathToDatabase = os.getenv("SANDSTONE_DATABASE_PATH")
+pathToDatabase = os.getenv("SHALEHAVEN_DATABASE_PATH")
 
 # Get Wells From ComboCurve and Split by Operator
 wells = combocurve.getWellsFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
@@ -61,16 +61,16 @@ combocurve.putDataComboCurve(aethonProductionData,sandstoneComboCurveServiceAcco
 combocurve.putDataComboCurve(devonProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
 
 # Get Daily Productions from ComboCurve for Shalehaven
-dailyProductions = combocurve.getDailyProductionFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, fundWells)
+dailyProductions = combocurve.getDailyProductionFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, fundWells, pathToDatabase)
 
 # Get Updated and Original Type Curves from ComboCurve for Shalehaven LP 2024
 updatedTypeCurves = combocurve.getDailyForecastFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, shalehavenProjectId, shalehavenForcastIdUpdatedTypeCurve, fundWells)
 originalTypeCurves = combocurve.getDailyForecastFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, shalehavenProjectId, shalehavenForcastIdOriginalTypeCurve, fundWells)
 
 # Merge Type Curves Updated and Orginal
-mergedUpdatedTypeCurves = production.mergeProductionWithTypeCurves(dailyProductions,updatedTypeCurves, originalTypeCurves, fundWells)
+mergedUpdatedTypeCurves = production.mergeProductionWithTypeCurves(dailyProductions,updatedTypeCurves, originalTypeCurves, fundWells, pathToDatabase)
 
 # Cumulative Summaries
-cumulativeProduction = production.cumulativeProduction(mergedUpdatedTypeCurves)
+cumulativeProduction = production.cumulativeProduction(mergedUpdatedTypeCurves, pathToDatabase)
 
 print("End Shalehaven ETL Process")
