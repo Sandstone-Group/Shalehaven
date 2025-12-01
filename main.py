@@ -34,6 +34,7 @@ pathToAdmiralData = os.getenv("SHALEHAVEN_ADMIRAL_PATH")
 pathToHuntData = os.getenv("SHALEHAVEN_HUNT_PATH")
 pathToAethonData = os.getenv("SHALEHAVEN_AETHON_PATH")
 pathToDevonData = os.getenv("SHALEHAVEN_DEVON_PATH")
+pathToMonthlyPDSData = os.getenv("SHALEHAVEN_MONTHLY_PDS_PATH")
 pathToDatabase = os.getenv("SHALEHAVEN_DATABASE_PATH")
 
 # Get Wells From ComboCurve and Split by Operator
@@ -53,12 +54,14 @@ admiralPermianProductionData = production.admiralPermianProductionData(pathToAdm
 huntOilProductionData = production.huntOilProductionData(pathToHuntData,huntWells)
 aethonProductionData = production.aethonProductionData(pathToAethonData)
 devonProductionData = production.devonProductionData(pathToDevonData)
+monthlyPds = production.pdsMonthlyData(pathToMonthlyPDSData)
 
 # Put Production Data to ComboCurve
-combocurve.putDataComboCurve(admiralPermianProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
-combocurve.putDataComboCurve(huntOilProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
-combocurve.putDataComboCurve(aethonProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
-combocurve.putDataComboCurve(devonProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
+combocurve.putDataComboCurveDaily(admiralPermianProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
+combocurve.putDataComboCurveDaily(huntOilProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
+combocurve.putDataComboCurveDaily(aethonProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
+combocurve.putDataComboCurveDaily(devonProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
+combocurve.putDataComboCurveMonthly(monthlyPds,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
 
 # Get Daily Productions from ComboCurve for Shalehaven
 dailyProductions = combocurve.getDailyProductionFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, fundWells, pathToDatabase)

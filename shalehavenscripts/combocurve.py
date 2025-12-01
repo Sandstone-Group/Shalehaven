@@ -7,14 +7,15 @@ from dotenv import load_dotenv
 from combocurve_api_v1 import ComboCurveAuth, ServiceAccount
 import os
 
+
+
 """
 
-    Script to put excel data into ComboCurve - production-ready
+    Script to put daily excel data into ComboCurve - production-ready
 
 """
 
-
-def putDataComboCurve(data, serviceAccount, comboCurveApi):
+def putDataComboCurveDaily(data, serviceAccount, comboCurveApi):
     
     load_dotenv()  # load enviroment variables
     
@@ -93,6 +94,64 @@ def putDataComboCurve(data, serviceAccount, comboCurveApi):
     )
 
     return text
+
+"""
+
+    Script to put monthly excel data into ComboCurve - production-ready
+
+"""
+
+def putDataComboCurveMonthly(data, serviceAccount, comboCurveApi):
+    
+    load_dotenv()  # load enviroment variables
+    
+    print("Start upsert of monthly well production data for update records from excel")
+
+    # connect to service account
+    service_account = ServiceAccount.from_file(serviceAccount)
+    # set API Key from enviroment variable
+    api_key = comboCurveApi
+    # specific Python ComboCurve authentication
+    combocurve_auth = ComboCurveAuth(service_account, api_key)
+
+    totalAssetProductionJson = data.to_json(
+        orient="records"
+    )  # converts to internal json format
+    
+    # loads json into format that can be sent to ComboCurve
+    cleanTotalAssetProduction = json.loads(totalAssetProductionJson)
+
+    print("Length of Sliced Data: " + str(len(cleanTotalAssetProduction)))
+
+    # sets url to monthly production for combo curve for monthly production
+    url = "https://api.combocurve.com/v1/monthly-productions"
+    auth_headers = combocurve_auth.get_auth_headers()  # authenticates ComboCurve
+
+    # put request to ComboCurve
+    response = requests.put(url, headers=auth_headers, json=cleanTotalAssetProduction)
+
+    responseCode = response.status_code  # sets response code to the current state
+    responseText = response.text  # sets response text to the current state
+
+    print("Response Code: " + str(responseCode))  # prints response code
+
+    if (
+        "successCount" in responseText
+    ):  # checks if the response text contains successCount
+        # finds the index of successCount
+        # prints the successCount and the number of data points sent
+        indexOfSuccessFail = responseText.index("successCount")
+        text = responseText[indexOfSuccessFail:]
+        print(text)
+
+    print(
+        "Finished PUT "
+        + str(len(cleanTotalAssetProduction))
+        + " Rows of New Production Data to ComboCurve from JOYN"
+    )
+
+    return text
+
 
 """
     

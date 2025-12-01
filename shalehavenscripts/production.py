@@ -321,3 +321,45 @@ def cumulativeProduction(data, pathToDatabase):
     print("Finished Creating Cumulative Production Data")
 
     return cumulativeData
+
+"""
+Convert Monthly PDS to ComboCurve Monthly Format    
+    
+"""
+
+def pdsMonthlyData(pathToData):
+    
+    print("Getting Devon Production Data")
+
+    load_dotenv()  # load enviroment variables
+    
+    # Update path to include the last file in the directory based on time modified
+    pathToData = max([os.path.join(pathToData, f) for f in os.listdir(pathToData)], key=os.path.getmtime)
+    
+    data = pd.read_csv(pathToData)
+    
+    data['API'] = data['API'].astype(str)
+    #drop last two characters from API
+    data['API'] = data['API'].str[:-2]
+    # add two more trailing zeros to API
+    data['API'] = data['API'] + '00'
+    # convert 'Production Date' to datetime format YYYY-MM-DD
+    data['Production Date'] = pd.to_datetime(data['Production Date'], format="%m/%d/%Y").dt.strftime("%Y-%m-%d")
+
+    data = data[['Production Date', 'API', 'Oil Production', 'Gas Production', 'Water Production']]
+    
+    # add new column to data called 'dataSource' and set all values to "other"
+    data['dataSource'] = "other"
+    
+    columnsComboCurve = [
+        "date",
+        "chosenID",
+        "oil",
+        "gas",
+        "water",
+        "dataSource",
+    ]
+    
+    data.columns = columnsComboCurve
+    
+    return data
