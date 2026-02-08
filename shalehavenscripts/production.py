@@ -134,7 +134,7 @@ def aethonProductionData(pathToData):
 
 """
 
-Get Devon Production Data
+Get Devon Production Data - PDS
 
 """
 
@@ -163,6 +163,77 @@ def devonProductionData(pathToData):
         data['API'] = data['API'] + '00'
 
         data = data[['Prod Date', 'API', 'Oil Prod', 'Gas Prod', 'Water Prod']]
+        
+        # add new column to data called 'dataSource' and set all values to "other"
+        data['dataSource'] = "other"
+        
+        columnsComboCurve = [
+            "date",
+            "chosenID",
+            "oil",
+            "gas",
+            "water",
+            "dataSource",
+        ]
+        
+        data.columns = columnsComboCurve
+    else:
+        
+        data = pd.read_csv(pathToData) 
+    
+        data['API'] = data['API'].astype(str)
+        
+        # drop operatorID rows that are not 9724
+        data = data[data['OperatorID'] == 1014]
+        
+        data = data[['Production Date', 'API', 'Oil Production', 'Gas Production', 'Water Production']]
+        
+        # add new column to data called 'dataSource' and set all values to "other"
+        data['dataSource'] = "other"
+        
+        columnsComboCurve = [
+            "date",
+            "chosenID",
+            "oil",
+            "gas",
+            "water",
+            "dataSource",
+        ]
+        
+        data.columns = columnsComboCurve
+    
+    return data
+
+"""
+
+Get COP Production Data - PDS
+
+"""
+
+def copProductionData(pathToData):
+    print("Getting ConocoPhillips Production Data")
+
+    load_dotenv()  # load enviroment variables
+    
+    # Update path to include the last file in the directory based on time modified
+    pathToData = max([os.path.join(pathToData, f) for f in os.listdir(pathToData)], key=os.path.getmtime)
+    
+    ### get file name
+    name = os.path.basename(pathToData)
+    # if starts with "PDSWDX"
+    if name.startswith("PDSWDX"):
+        data = pd.read_csv(pathToData) 
+        
+        # drop last row
+        data = data[:-1]
+        
+        data['API'] = data['API'].astype(str)
+        #drop last two characters from API
+        data['API'] = data['API'].str[:-2]
+        # add two more trailing zeros to API
+        data['API'] = data['API'] + '00'
+
+        data = data[['PRODDATE', 'API', 'OIL PROD', 'GAS PROD', 'WATER PROD']]
         
         # add new column to data called 'dataSource' and set all values to "other"
         data['dataSource'] = "other"
