@@ -19,7 +19,7 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 warnings.simplefilter(action='ignore', category=UserWarning)
 
 # path to AFE data
-pathToAfe = os.getenv("AFE_PATH")
+pathToAfe = os.getenv("SHALEHAVEN_AFE_PATH")
 
 print("Begin Shalehaven AFE ETL Process")
 
