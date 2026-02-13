@@ -21,12 +21,13 @@ warnings.simplefilter(action='ignore', category=UserWarning)
 # path to AFE data
 pathToAfe2025 = os.getenv("SHALEHAVEN_AFE_2025_PATH")
 pathToJib = os.getenv("SHALEHAVEN_JIB_PATH")
+pathToRevenue = os.getenv("SHALEHAVEN_REVENUE_PATH")
 
 
 runAfe = False # set to true to run the AFE ETL process, set to false to skip the AFE ETL process
 runJib = False # set to true to run the JIB ETL process, set to false to skip the JIB ETL process
-
-print("Begin Shalehaven AFE ETL Process")
+runRevenue = True # set to true to run the Revenue ETL process, set to false to skip the Revenue ETL process
+print("Begin Shalehaven LOS ETL Process")
 
 load_dotenv()  # load enviroment variables
 
@@ -42,6 +43,10 @@ if runJib:
 else:
     print("Skipping JIB ETL Process")
     
+# if runRevenue is true, run the Revenue ETL process
+if runRevenue:
+    revenueData = los.combineRevenueData(pathToRevenue)
+else:
+    print("Skipping Revenue ETL Process")
 
-
-print("Shalehaven AFE ETL Process Complete")
+print("Shalehaven LOS ETL Process Complete")
