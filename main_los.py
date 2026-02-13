@@ -22,11 +22,12 @@ warnings.simplefilter(action='ignore', category=UserWarning)
 pathToAfe2025 = os.getenv("SHALEHAVEN_AFE_2025_PATH")
 pathToJib = os.getenv("SHALEHAVEN_JIB_PATH")
 pathToRevenue = os.getenv("SHALEHAVEN_REVENUE_PATH")
+pathToDatabase = os.getenv("SHALEHAVEN_DATABASE_PATH")
 
 
 runAfe = False # set to true to run the AFE ETL process, set to false to skip the AFE ETL process
 runJib = False # set to true to run the JIB ETL process, set to false to skip the JIB ETL process
-runRevenue = True # set to true to run the Revenue ETL process, set to false to skip the Revenue ETL process
+runRevenue = False # set to true to run the Revenue ETL process, set to false to skip the Revenue ETL process
 print("Begin Shalehaven LOS ETL Process")
 
 load_dotenv()  # load enviroment variables
@@ -48,5 +49,12 @@ if runRevenue:
     revenueData = los.combineRevenueData(pathToRevenue)
 else:
     print("Skipping Revenue ETL Process")
+
+# get afeData, jibData, and revenueData from database
+afeData = pd.read_excel(os.path.join(pathToDatabase, r"afe_data.xlsx"))
+jibData = pd.read_excel(os.path.join(pathToDatabase, r"jib_data.xlsx"))
+revenueData = pd.read_excel(os.path.join(pathToDatabase, r"revenue_data.xlsx"))
+
+losData = los.formatLosData(jibData, revenueData)
 
 print("Shalehaven LOS ETL Process Complete")

@@ -83,3 +83,50 @@ def combineRevenueData(pathToRevenue):
     revenueData.to_excel(os.path.join(pathToDatabase, r"revenue_data.xlsx"), index=False)
     
     return revenueData
+
+"""
+
+Formats Rev and JIB data into single dataframe to be used for consolidated LOS reporting
+
+"""
+
+def formatLosData(jibData, revenueData):
+    
+    masterHeaders = [
+        "Invoice Date",
+        "Date",
+        "Operator",
+        "Owner Name",
+        "Owner Number",
+        "Invoice Number",
+        "Property Name",
+        "API Number",
+        "AFE Description",
+        "Product Bucket",
+        "Description",
+        "Price",
+        "Gross Volume",
+        "Gross Cost",
+        "Net Cost",
+        "Line Detail"
+    ]
+    
+    
+    data = revenueData
+    
+    # create empty dataframe with masterHeaders as columns
+    losData = pd.DataFrame(columns=masterHeaders)
+    # place headers in revenueData into losData based on <header mapping> in the correct columns and fill in the rest of the columns with null values
+    headerMapping = {
+        "Invoice Date": "Check Date",
+        "Date": "Prod Date",
+        "Operator": "Operator",
+        "Owner Name": "Owner Name",
+        "Owner Number": "Owner Number",
+        "Invoice Number": "Check Number",
+        "Property Name": "Property Name",
+        "API Number": "API Number",
+    }
+    
+    x= 5
+    return x
