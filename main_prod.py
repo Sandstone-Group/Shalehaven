@@ -39,16 +39,6 @@ pathToSpurData = os.getenv("SHALEHAVEN_SPUR_PATH")
 pathToMonthlyPDSData = os.getenv("SHALEHAVEN_MONTHLY_PDS_PATH")
 pathToDatabase = os.getenv("SHALEHAVEN_DATABASE_PATH")
 
-# # test Spur
-# wells = combocurve.getWellsFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
-# spurWells = wells[wells['currentOperator'] == 'Spur Energy Partners LLC']
-# wellMapping = dict(zip(spurWells['wellName'], spurWells['chosenID']))
-# spurProductionData = production.spurProductionData(pathToSpurData, wellMapping)
-# combocurve.putDataComboCurveDaily(spurProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
-
-
-# x= 5
-
 # Get Wells From ComboCurve and Split by Operator
 wells = combocurve.getWellsFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
 huntWells = wells[wells['currentOperator'] == 'HUNT OIL COMPANY']
