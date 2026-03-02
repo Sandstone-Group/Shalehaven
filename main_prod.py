@@ -35,8 +35,19 @@ pathToHuntData = os.getenv("SHALEHAVEN_HUNT_PATH")
 pathToAethonData = os.getenv("SHALEHAVEN_AETHON_PATH")
 pathToDevonData = os.getenv("SHALEHAVEN_DEVON_PATH")
 pathToCopData = os.getenv("SHALEHAVEN_COP_PATH")
+pathToSpurData = os.getenv("SHALEHAVEN_SPUR_PATH")
 pathToMonthlyPDSData = os.getenv("SHALEHAVEN_MONTHLY_PDS_PATH")
 pathToDatabase = os.getenv("SHALEHAVEN_DATABASE_PATH")
+
+# # test Spur
+# wells = combocurve.getWellsFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
+# spurWells = wells[wells['currentOperator'] == 'Spur Energy Partners LLC']
+# wellMapping = dict(zip(spurWells['wellName'], spurWells['chosenID']))
+# spurProductionData = production.spurProductionData(pathToSpurData, wellMapping)
+# combocurve.putDataComboCurveDaily(spurProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
+
+
+# x= 5
 
 # Get Wells From ComboCurve and Split by Operator
 wells = combocurve.getWellsFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
@@ -45,7 +56,8 @@ admiralWells = wells[wells['currentOperator'] == 'ADMIRAL PERMIAN OPERATING LLC'
 aethonWells = wells[wells['currentOperator'] == 'AETHON ENERGY OPERATING LLC']
 devonWells = wells[wells['currentOperator'] == 'DEVON ENERGY PRODUCTION COMPANY LP']
 copWells = wells[wells['currentOperator'] == 'COG OPERATING LLC']
-fundWells = pd.concat([huntWells, admiralWells, aethonWells, devonWells, copWells]) # merge huntWells with admiralWells, devonWells, aethonWells, and copWells
+spurWells = wells[wells['currentOperator'] == 'Spur Energy Partners LLC']
+fundWells = pd.concat([huntWells, admiralWells, aethonWells, devonWells, copWells, spurWells]) # merge huntWells with admiralWells, devonWells, aethonWells, copWells, and spurWells
 
 # print fundWells to database
 fundWells.to_excel(os.path.join(pathToDatabase, r"fundWells.xlsx"))
@@ -57,6 +69,8 @@ huntOilProductionData = production.huntOilProductionData(pathToHuntData,huntWell
 aethonProductionData = production.aethonProductionData(pathToAethonData)
 devonProductionData = production.devonProductionData(pathToDevonData)
 copProductionData = production.copProductionData(pathToCopData)
+spurWellMapping = dict(zip(spurWells['wellName'], spurWells['chosenID']))
+spurProductionData = production.spurProductionData(pathToSpurData, spurWellMapping)
 monthlyPds = production.pdsMonthlyData(pathToMonthlyPDSData)
 
 # Put Production Data to ComboCurve
@@ -65,6 +79,7 @@ combocurve.putDataComboCurveDaily(huntOilProductionData,sandstoneComboCurveServi
 combocurve.putDataComboCurveDaily(aethonProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
 combocurve.putDataComboCurveDaily(devonProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
 combocurve.putDataComboCurveDaily(copProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
+combocurve.putDataComboCurveDaily(spurProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
 combocurve.putDataComboCurveMonthly(monthlyPds,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
 
 # Get Daily Productions from ComboCurve for Shalehaven

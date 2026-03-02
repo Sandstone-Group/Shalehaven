@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
 import os
+import re
 
 pathToDatabase = os.getenv("SANDSTONE_DATABASE_PATH")
 
@@ -275,6 +276,63 @@ def copProductionData(pathToData):
     
     return data
 
+"""
+
+Load Spur Energy Data from ProdView excel to ComboCurve Monthly Format
+
+"""
+
+def spurProductionData(pathToData, wellMapping):
+
+    print("Getting Spur Energy Production Data")
+
+    load_dotenv()  # load enviroment variables
+
+    # Update path to include the last file in the directory based on time modified
+    pathToData = max([os.path.join(pathToData, f) for f in os.listdir(pathToData)], key=os.path.getmtime)
+
+    data = pd.read_excel(pathToData, header=1)
+
+    rows = []
+    current_chosen_id = None
+
+    mapping_keys = list(wellMapping.keys())
+
+    for _, row in data.iterrows():
+        cell = row['Unit Name/Date']
+        if isinstance(cell, str) and cell.strip().upper().startswith("FRIESIAN"):
+            well_name = cell.strip()
+            if well_name in wellMapping:
+                current_chosen_id = wellMapping[well_name]
+            else:
+                # extract trailing well number (e.g. "01H" -> 1, "#001H" -> 1)
+                excel_num = re.search(r'#?0*(\d+)[Hh]\s*$', well_name)
+                matched = False
+                if excel_num:
+                    target = int(excel_num.group(1))
+                    for key in mapping_keys:
+                        key_num = re.search(r'#?0*(\d+)[Hh]\s*$', key)
+                        if key_num and int(key_num.group(1)) == target:
+                            print(f"  Matched '{well_name}' -> '{key}'")
+                            current_chosen_id = wellMapping[key]
+                            matched = True
+                            break
+                if not matched:
+                    print(f"  Warning: No match found for '{well_name}' in wellMapping")
+                    current_chosen_id = None
+        elif current_chosen_id is not None:
+            rows.append({
+                'date': pd.to_datetime(cell.strip()),
+                'chosenID': current_chosen_id,
+                'oil': row['Oil Production (bbl)'],
+                'gas': row['Gas Production (MCF)'],
+                'water': row['Water Production (bbl)'],
+                'dataSource': 'other',
+            })
+
+    data = pd.DataFrame(rows, columns=['date', 'chosenID', 'oil', 'gas', 'water', 'dataSource'])
+    
+    return data
 
 """
     
