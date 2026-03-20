@@ -20,6 +20,7 @@ warnings.simplefilter(action='ignore', category=UserWarning)
 
 # path to AFE data
 pathToAfe2025 = os.getenv("SHALEHAVEN_AFE_2025_PATH")
+pathToAfe2024 = os.getenv("SHALEHAVEN_AFE_2024_PATH")
 pathToJib = os.getenv("SHALEHAVEN_JIB_PATH")
 pathToRevenue = os.getenv("SHALEHAVEN_REVENUE_PATH")
 pathToDatabase = os.getenv("SHALEHAVEN_DATABASE_PATH")
@@ -34,18 +35,26 @@ load_dotenv()  # load enviroment variables
 
 # if runAFE is true, run the AFE ETL process
 if runAfe:
-    afeData = los.combineAfeData(pathToAfe2025)
+    print("Running AFE ETL Process")
+    afeData2025 = los.combineAfeData(pathToAfe2025)
+    afeData2024 = los.combineAfeData(pathToAfe2024)
+    # combine afeData2025 and afeData2024 into a single dataframe called afeData
+    afeData = pd.concat([afeData2025, afeData2024], ignore_index=True)
+    # save afeData to database
+    afeData.to_excel(os.path.join(pathToDatabase, r"afe_data.xlsx"), index=False)
 else:
     print("Skipping AFE ETL Process")
 
 # if runJib is true, run the JIB ETL process
 if runJib:
+    print("Running JIB ETL Process")
     jibData = los.combineJibData(pathToJib)
 else:
     print("Skipping JIB ETL Process")
     
 # if runRevenue is true, run the Revenue ETL process
 if runRevenue:
+    print("Running Revenue ETL Process")
     revenueData = los.combineRevenueData(pathToRevenue)
 else:
     print("Skipping Revenue ETL Process")

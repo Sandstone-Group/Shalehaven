@@ -34,10 +34,7 @@ def combineAfeData(pathToAfe):
                             df['Company Code'] = companyCode
                             break
                     afeData = pd.concat([afeData, df], ignore_index=True) # concatenate the current dataframe with the combined dataframe
-    
-    # print afeData to database using name "afe_data.xlsx"
-    afeData.to_excel(os.path.join(pathToDatabase, r"afe_data.xlsx"), index=False)
-    
+
     return afeData
 
 """
@@ -91,7 +88,7 @@ Formats Rev and JIB data into single dataframe to be used for consolidated LOS r
 """
 
 def formatLosData(jibData, revenueData):
-    
+
     masterHeaders = [
         "Invoice Date",
         "Date",
@@ -110,10 +107,10 @@ def formatLosData(jibData, revenueData):
         "Net Cost",
         "Line Detail"
     ]
-    
-    
+
+
     data = revenueData
-    
+
     # create empty dataframe with masterHeaders as columns
     losData = pd.DataFrame(columns=masterHeaders)
     # place headers in revenueData into losData based on <header mapping> in the correct columns and fill in the rest of the columns with null values
@@ -127,6 +124,6 @@ def formatLosData(jibData, revenueData):
         "Property Name": "Property Name",
         "API Number": "API Number",
     }
-    
+
     x= 5
     return x
