@@ -18,6 +18,8 @@ pd.options.mode.chained_assignment = None  # default='warn'
 warnings.simplefilter(action='ignore', category=FutureWarning)
 warnings.simplefilter(action='ignore', category=UserWarning)
 
+load_dotenv()  # load enviroment variables
+
 # path to AFE data
 pathToAfe2025 = os.getenv("SHALEHAVEN_AFE_2025_PATH")
 pathToAfe2024 = os.getenv("SHALEHAVEN_AFE_2024_PATH")
@@ -30,8 +32,6 @@ runAfe = False # set to true to run the AFE ETL process, set to false to skip th
 runJib = False # set to true to run the JIB ETL process, set to false to skip the JIB ETL process
 runRevenue = False # set to true to run the Revenue ETL process, set to false to skip the Revenue ETL process
 print("Begin Shalehaven LOS ETL Process")
-
-load_dotenv()  # load enviroment variables
 
 # if runAFE is true, run the AFE ETL process
 if runAfe:
@@ -65,5 +65,10 @@ jibData = pd.read_excel(os.path.join(pathToDatabase, r"jib_data.xlsx"))
 revenueData = pd.read_excel(os.path.join(pathToDatabase, r"revenue_data.xlsx"))
 
 losData = los.formatLosData(jibData, revenueData)
+
+# generate P&L data for Power BI
+pnlData = los.generatePnlData(jibData, revenueData)
+pnlData.to_excel(os.path.join(pathToDatabase, r"pnl_data.xlsx"), index=False)
+print("P&L data exported to pnl_data.xlsx")
 
 print("Shalehaven LOS ETL Process Complete")
