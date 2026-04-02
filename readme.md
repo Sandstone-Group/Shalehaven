@@ -14,9 +14,9 @@ Process geospatial constraints, run production models, and evaluate economics to
  
 ## Package Modules (`shalehavenscripts/`)
 
-- `los.py` — LOS calculations and spatial utilities
+- `los.py` — LOS calculations
 - `novi.py` — Novi Labs API client for authentication and data retrieval
-- `production.py` — Production data processing and decline analysis
+- `production.py` — Production data processing
 - `combocurve.py` — Combo/hybrid type curve generation
 
 ## Quick Start
