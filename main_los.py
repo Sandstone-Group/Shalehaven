@@ -29,8 +29,8 @@ pathToDatabase = os.getenv("SHALEHAVEN_DATABASE_PATH")
 
 
 runAfe = False # set to true to run the AFE ETL process, set to false to skip the AFE ETL process
-runJib = False # set to true to run the JIB ETL process, set to false to skip the JIB ETL process
-runRevenue = False # set to true to run the Revenue ETL process, set to false to skip the Revenue ETL process
+runJib = True # set to true to run the JIB ETL process, set to false to skip the JIB ETL process
+runRevenue = True # set to true to run the Revenue ETL process, set to false to skip the Revenue ETL process
 print("Begin Shalehaven LOS ETL Process")
 
 # if runAFE is true, run the AFE ETL process
