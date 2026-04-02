@@ -1,6 +1,6 @@
 # Shalehaven Scripts
 
-Python toolkit for shale energy investment analysis and operations at **Shalehaven Partners** — supporting tax-advantaged, non-operated oil & gas projects in proven basins. Developed by Michael Tanner. For questions or contributions, contact [Michael Tanner](mailto:development@shalehaven.com).
+Python toolkit for oil & gas investment analysis and operations at **Shalehaven Partners** — supporting tax-advantaged, non-operated oil & gas projects in proven basins. Developed by Michael Tanner. For questions or contributions, contact [Michael Tanner](mailto:dev@shalehaven.com).
 
 Process geospatial constraints, run production models, and evaluate economics to inform drilling decisions and investor returns.
 
