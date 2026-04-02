@@ -89,7 +89,7 @@ Process geospatial constraints, run production models, and evaluate economics to
     - `wellList` (DataFrame) — well list with `id`, `wellName`, and `chosenID` columns
 
 - **`afeleaks.py`** — AFE Leaks API client for well cost, production, and financial data
-  - No functions defined (configuration only: `BASE_URL`, `apiKey`)
+  - In progress
 
 ## Quick Start
 
