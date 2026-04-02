@@ -2,7 +2,7 @@
 ## Developed by Michael Tanner
 
 # Imports - SHEM Scripts
-import shalehavenscripts.model as model
+import shalehaven.shalehavenscripts.novi as novi
 import shalehavenscripts.combocurve as combocurve
 import shalehavenscripts.production as production
 
