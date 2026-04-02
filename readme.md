@@ -11,6 +11,9 @@ Process geospatial constraints, run production models, and evaluate economics to
 
 - **`main_prod.py`**  
   Production forecasting and operational analytics.  
+
+- **`main_model.py`**  
+  Core SHP model for evaluating drilling prospects.
  
 ## Package Modules (`shalehavenscripts/`)
 
@@ -18,6 +21,7 @@ Process geospatial constraints, run production models, and evaluate economics to
 - `novi.py` — Novi Labs API client for authentication and data retrieval
 - `production.py` — Production data processing
 - `combocurve.py` — Combo/hybrid type curve generation
+- `afeleaks.py` — AFE Leaks API client for well cost, production, and financial data
 
 ## Quick Start
 
