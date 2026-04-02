@@ -7,21 +7,15 @@ Process geospatial constraints, run production models, and evaluate economics to
 ## Core Scripts
 
 - **`main_los.py`**  
-  Line-of-Sight / geospatial visibility analysis + PnL output.  
-  Screens pad locations, pipeline routes, and infrastructure conflicts.
-
-- **`main_model.py`**  
-  Core modeling engine.  
-  Builds and runs reservoir, decline curve, and economic simulations.
+  Profit and loss analysis.
 
 - **`main_prod.py`**  
   Production forecasting and operational analytics.  
-  Handles historical data, type curves, and cash flow projections.
-
+ 
 ## Package Modules (`shalehavenscripts/`)
 
 - `los.py` — LOS calculations and spatial utilities
-- `model.py` — Modeling logic and simulation helpers
+- `novi.py` — Novi Labs API client for authentication and data retrieval
 - `production.py` — Production data processing and decline analysis
 - `combocurve.py` — Combo/hybrid type curve generation
 
