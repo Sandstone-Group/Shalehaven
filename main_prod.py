@@ -36,6 +36,7 @@ pathToAethonData = os.getenv("SHALEHAVEN_AETHON_PATH")
 pathToDevonData = os.getenv("SHALEHAVEN_DEVON_PATH")
 pathToCopData = os.getenv("SHALEHAVEN_COP_PATH")
 pathToSpurData = os.getenv("SHALEHAVEN_SPUR_PATH")
+pathToBallardData = os.getenv("SHALEHAVEN_BALLARD_PATH")
 pathToMonthlyPDSData = os.getenv("SHALEHAVEN_MONTHLY_PDS_PATH")
 pathToDatabase = os.getenv("SHALEHAVEN_DATABASE_PATH")
 
@@ -47,7 +48,8 @@ aethonWells = wells[wells['currentOperator'] == 'AETHON ENERGY OPERATING LLC']
 devonWells = wells[wells['currentOperator'] == 'DEVON ENERGY PRODUCTION COMPANY LP']
 copWells = wells[wells['currentOperator'] == 'COG OPERATING LLC']
 spurWells = wells[wells['currentOperator'] == 'Spur Energy Partners LLC']
-fundWells = pd.concat([huntWells, admiralWells, aethonWells, devonWells, copWells, spurWells]) # merge huntWells with admiralWells, devonWells, aethonWells, copWells, and spurWells
+ballardWells = wells[wells['currentOperator'] == 'Ballard Petroleum']
+fundWells = pd.concat([huntWells, admiralWells, aethonWells, devonWells, copWells, spurWells, ballardWells]) # merge huntWells with admiralWells, devonWells, aethonWells, copWells, spurWells, and ballardWells
 
 # print fundWells to database
 fundWells.to_excel(os.path.join(pathToDatabase, r"fundWells.xlsx"))
@@ -61,6 +63,7 @@ devonProductionData = production.devonProductionData(pathToDevonData)
 copProductionData = production.copProductionData(pathToCopData)
 spurWellMapping = dict(zip(spurWells['wellName'], spurWells['chosenID']))
 spurProductionData = production.spurProductionData(pathToSpurData, spurWellMapping)
+ballardProductionData = production.ballardProductionData(pathToBallardData)
 monthlyPds = production.pdsMonthlyData(pathToMonthlyPDSData)
 
 # Put Production Data to ComboCurve
@@ -70,6 +73,7 @@ combocurve.putDataComboCurveDaily(aethonProductionData,sandstoneComboCurveServic
 combocurve.putDataComboCurveDaily(devonProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
 combocurve.putDataComboCurveDaily(copProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
 combocurve.putDataComboCurveDaily(spurProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
+combocurve.putDataComboCurveDaily(ballardProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
 combocurve.putDataComboCurveMonthly(monthlyPds,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
 
 # Get Daily Productions from ComboCurve for Shalehaven

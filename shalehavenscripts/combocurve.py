@@ -19,8 +19,6 @@ def putDataComboCurveDaily(data, serviceAccount, comboCurveApi):
     
     load_dotenv()  # load enviroment variables
     
-    print("Start upsert of daily well production data for update records from excel")
-
     # connect to service account
     service_account = ServiceAccount.from_file(serviceAccount)
     # set API Key from enviroment variable
@@ -28,9 +26,6 @@ def putDataComboCurveDaily(data, serviceAccount, comboCurveApi):
     # specific Python ComboCurve authentication
     combocurve_auth = ComboCurveAuth(service_account, api_key)
 
-    # helps when uploading to ComboCurve to check for length of data (can only send 20,000 data points at a time)
-    print("Length of Total Asset Production: " + str(len(data)))
-    
     columnsComboCurve = [
         "date",
         "chosenID",
@@ -63,9 +58,6 @@ def putDataComboCurveDaily(data, serviceAccount, comboCurveApi):
     # loads json into format that can be sent to ComboCurve
     cleanTotalAssetProduction = json.loads(totalAssetProductionJson)
 
-    # prints length as final check (should be less than 20,000)
-    print("Length of Sliced Data: " + str(len(cleanTotalAssetProduction)))
-
     # sets url to daily production for combo curve for daily production
     url = "https://api.combocurve.com/v1/daily-productions"
     auth_headers = combocurve_auth.get_auth_headers()  # authenticates ComboCurve
@@ -76,16 +68,13 @@ def putDataComboCurveDaily(data, serviceAccount, comboCurveApi):
     responseCode = response.status_code  # sets response code to the current state
     responseText = response.text  # sets response text to the current state
 
-    print("Response Code: " + str(responseCode))  # prints response code
-
-    if (
-        "successCount" in responseText
-    ):  # checks if the response text contains successCount
-        # finds the index of successCount
-        # prints the successCount and the number of data points sent
-        indexOfSuccessFail = responseText.index("successCount")
-        text = responseText[indexOfSuccessFail:]
-        print(text)
+    responseJson = response.json()
+    successCount = responseJson.get("successCount", 0)
+    failedCount = responseJson.get("failedCount", 0)
+    text = f"Success: {successCount} Failed: {failedCount}"
+    print(text)
+    if failedCount > 0:
+        print("Errors: " + str(responseJson.get("results", []))[:500])
 
     print(
         "Finished PUT "
@@ -105,8 +94,6 @@ def putDataComboCurveMonthly(data, serviceAccount, comboCurveApi):
     
     load_dotenv()  # load enviroment variables
     
-    print("Start upsert of monthly well production data for update records from excel")
-
     # connect to service account
     service_account = ServiceAccount.from_file(serviceAccount)
     # set API Key from enviroment variable
@@ -121,8 +108,6 @@ def putDataComboCurveMonthly(data, serviceAccount, comboCurveApi):
     # loads json into format that can be sent to ComboCurve
     cleanTotalAssetProduction = json.loads(totalAssetProductionJson)
 
-    print("Length of Sliced Data: " + str(len(cleanTotalAssetProduction)))
-
     # sets url to monthly production for combo curve for monthly production
     url = "https://api.combocurve.com/v1/monthly-productions"
     auth_headers = combocurve_auth.get_auth_headers()  # authenticates ComboCurve
@@ -133,16 +118,13 @@ def putDataComboCurveMonthly(data, serviceAccount, comboCurveApi):
     responseCode = response.status_code  # sets response code to the current state
     responseText = response.text  # sets response text to the current state
 
-    print("Response Code: " + str(responseCode))  # prints response code
-
-    if (
-        "successCount" in responseText
-    ):  # checks if the response text contains successCount
-        # finds the index of successCount
-        # prints the successCount and the number of data points sent
-        indexOfSuccessFail = responseText.index("successCount")
-        text = responseText[indexOfSuccessFail:]
-        print(text)
+    responseJson = response.json()
+    successCount = responseJson.get("successCount", 0)
+    failedCount = responseJson.get("failedCount", 0)
+    text = f"Success: {successCount} Failed: {failedCount}"
+    print(text)
+    if failedCount > 0:
+        print("Errors: " + str(responseJson.get("results", []))[:500])
 
     print(
         "Finished PUT "

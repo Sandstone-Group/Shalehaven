@@ -335,6 +335,50 @@ def spurProductionData(pathToData, wellMapping):
     return data
 
 """
+
+Convert Ballard Petroleum Production Data from ProdView excel to ComboCurve Monthly Format
+
+"""
+
+def ballardProductionData(pathToData):
+    
+    print("Getting Ballard Petroleum Production Data")
+    
+    load_dotenv()  # load enviroment variables
+    
+    # Update path to include the last file in the directory based on time modified
+    pathToData = max([os.path.join(pathToData, f) for f in os.listdir(pathToData)], key=os.path.getmtime)
+    
+    data = pd.read_excel(pathToData) # read in excel data
+    
+    data = data[['RecordDate', 'API10', 'EstimatedOilProductionBBLS', 'EstimatedGasProductionMCF', 'EstimatedWaterProductionBBLS']] 
+    
+    # format API to be 14 characters by dropping leading zeros and adding trailing zeros if necessary, then convert to string
+    data['API'] = data['API10'].astype(str).str.lstrip('0').str.replace('.0', '', regex=False) + '0000'
+    data['API'] = data['API'].astype(str)
+    # add new column to data called 'dataSource' and set all values to "other"
+    data['dataSource'] = "other"
+
+    # reorder columns to match ComboCurve format
+    data = data[['RecordDate', 'API', 'EstimatedOilProductionBBLS', 'EstimatedGasProductionMCF', 'EstimatedWaterProductionBBLS', 'dataSource']]
+
+    columnsComboCurve = [
+        "date",
+        "chosenID",
+        "oil",
+        "gas",
+        "water",
+        "dataSource",
+    ]
+
+    data.columns = columnsComboCurve
+    
+    return data
+
+
+
+
+"""
     
     Merge daily production data with updated and original type curves from ComboCurve.
 
@@ -478,6 +522,10 @@ def cumulativeProduction(data, pathToDatabase):
     print("Finished Creating Cumulative Production Data")
 
     return cumulativeData
+
+
+
+
 
 """
 Convert Monthly PDS to ComboCurve Monthly Format    
