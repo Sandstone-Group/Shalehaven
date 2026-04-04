@@ -13,7 +13,7 @@ Process geospatial constraints, run production models, and evaluate economics to
   Production forecasting and operational analytics.  
 
 - **`main_model.py`**  
-  Core SHP modeling pipeline — authenticates with Novi, reads an AFE Summary, retrieves well permits and offset wells within 5 miles, and fetches production forecasts (EUR) for each offset.
+  Core SHP modeling pipeline — authenticates with Novi, prompts the user for an AFE Summary file path, retrieves well permits and offset wells within 5 miles, and fetches production forecasts (EUR) for each offset.
  
 ## Package Modules (`shalehavenscripts/`)
 
@@ -36,16 +36,19 @@ Process geospatial constraints, run production models, and evaluate economics to
     - `pathToFile` (string) — file path to the AFE Summary Excel file (must include "Landing Zone", "API Number", "County", and "State" columns)
   - `authNovi()` — Authenticates with the Novi Labs API using environment variables
     - No parameters (uses `NOVI_USERNAME` and `NOVI_PASSWORD` env vars)
-  - `getWellPermits(token, afeData)` — Retrieves well permits from Novi based on AFE Summary rows (API Number, County, State)
+  - `getWellPermits(token, afeData, scope="us-horizontals")` — Retrieves well permits from Novi based on AFE Summary rows (API Number, County, State)
     - `token` (string) — authentication token from `authNovi()`
     - `afeData` (DataFrame) — AFE Summary data from `readAFESummary()`
-  - `getWells(token, permitData, afeData)` — Finds horizontal wells within a 5-mile bounding box of permit locations, filtered by landing zone formation
+    - `scope` (string, optional) — Novi API well scope (default `"us-horizontals"`)
+  - `getWells(token, permitData, afeData, scope="us-horizontals")` — Finds horizontal wells within a 5-mile bounding box of permit locations, filtered by landing zone formation
     - `token` (string) — authentication token from `authNovi()`
     - `permitData` (DataFrame) — permit data with Latitude/Longitude from `getWellPermits()`
     - `afeData` (DataFrame) — AFE Summary data (used for Landing Zone filter)
-  - `getWellForecast(token, offsetData)` — Retrieves forecast EUR (Oil, Gas, Water) for each offset well
+    - `scope` (string, optional) — Novi API well scope (default `"us-horizontals"`)
+  - `getWellForecast(token, offsetData, scope="us-horizontals")` — Retrieves forecast EUR (Oil, Gas, Water) for each offset well via `forecast_well_years` endpoint
     - `token` (string) — authentication token from `authNovi()`
     - `offsetData` (DataFrame) — offset wells from `getWells()`
+    - `scope` (string, optional) — Novi API well scope (default `"us-horizontals"`)
 
 - **`production.py`** — Production data processing
   - `admiralPermianProductionData(pathToData)` — Imports and formats Admiral Permian well production data
