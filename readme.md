@@ -13,7 +13,7 @@ Process geospatial constraints, run production models, and evaluate economics to
   Production forecasting and operational analytics.  
 
 - **`main_model.py`**  
-  Core SHP model for evaluating drilling prospects.
+  Core SHP modeling pipeline — authenticates with Novi, reads an AFE Summary, retrieves well permits and offset wells within 5 miles, and fetches production forecasts (EUR) for each offset.
  
 ## Package Modules (`shalehavenscripts/`)
 
@@ -31,11 +31,21 @@ Process geospatial constraints, run production models, and evaluate economics to
     - `jibData` (DataFrame) — combined JIB data from `combineJibData()`
     - `revenueData` (DataFrame) — combined revenue data from `combineRevenueData()`
 
-- **`novi.py`** — Novi Labs API client for authentication and data retrieval
+- **`novi.py`** — Novi Labs API client for authentication, permit lookup, offset well search, and forecasting
+  - `readAFESummary(pathToFile)` — Reads an AFE Summary Excel file into a DataFrame
+    - `pathToFile` (string) — file path to the AFE Summary Excel file (must include "Landing Zone", "API Number", "County", and "State" columns)
   - `authNovi()` — Authenticates with the Novi Labs API using environment variables
     - No parameters (uses `NOVI_USERNAME` and `NOVI_PASSWORD` env vars)
-  - `getWells(token)` — Retrieves well data from the Novi API
+  - `getWellPermits(token, afeData)` — Retrieves well permits from Novi based on AFE Summary rows (API Number, County, State)
     - `token` (string) — authentication token from `authNovi()`
+    - `afeData` (DataFrame) — AFE Summary data from `readAFESummary()`
+  - `getWells(token, permitData, afeData)` — Finds horizontal wells within a 5-mile bounding box of permit locations, filtered by landing zone formation
+    - `token` (string) — authentication token from `authNovi()`
+    - `permitData` (DataFrame) — permit data with Latitude/Longitude from `getWellPermits()`
+    - `afeData` (DataFrame) — AFE Summary data (used for Landing Zone filter)
+  - `getWellForecast(token, offsetData)` — Retrieves forecast EUR (Oil, Gas, Water) for each offset well
+    - `token` (string) — authentication token from `authNovi()`
+    - `offsetData` (DataFrame) — offset wells from `getWells()`
 
 - **`production.py`** — Production data processing
   - `admiralPermianProductionData(pathToData)` — Imports and formats Admiral Permian well production data
@@ -52,6 +62,8 @@ Process geospatial constraints, run production models, and evaluate economics to
   - `spurProductionData(pathToData, wellMapping)` — Loads Spur Energy production data from ProdView Excel
     - `pathToData` (string) — file path to the Spur Energy data directory
     - `wellMapping` (dict) — dictionary mapping well names to chosenIDs
+  - `ballardProductionData(pathToData)` — Converts Ballard Petroleum production data from Excel to ComboCurve format, formatting API10 to 14-character chosenID
+    - `pathToData` (string) — file path to the Ballard Petroleum data directory
   - `mergeProductionWithTypeCurves(dailyprod, updated, original, wellList, pathToDatabase)` — Merges daily production with type curves from ComboCurve
     - `dailyprod` (DataFrame) — daily production data
     - `updated` (DataFrame) — updated type curve forecast data
