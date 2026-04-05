@@ -41,9 +41,9 @@ def authNovi():
 ## Formation name is pulled from AFE Summary "Landing Zone" column and uppercased for Novi
 def getWells(token, permitData, afeData, scope="us-horizontals"):
 
-    # Calculate bounding box: 3 miles around the permit locations
+    # Calculate bounding box around the permit locations
     # 1 degree latitude ~ 69 miles, 1 degree longitude ~ 69 * cos(lat) miles
-    miles = 3
+    miles = int(input("Enter search radius in miles: ").strip())
     lat_offset = miles / 69.0
     avg_lat = permitData["Latitude"].mean()
     lon_offset = miles / (69.0 * abs(math.cos(math.radians(avg_lat))))
@@ -54,13 +54,13 @@ def getWells(token, permitData, afeData, scope="us-horizontals"):
     min_lon = permitData["Longitude"].min() - lon_offset
     max_lon = permitData["Longitude"].max() + lon_offset
 
-    # Pull formation from AFE Summary and uppercase to match Novi format
-    formation = afeData["Landing Zone"].iloc[0].upper()
+    # Pull all unique formations from AFE Summary and uppercase to match Novi format
+    formations = afeData["Landing Zone"].dropna().str.upper().unique().tolist()
 
-    print(f"Searching for wells within 3 miles of permit locations, Formation: {formation}")
+    print(f"Searching for wells within {miles} miles of permit locations, Formations: {formations}")
     print(f"Bounding box: Lat [{min_lat:.4f}, {max_lat:.4f}], Lon [{min_lon:.4f}, {max_lon:.4f}]")
 
-    # Query well_details using SHL coordinates and formation filter
+    # Query well_details using SHL coordinates and formation filter (batch all formations)
     params = {
         "authentication_token": token,
         "scope": scope,
@@ -68,7 +68,7 @@ def getWells(token, permitData, afeData, scope="us-horizontals"):
         "q[SHLLatitude_lteq]": max_lat,
         "q[SHLLongitude_gteq]": min_lon,
         "q[SHLLongitude_lteq]": max_lon,
-        "q[Formation_eq]": formation,
+        "q[Formation_in][]": formations,
     }
 
     # Paginate through results, 100 wells per page
@@ -266,44 +266,51 @@ def getNoviYearlyForecast(token, offsetData, scope="us-horizontals"):
 def getNoviMonthlyForecast(token, forecastData, scope="us-horizontals"):
 
     api10_list = forecastData["API10"].tolist()
-    print(f"Fetching monthly forecasts for {len(api10_list)} wells in batch...")
+    print(f"Fetching monthly forecasts for {len(api10_list)} wells...")
 
-    params = {
-        "authentication_token": token,
-        "scope": scope,
-        "q[API10_in][]": api10_list,
-    }
-
+    # Chunk into batches of 50 wells to avoid API timeouts
+    batch_size = 50
     all_monthly = []
-    page = 1
 
-    while True:
-        params["page"] = page
+    for i in range(0, len(api10_list), batch_size):
+        batch = api10_list[i:i + batch_size]
+        print(f"\nBatch {i // batch_size + 1} ({len(batch)} wells, {i + len(batch)}/{len(api10_list)} total)...")
 
-        for attempt in range(1, 4):
-            try:
-                response = requests.get(BASE_URL + "v3/forecast_well_months.json", params=params, timeout=300)
-                response.raise_for_status()
+        params = {
+            "authentication_token": token,
+            "scope": scope,
+            "q[API10_in][]": batch,
+        }
+
+        page = 1
+
+        while True:
+            params["page"] = page
+
+            for attempt in range(1, 4):
+                try:
+                    response = requests.get(BASE_URL + "v3/forecast_well_months.json", params=params, timeout=300)
+                    response.raise_for_status()
+                    break
+                except requests.exceptions.ReadTimeout:
+                    print(f"  Request timed out (attempt {attempt}/3), retrying...")
+                    if attempt == 3:
+                        raise
+
+            data = response.json()
+
+            if not data:
                 break
-            except requests.exceptions.ReadTimeout:
-                print(f"  Request timed out (attempt {attempt}/3), retrying...")
-                if attempt == 3:
-                    raise
 
-        data = response.json()
+            all_monthly.extend(data)
+            print(f"  Page {page}: {len(data)} records ({len(all_monthly)} total)")
 
-        if not data:
-            break
+            if len(data) < 600:
+                break
 
-        all_monthly.extend(data)
-        print(f"  Page {page}: {len(data)} records ({len(all_monthly)} total)")
+            page += 1
 
-        if len(data) < 600:
-            break
-
-        page += 1
-
-    print(f"Done. Retrieved {len(all_monthly)} total monthly forecast records.")
+    print(f"\nDone. Retrieved {len(all_monthly)} total monthly forecast records.")
     monthlyDf = pd.DataFrame(all_monthly)
 
     return monthlyDf
@@ -314,9 +321,13 @@ def getNoviMonthlyForecast(token, forecastData, scope="us-horizontals"):
 ## forecastData_{DSU Name}.xlsx - monthly forecast volumes
 def printData(forecastData, monthlyForecastData, pathToAfeSummary):
     # Parse DSU name from AFE Summary filename (everything after the "-")
-    outputDir = os.path.dirname(pathToAfeSummary)
+    afeDir = os.path.dirname(pathToAfeSummary)
     afeFilename = os.path.splitext(os.path.basename(pathToAfeSummary))[0]
     dsuName = afeFilename.split("-", 1)[1].strip() if "-" in afeFilename else afeFilename
+
+    # Create "Data" subfolder next to AFE Summary (or use existing one)
+    outputDir = os.path.join(afeDir, "Data")
+    os.makedirs(outputDir, exist_ok=True)
 
     # Export header data (offset wells with EUR)
     headerPath = os.path.join(outputDir, f"headerData_{dsuName}.xlsx")
