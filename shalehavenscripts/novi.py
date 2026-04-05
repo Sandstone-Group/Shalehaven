@@ -197,34 +197,29 @@ def getWellPermits(token, afeData, scope="us-horizontals"):
 
 
 ## Retrieve EUR forecasts for offset wells by summing all forecast years (up to 50 years)
-## Queries forecast_well_years endpoint per well and sums OilPerYear, GasPerYear, WaterPerYear
+## Batches all API10s into a single request using q[API10_in][] filter
 ## Appends Oil EUR, Gas EUR, Water EUR columns to the offset well DataFrame
-def getWellForecast(token, offsetData, scope="us-horizontals"):
+def getNoviYearlyForecast(token, offsetData, scope="us-horizontals"):
 
-    # Collect EUR values for each well
-    oil_eur = []
-    gas_eur = []
-    water_eur = []
+    api10_list = offsetData["API10"].tolist()
+    print(f"Fetching yearly forecasts for {len(api10_list)} wells in batch...")
 
-    # Loop through each offset well and query its forecast
-    for index, row in offsetData.iterrows():
-        well_id = row["API10"]
-        well_name = row.get("WellName", well_id)
+    params = {
+        "authentication_token": token,
+        "scope": scope,
+        "q[API10_in][]": api10_list,
+    }
 
-        print(f"\nWell {index + 1}/{len(offsetData)}: Fetching forecast months for {well_name} (API10: {well_id})")
+    # Paginate through all results
+    all_data = []
+    page = 1
 
-        params = {
-            "authentication_token": token,
-            "scope": scope,
-            "q[API10_eq]": well_id,
-        }
+    while True:
+        params["page"] = page
 
-        print(f"  Querying well forecast data...")
-
-        # Retry up to 3 times on timeout
         for attempt in range(1, 4):
             try:
-                response = requests.get(BASE_URL + "v3/forecast_well_years.json", params=params, timeout=120)
+                response = requests.get(BASE_URL + "v3/forecast_well_years.json", params=params, timeout=300)
                 response.raise_for_status()
                 break
             except requests.exceptions.ReadTimeout:
@@ -234,42 +229,101 @@ def getWellForecast(token, offsetData, scope="us-horizontals"):
 
         data = response.json()
 
-        # Sum across all forecast years (up to 50) to get total EUR
-        if data:
-            oil_sum = sum((year.get("OilPerYear", 0) or 0) for year in data)
-            gas_sum = sum((year.get("GasPerYear", 0) or 0) for year in data)
-            water_sum = sum((year.get("WaterPerYear", 0) or 0) for year in data)
-            print(f"  Summed {len(data)} forecast years")
-            print(f"  EUR - Oil: {oil_sum:,.0f}, Gas: {gas_sum:,.0f}, Water: {water_sum:,.0f}")
-        else:
-            oil_sum = 0
-            gas_sum = 0
-            water_sum = 0
-            print(f"  No forecast data found.")
+        if not data:
+            break
 
-        oil_eur.append(oil_sum)
-        gas_eur.append(gas_sum)
-        water_eur.append(water_sum)
+        all_data.extend(data)
+        print(f"  Page {page}: {len(data)} records ({len(all_data)} total)")
+
+        if len(data) < 100:
+            break
+
+        page += 1
+
+    # Group by API10 and sum EUR
+    eur_map = {}
+    for record in all_data:
+        api10 = record.get("API10")
+        if api10 not in eur_map:
+            eur_map[api10] = {"oil": 0, "gas": 0, "water": 0}
+        eur_map[api10]["oil"] += (record.get("OilPerYear", 0) or 0)
+        eur_map[api10]["gas"] += (record.get("GasPerYear", 0) or 0)
+        eur_map[api10]["water"] += (record.get("WaterPerYear", 0) or 0)
 
     # Append EUR columns to offset well data
     offsetData = offsetData.copy()
-    offsetData["Oil EUR"] = oil_eur
-    offsetData["Gas EUR"] = gas_eur
-    offsetData["Water EUR"] = water_eur
+    offsetData["Oil EUR"] = offsetData["API10"].map(lambda x: eur_map.get(x, {}).get("oil", 0))
+    offsetData["Gas EUR"] = offsetData["API10"].map(lambda x: eur_map.get(x, {}).get("gas", 0))
+    offsetData["Water EUR"] = offsetData["API10"].map(lambda x: eur_map.get(x, {}).get("water", 0))
 
-    print(f"\nDone. Retrieved forecast data for {len(offsetData)} wells.")
+    print(f"Done. Retrieved forecast data for {len(eur_map)} of {len(api10_list)} wells.")
     return offsetData
 
 
-## Export offset well data with EUR to Excel file in the same directory as the AFE Summary
-## Filename is headerData_{DSU Name}.xlsx where DSU Name is parsed from the AFE Summary filename after the "-"
-def printHeaderData(forecastData, pathToAfeSummary):
+## Retrieve monthly forecast volumes for all wells in forecastData
+## Batches all API10s into a single request using q[API10_in][] filter
+## Paginates through all pages (600 records per page)
+def getNoviMonthlyForecast(token, forecastData, scope="us-horizontals"):
+
+    api10_list = forecastData["API10"].tolist()
+    print(f"Fetching monthly forecasts for {len(api10_list)} wells in batch...")
+
+    params = {
+        "authentication_token": token,
+        "scope": scope,
+        "q[API10_in][]": api10_list,
+    }
+
+    all_monthly = []
+    page = 1
+
+    while True:
+        params["page"] = page
+
+        for attempt in range(1, 4):
+            try:
+                response = requests.get(BASE_URL + "v3/forecast_well_months.json", params=params, timeout=300)
+                response.raise_for_status()
+                break
+            except requests.exceptions.ReadTimeout:
+                print(f"  Request timed out (attempt {attempt}/3), retrying...")
+                if attempt == 3:
+                    raise
+
+        data = response.json()
+
+        if not data:
+            break
+
+        all_monthly.extend(data)
+        print(f"  Page {page}: {len(data)} records ({len(all_monthly)} total)")
+
+        if len(data) < 600:
+            break
+
+        page += 1
+
+    print(f"Done. Retrieved {len(all_monthly)} total monthly forecast records.")
+    monthlyDf = pd.DataFrame(all_monthly)
+
+    return monthlyDf
+
+
+## Export header data and monthly forecast data to Excel files in the same directory as the AFE Summary
+## headerData_{DSU Name}.xlsx - offset wells with EUR
+## forecastData_{DSU Name}.xlsx - monthly forecast volumes
+def printData(forecastData, monthlyForecastData, pathToAfeSummary):
     # Parse DSU name from AFE Summary filename (everything after the "-")
     outputDir = os.path.dirname(pathToAfeSummary)
     afeFilename = os.path.splitext(os.path.basename(pathToAfeSummary))[0]
     dsuName = afeFilename.split("-", 1)[1].strip() if "-" in afeFilename else afeFilename
 
-    # Write to Excel in the same folder as the AFE Summary
-    outputPath = os.path.join(outputDir, f"headerData_{dsuName}.xlsx")
-    forecastData.to_excel(outputPath, index=False)
-    print(f"Exported {len(forecastData)} offset wells with EUR to {outputPath}")
+    # Export header data (offset wells with EUR)
+    headerPath = os.path.join(outputDir, f"headerData_{dsuName}.xlsx")
+    forecastData.to_excel(headerPath, index=False)
+    print(f"Exported {len(forecastData)} offset wells with EUR to {headerPath}")
+
+    # Export monthly forecast data
+    forecastPath = os.path.join(outputDir, f"forecastData_{dsuName}.xlsx")
+    monthlyForecastData.to_excel(forecastPath, index=False)
+    print(f"Exported {len(monthlyForecastData)} monthly forecast rows to {forecastPath}")
