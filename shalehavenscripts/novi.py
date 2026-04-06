@@ -60,7 +60,7 @@ def getWells(token, permitData, afeData, scope="us-horizontals"):
     print(f"Searching for wells within {miles} miles of permit locations, Formations: {formations}")
     print(f"Bounding box: Lat [{min_lat:.4f}, {max_lat:.4f}], Lon [{min_lon:.4f}, {max_lon:.4f}]")
 
-    # Query well_details using SHL coordinates and formation filter (batch all formations)
+    # Query bulk endpoint with bounding box and formation filter
     params = {
         "authentication_token": token,
         "scope": scope,
@@ -71,38 +71,19 @@ def getWells(token, permitData, afeData, scope="us-horizontals"):
         "q[Formation_in][]": formations,
     }
 
-    # Paginate through results, 100 wells per page
-    all_wells = []
-    page = 1
+    print("Fetching offset wells via bulk endpoint...")
 
-    while True:
-        params["page"] = page
-        print(f"Fetching page {page}...")
-
-        # Retry up to 5 times on timeout
-        for attempt in range(1, 6):
-            try:
-                response = requests.get(BASE_URL + "v3/well_details.json", params=params, timeout=300)
-                response.raise_for_status()
-                break
-            except requests.exceptions.ReadTimeout:
-                print(f"Request timed out (attempt {attempt}/5), retrying...")
-                if attempt == 5:
-                    raise
-
-        data = response.json()
-
-        if not data:
+    for attempt in range(1, 6):
+        try:
+            response = requests.get(BASE_URL + "v3/bulk.json", params=params, timeout=600)
+            response.raise_for_status()
             break
+        except requests.exceptions.ReadTimeout:
+            print(f"Request timed out (attempt {attempt}/5), retrying...")
+            if attempt == 5:
+                raise
 
-        all_wells.extend(data)
-        print(f"Page {page} returned {len(data)} wells ({len(all_wells)} total so far)")
-
-        # Less than 100 results means we've hit the last page
-        if len(data) < 100:
-            break
-
-        page += 1
+    all_wells = response.json()
 
     print(f"Done. Retrieved {len(all_wells)} wells total.")
     return pd.DataFrame(all_wells)
@@ -260,57 +241,37 @@ def getNoviYearlyForecast(token, offsetData, scope="us-horizontals"):
 
 
 ## Retrieve monthly forecast volumes for all wells in forecastData
-## Batches all API10s into a single request using q[API10_in][] filter
-## Paginates through all pages (600 records per page)
+## Uses the bulk export endpoint for a single fast download, then filters to matching API10s
 def getNoviMonthlyForecast(token, forecastData, scope="us-horizontals"):
 
     api10_list = forecastData["API10"].tolist()
-    print(f"Fetching monthly forecasts for {len(api10_list)} wells...")
+    api10_set = set(api10_list)
+    print(f"Fetching monthly forecasts for {len(api10_list)} wells via bulk endpoint...")
 
-    # Chunk into batches of 50 wells to avoid API timeouts
-    batch_size = 25
-    all_monthly = []
+    params = {
+        "authentication_token": token,
+        "scope": scope,
+        "q[API10_in][]": api10_list,
+    }
 
-    for i in range(0, len(api10_list), batch_size):
-        batch = api10_list[i:i + batch_size]
-        print(f"\nBatch {i // batch_size + 1} ({len(batch)} wells, {i + len(batch)}/{len(api10_list)} total)...")
+    for attempt in range(1, 6):
+        try:
+            response = requests.get(BASE_URL + "v3/bulk.json", params=params, timeout=600)
+            response.raise_for_status()
+            break
+        except requests.exceptions.ReadTimeout:
+            print(f"  Request timed out (attempt {attempt}/5), retrying...")
+            if attempt == 5:
+                raise
 
-        params = {
-            "authentication_token": token,
-            "scope": scope,
-            "q[API10_in][]": batch,
-        }
+    data = response.json()
+    print(f"Bulk endpoint returned {len(data)} records.")
 
-        page = 1
-
-        while True:
-            params["page"] = page
-
-            for attempt in range(1, 6):
-                try:
-                    response = requests.get(BASE_URL + "v3/forecast_well_months.json", params=params, timeout=450)
-                    response.raise_for_status()
-                    break
-                except requests.exceptions.ReadTimeout:
-                    print(f"  Request timed out (attempt {attempt}/5), retrying...")
-                    if attempt == 5:
-                        raise
-
-            data = response.json()
-
-            if not data:
-                break
-
-            all_monthly.extend(data)
-            print(f"  Page {page}: {len(data)} records ({len(all_monthly)} total)")
-
-            if len(data) < 600:
-                break
-
-            page += 1
-
-    print(f"\nDone. Retrieved {len(all_monthly)} total monthly forecast records.")
-    monthlyDf = pd.DataFrame(all_monthly)
+    # Filter to only our wells
+    monthlyDf = pd.DataFrame(data)
+    if not monthlyDf.empty and "API10" in monthlyDf.columns:
+        monthlyDf = monthlyDf[monthlyDf["API10"].isin(api10_set)]
+        print(f"Filtered to {len(monthlyDf)} records matching {len(api10_set)} wells.")
 
     return monthlyDf
 
