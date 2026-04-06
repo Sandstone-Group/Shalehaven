@@ -43,7 +43,7 @@ def getWells(token, permitData, afeData, scope="us-horizontals"):
 
     # Calculate bounding box around the permit locations
     # 1 degree latitude ~ 69 miles, 1 degree longitude ~ 69 * cos(lat) miles
-    miles = int(input("Enter search radius in miles: ").strip())
+    miles = float(input("Enter search radius in miles: ").strip())
     lat_offset = miles / 69.0
     avg_lat = permitData["Latitude"].mean()
     lon_offset = miles / (69.0 * abs(math.cos(math.radians(avg_lat))))
@@ -64,10 +64,10 @@ def getWells(token, permitData, afeData, scope="us-horizontals"):
     params = {
         "authentication_token": token,
         "scope": scope,
-        "q[SHLLatitude_gteq]": min_lat,
-        "q[SHLLatitude_lteq]": max_lat,
-        "q[SHLLongitude_gteq]": min_lon,
-        "q[SHLLongitude_lteq]": max_lon,
+        "q[MPLatitude_gteq]": min_lat,
+        "q[MPLatitude_lteq]": max_lat,
+        "q[MPLongitude_gteq]": min_lon,
+        "q[MPLongitude_lteq]": max_lon,
         "q[Formation_in][]": formations,
     }
 
@@ -187,7 +187,6 @@ def getWellPermits(token, afeData, scope="us-horizontals"):
     permitDf = pd.DataFrame(all_permits)
 
     # Texas permits often have null Lat/Lon but BHL coordinates are populated - use those as fallback
-    pd.set_option('future.no_silent_downcasting', True)
     if "Latitude" in permitDf.columns and "BHLLatitude" in permitDf.columns:
         permitDf["Latitude"] = permitDf["Latitude"].fillna(permitDf["BHLLatitude"])
     if "Longitude" in permitDf.columns and "BHLLongitude" in permitDf.columns:
@@ -269,7 +268,7 @@ def getNoviMonthlyForecast(token, forecastData, scope="us-horizontals"):
     print(f"Fetching monthly forecasts for {len(api10_list)} wells...")
 
     # Chunk into batches of 50 wells to avoid API timeouts
-    batch_size = 50
+    batch_size = 25
     all_monthly = []
 
     for i in range(0, len(api10_list), batch_size):
@@ -287,14 +286,14 @@ def getNoviMonthlyForecast(token, forecastData, scope="us-horizontals"):
         while True:
             params["page"] = page
 
-            for attempt in range(1, 4):
+            for attempt in range(1, 6):
                 try:
-                    response = requests.get(BASE_URL + "v3/forecast_well_months.json", params=params, timeout=300)
+                    response = requests.get(BASE_URL + "v3/forecast_well_months.json", params=params, timeout=450)
                     response.raise_for_status()
                     break
                 except requests.exceptions.ReadTimeout:
-                    print(f"  Request timed out (attempt {attempt}/3), retrying...")
-                    if attempt == 3:
+                    print(f"  Request timed out (attempt {attempt}/5), retrying...")
+                    if attempt == 5:
                         raise
 
             data = response.json()
