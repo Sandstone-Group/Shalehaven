@@ -64,7 +64,6 @@ def getWells(token, permitData, afeData, scope="us-horizontals"):
     # Load WellDetails from local bulk export
     paths = getNoviBulkPaths()
     wellDetailsPath = paths["tsv"]["WellDetails"]
-    print(f"Reading {wellDetailsPath} (export {paths['export_date']})...")
 
     # API10 is varchar(32) per Novi schema — pin as string so downstream filters/joins
     # against ForecastWellMonths/Years (also pinned to string) match correctly
@@ -98,7 +97,6 @@ def getWellPermits(token, afeData, scope="us-horizontals"):
     # Load local permits TSV once (~130 MB) — single read for the whole AFE list
     paths = getNoviBulkPaths()
     permitsPath = paths["tsv"]["WellPermits"]
-    print(f"Loading local permits from {permitsPath} (export {paths['export_date']})...")
     localPermits = pd.read_csv(
         permitsPath,
         sep="\t",
@@ -221,7 +219,6 @@ def getNoviYearlyForecast(token, offsetData, scope="us-horizontals"):
 
     paths = getNoviBulkPaths()
     yearlyPath = paths["tsv"]["ForecastWellYears"]
-    print(f"Reading {yearlyPath} (export {paths['export_date']})...")
 
     chunk_size = 1_000_000
     matched_chunks = []
@@ -282,7 +279,6 @@ def getNoviMonthlyForecast(token, forecastData, scope="us-horizontals"):
 
     paths = getNoviBulkPaths()
     monthlyPath = paths["tsv"]["ForecastWellMonths"]
-    print(f"Reading {monthlyPath} (export {paths['export_date']})...")
 
     chunk_size = 1_000_000
     matched_chunks = []
@@ -510,7 +506,6 @@ def getNoviMonthlyProduction(token, offsetData, scope="us-horizontals"):
 
     paths = getNoviBulkPaths()
     productionPath = paths["tsv"]["WellMonths"]
-    print(f"Reading {productionPath} (export {paths['export_date']})...")
 
     chunk_size = 1_000_000
     matched_chunks = []
@@ -553,7 +548,6 @@ def getNoviSubsurface(token, offsetData, scope="us-horizontals"):
 
     paths = getNoviBulkPaths()
     subsurfacePath = paths["tsv"]["Subsurface"]
-    print(f"Reading {subsurfacePath} (export {paths['export_date']})...")
 
     subsurface = pd.read_csv(subsurfacePath, sep="\t", low_memory=False, dtype={"API10": "string"})
     print(f"  Loaded {len(subsurface):,} total subsurface rows")
@@ -589,7 +583,6 @@ def getNoviWellboreLocations(token, offsetData, scope="us-horizontals"):
 
     paths = getNoviBulkPaths()
     wbPath = paths["tsv"]["WellboreLocations"]
-    print(f"Reading {wbPath} (export {paths['export_date']})...")
 
     chunk_size = 1_000_000
     matched_chunks = []
@@ -851,10 +844,22 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
         print(f"  Loaded {len(wb_groups)} offset well trajectories ({len(wb_clean):,} total points)")
 
     # Build api10 -> WellName lookup from offsetData (used for labeling nearest-N wells)
+    # plus a fallback (lon, lat) using MPLatitude/MPLongitude for wells without wellbore trajectory data.
     api10_to_name = {}
-    if offsetData is not None and not offsetData.empty and "WellName" in offsetData.columns:
-        for _, r in offsetData[["API10", "WellName"]].dropna().iterrows():
-            api10_to_name[str(r["API10"])] = str(r["WellName"])
+    api10_to_fallback_pos = {}
+    if offsetData is not None and not offsetData.empty:
+        cols_needed = ["API10", "WellName"]
+        if "MPLatitude" in offsetData.columns and "MPLongitude" in offsetData.columns:
+            cols_needed += ["MPLatitude", "MPLongitude"]
+        sub = offsetData[cols_needed].copy()
+        for _, r in sub.iterrows():
+            api10 = str(r["API10"]) if pd.notna(r["API10"]) else None
+            if not api10:
+                continue
+            if pd.notna(r.get("WellName")):
+                api10_to_name[api10] = str(r["WellName"])
+            if "MPLatitude" in sub.columns and pd.notna(r.get("MPLatitude")) and pd.notna(r.get("MPLongitude")):
+                api10_to_fallback_pos[api10] = (float(r["MPLongitude"]), float(r["MPLatitude"]))
 
     # AFE-driven DSU section matching:
     # For each AFE row, parse Township/Range/Section and find matching BLM PLSS section polygons.
@@ -1006,7 +1011,7 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
             # Wider figure when we have a numbered-well legend to render on the right
             if numbered_wells:
                 fig, ax = plt.subplots(figsize=(14, 8.5))
-                fig.subplots_adjust(left=0.06, right=0.72, top=0.93, bottom=0.07)
+                fig.subplots_adjust(left=0.06, right=0.69, top=0.93, bottom=0.07)
             else:
                 fig, ax = plt.subplots(figsize=(11, 8.5))
             import matplotlib.patheffects as path_effects
@@ -1113,14 +1118,17 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
                             path_effects=tr_halo,
                         )
 
-            # Nearest-N offset wells — lowercase letter labels at lateral midpoint (small badge with halo).
-            # Full names live in the side legend below.
+            # Nearest-N offset wells — lowercase letter labels at lateral midpoint.
+            # Falls back to MPLatitude/MPLongitude if a well has no wellbore trajectory data.
             if numbered_wells:
                 num_halo = [path_effects.withStroke(linewidth=2.0, foreground="white")]
                 for letter, api10, _name in numbered_wells:
-                    if api10 not in wb_midpoints:
+                    if api10 in wb_midpoints:
+                        lon, lat = wb_midpoints[api10]
+                    elif api10 in api10_to_fallback_pos:
+                        lon, lat = api10_to_fallback_pos[api10]
+                    else:
                         continue
-                    lon, lat = wb_midpoints[api10]
                     if not (lon_min <= lon <= lon_max and lat_min <= lat <= lat_max):
                         continue
                     ax.annotate(
@@ -1183,7 +1191,7 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
                     permit_lines.append(f"{letter}. {display}")
                 permit_text = "\n".join(permit_lines)
                 fig.text(
-                    0.74, permit_y_top, permit_text,
+                    0.71, permit_y_top, permit_text,
                     fontsize=7,
                     family="monospace",
                     fontweight="bold",
@@ -1201,7 +1209,7 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
                     offset_lines.append(f"{letter}. {display}")
                 offset_text = "\n".join(offset_lines)
                 fig.text(
-                    0.74, offset_y_top, offset_text,
+                    0.71, offset_y_top, offset_text,
                     fontsize=6.5,
                     family="monospace",
                     verticalalignment="top",
