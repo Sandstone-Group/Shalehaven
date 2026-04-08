@@ -664,9 +664,11 @@ def _ensureBasemaps(outputDir=None):
 ## area (Texas, Pennsylvania, ocean) or if the BLM service is unreachable.
 def _fetchPlssLayers(lon_min, lat_min, lon_max, lat_max, outputDir=None):
     import json
+    import time
     import urllib.request
     import urllib.error
     import geopandas as gpd
+    import pandas as pd
 
     if outputDir is None:
         outputDir = os.environ.get("NOVI_BULK_DATA_PATH", r"D:\novi")
@@ -682,39 +684,38 @@ def _fetchPlssLayers(lon_min, lat_min, lon_max, lat_max, outputDir=None):
 
     BASE = "https://gis.blm.gov/arcgis/rest/services/Cadastral/BLM_Natl_PLSS_CadNSDI/MapServer"
     PAGE_SIZE = 1000
-    MAX_PAGES = 20  # safety cap — 20k features is far more than any reasonable AFE bbox
+    MAX_PAGES = 20
 
-    def _fetch_layer(layer_id, label):
-        cachePath = os.path.join(plssDir, f"plss_{label}_{bbox_str}.geojson")
-        if os.path.exists(cachePath):
-            try:
-                gdf = gpd.read_file(cachePath)
-                print(f"  PLSS {label}: {len(gdf)} features (cache hit)")
-                return gdf
-            except Exception as e:
-                print(f"  PLSS {label}: cache file corrupt ({e}), refetching")
-
-        all_features = []
-        offset = 0
-        for page in range(MAX_PAGES):
-            url = (
-                f"{BASE}/{layer_id}/query"
-                f"?where=1=1"
-                f"&geometry={rl_min},{rt_min},{rl_max},{rt_max}"
-                f"&geometryType=esriGeometryEnvelope"
-                f"&inSR=4326&outSR=4326"
-                f"&outFields=*"
-                f"&f=geojson"
-                f"&resultRecordCount={PAGE_SIZE}"
-                f"&resultOffset={offset}"
-            )
+    def _fetch_page(layer_id, bx_min, by_min, bx_max, by_max, offset):
+        """Fetch one page of features from BLM. Retries up to 3 times on transient errors."""
+        url = (
+            f"{BASE}/{layer_id}/query"
+            f"?where=1=1"
+            f"&geometry={bx_min},{by_min},{bx_max},{by_max}"
+            f"&geometryType=esriGeometryEnvelope"
+            f"&inSR=4326&outSR=4326"
+            f"&outFields=*"
+            f"&f=geojson"
+            f"&resultRecordCount={PAGE_SIZE}"
+            f"&resultOffset={offset}"
+        )
+        last_err = None
+        for attempt in range(3):
             try:
                 with urllib.request.urlopen(url, timeout=60) as r:
-                    data = json.loads(r.read())
+                    return json.loads(r.read())
             except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
-                print(f"  PLSS {label}: BLM service unreachable ({e}), skipping layer")
-                return gpd.GeoDataFrame()
+                last_err = e
+                if attempt < 2:
+                    time.sleep(1.5 * (attempt + 1))
+        raise last_err
 
+    def _fetch_bbox(layer_id, bx_min, by_min, bx_max, by_max):
+        """Fetch all features in one bbox with pagination. Returns list or raises on failure."""
+        all_features = []
+        offset = 0
+        for _ in range(MAX_PAGES):
+            data = _fetch_page(layer_id, bx_min, by_min, bx_max, by_max, offset)
             page_features = data.get("features", [])
             if not page_features:
                 break
@@ -722,13 +723,61 @@ def _fetchPlssLayers(lon_min, lat_min, lon_max, lat_max, outputDir=None):
             if len(page_features) < PAGE_SIZE:
                 break
             offset += PAGE_SIZE
+        return all_features
+
+    def _fetch_bbox_with_split(layer_id, label, bx_min, by_min, bx_max, by_max, depth=0):
+        """Fetch a bbox; if BLM returns an error (e.g. 500 on dense layers), split into
+        4 quadrants and recurse. Sections are denser than townships and sometimes hit
+        BLM's per-request limit on wide bboxes — splitting tiles around it."""
+        try:
+            return _fetch_bbox(layer_id, bx_min, by_min, bx_max, by_max)
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
+            if depth >= 3:
+                print(f"  PLSS {label}: tile {bx_min:.2f},{by_min:.2f},{bx_max:.2f},{by_max:.2f} failed after split ({e})")
+                return []
+            print(f"  PLSS {label}: bbox failed ({e}), splitting into 4 quadrants")
+            mx = (bx_min + bx_max) / 2
+            my = (by_min + by_max) / 2
+            out = []
+            out += _fetch_bbox_with_split(layer_id, label, bx_min, by_min, mx, my, depth + 1)
+            out += _fetch_bbox_with_split(layer_id, label, mx, by_min, bx_max, my, depth + 1)
+            out += _fetch_bbox_with_split(layer_id, label, bx_min, my, mx, by_max, depth + 1)
+            out += _fetch_bbox_with_split(layer_id, label, mx, my, bx_max, by_max, depth + 1)
+            return out
+
+    def _fetch_layer(layer_id, label):
+        cachePath = os.path.join(plssDir, f"plss_{label}_{bbox_str}.geojson")
+        if os.path.exists(cachePath):
+            try:
+                gdf = gpd.read_file(cachePath)
+                if len(gdf) > 0:
+                    print(f"  PLSS {label}: {len(gdf)} features (cache hit)")
+                    return gdf
+                else:
+                    print(f"  PLSS {label}: cache file empty, refetching")
+            except Exception as e:
+                print(f"  PLSS {label}: cache file corrupt ({e}), refetching")
+
+        all_features = _fetch_bbox_with_split(layer_id, label, rl_min, rt_min, rl_max, rt_max)
 
         if not all_features:
-            print(f"  PLSS {label}: 0 features in bbox (likely non-PLSS area)")
+            print(f"  PLSS {label}: 0 features in bbox (likely non-PLSS area or fetch failed)")
             return gpd.GeoDataFrame()
 
-        # Reassemble into a FeatureCollection and save to cache
-        fc = {"type": "FeatureCollection", "features": all_features}
+        # De-dupe features that may appear in multiple split tiles (overlap on tile borders)
+        seen = set()
+        unique = []
+        for f in all_features:
+            fid = f.get("id") or f.get("properties", {}).get("OBJECTID")
+            if fid is None:
+                unique.append(f)
+                continue
+            if fid in seen:
+                continue
+            seen.add(fid)
+            unique.append(f)
+
+        fc = {"type": "FeatureCollection", "features": unique}
         with open(cachePath, "w") as f:
             json.dump(fc, f)
 
@@ -830,7 +879,15 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
     if "State" in df.columns and df["State"].astype(str).str.lower().str.contains("texas").any():
         print("  WARNING: offset wells include Texas — BLM PLSS does not cover Texas.")
         print("           Texas areas will have no township/section grid overlay (planned for v3 via TX GLO).")
-    plss_townships, plss_sections = _fetchPlssLayers(lon_min, lat_min, lon_max, lat_max)
+    # Pad the PLSS fetch bbox generously (~35 mi in each direction). The offset wells'
+    # extent doesn't always reach the AFE's actual section — e.g. if the AFE targets
+    # 21S/26E but the offsets cluster in 21S/25E, the section we need to outline sits
+    # just outside the tight bbox and PLSS fetches a layer that doesn't contain it.
+    # PLSS data is small so the extra coverage is essentially free.
+    PLSS_PAD = 0.5
+    plss_townships, plss_sections = _fetchPlssLayers(
+        lon_min - PLSS_PAD, lat_min - PLSS_PAD, lon_max + PLSS_PAD, lat_max + PLSS_PAD
+    )
 
     # Pre-group wellbore trajectories by API10 (sorted by Path) for fast per-page plotting
     wb_groups = None
@@ -888,22 +945,57 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
             return chr(ord("A") + i)
         return chr(ord("A") + (i // 26 - 1)) + chr(ord("A") + (i % 26))
 
-    numbered_permits = []  # list of (letter, well_name) for the legend, in AFE row order
-    dsu_section_groups = []  # list of (letter, well_name, sections_gdf) for rendering boxes
-    permit_fallbacks = []  # list of (letter, well_name, lon, lat) — TX/PA/missing-T-R-S wells
+    # Tuples include the AFE row's Landing Zone (uppercased) so we can filter the
+    # legend per-formation at render time without re-iterating afeData. The DSU section
+    # groups stay GLOBAL (no filtering) so the box always renders on every page.
+    numbered_permits = []   # list of (letter, well_name, lz_upper)
+    dsu_section_groups = [] # list of (letter, well_name, sections_gdf) — global, never filtered
+    permit_fallbacks = []   # list of (letter, well_name, lon, lat, lz_upper)
+
+    # Robust T/R/S parser. Accepts "18S", "T18S", "18 South", "T-18-S", "T.18.S", etc.
+    # Pulls the first run of digits and the first N/S (Township) or E/W (Range) letter.
+    import re
+    def _parse_tr(s, kind):
+        if not s:
+            return None, None
+        s_up = str(s).upper()
+        m = re.search(r"(\d+)", s_up)
+        if not m:
+            return None, None
+        num = m.group(1).zfill(3)
+        valid = ("N", "S") if kind == "twp" else ("E", "W")
+        d = next((ch for ch in s_up if ch in valid), None)
+        return num, d
 
     if afeData is not None and not afeData.empty:
         print(f"Matching {len(afeData)} AFE rows to PLSS sections...")
+        # Diagnostic: dump the first few township values from the PLSS layer so we
+        # can compare format against what we parse from the AFE Summary.
+        if plss_townships is not None and not plss_townships.empty:
+            sample_cols = [c for c in ["STATEABBR", "TWNSHPNO", "TWNSHPDIR", "RANGENO", "RANGEDIR"] if c in plss_townships.columns]
+            print(f"  PLSS township sample (first 3 rows, cols={sample_cols}):")
+            for _, trow in plss_townships[sample_cols].head(3).iterrows():
+                print(f"    {dict(trow)}")
         for i, (_idx, row) in enumerate(afeData.iterrows()):
             letter = _afe_letter(i)
             well_name = str(row.get("Well Name", f"Well {i + 1}")).strip()
-            numbered_permits.append((letter, well_name))
+            lz_upper = str(row.get("Landing Zone", "")).strip().upper()
+            numbered_permits.append((letter, well_name, lz_upper))
 
             state_full = str(row.get("State", "")).strip().lower()
             twp_str = str(row.get("Township", "")).strip()
             rng_str = str(row.get("Range", "")).strip()
             sec_str = str(row.get("Section", "")).strip()
             state_abbr = STATE_ABBR_MAP.get(state_full)
+
+            twp_no, twp_dir = _parse_tr(twp_str, "twp")
+            rng_no, rng_dir = _parse_tr(rng_str, "rng")
+            print(
+                f"  {letter}. {well_name}: state={state_abbr or '?'} "
+                f"twp={twp_str!r}->({twp_no},{twp_dir}) "
+                f"rng={rng_str!r}->({rng_no},{rng_dir}) "
+                f"sec={sec_str!r}"
+            )
 
             matched_sections = None
             if (
@@ -912,12 +1004,6 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
                 and plss_townships is not None and not plss_townships.empty
                 and plss_sections is not None and not plss_sections.empty
             ):
-                # Parse "18S" → ("018", "S"), "30E" → ("030", "E")
-                twp_no = "".join(c for c in twp_str if c.isdigit()).zfill(3)
-                twp_dir = "".join(c for c in twp_str if c.isalpha()).upper()
-                rng_no = "".join(c for c in rng_str if c.isdigit()).zfill(3)
-                rng_dir = "".join(c for c in rng_str if c.isalpha()).upper()
-
                 if twp_no and twp_dir and rng_no and rng_dir:
                     twp_match = plss_townships[
                         (plss_townships["STATEABBR"] == state_abbr)
@@ -953,7 +1039,7 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
                         fallback_lon = p_match["Longitude"].iloc[0]
                         fallback_lat = p_match["Latitude"].iloc[0]
                 if fallback_lon is not None:
-                    permit_fallbacks.append((letter, well_name, fallback_lon, fallback_lat))
+                    permit_fallbacks.append((letter, well_name, fallback_lon, fallback_lat, lz_upper))
                     print(f"  {letter}. {well_name}: no PLSS section match — using star fallback at permit point")
                 else:
                     print(f"  {letter}. {well_name}: no PLSS section match and no permit point — skipping marker")
@@ -1007,36 +1093,20 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
             api10_to_distance_mi[api10] = d_mi
         print(f"  Numbered {len(numbered_wells)} offset wells by distance from permit centroid")
 
-    # Build operator → color map from offsetData. Most-common operators get the most distinct
-    # tab20 colors; rare operators (rank > 19) collapse to a single gray "Other" bucket so the
-    # legend stays compact and the map stays readable.
-    import matplotlib.cm as cm
-    operator_counts = {}
-    for op in api10_to_operator.values():
-        if op:
-            operator_counts[op] = operator_counts.get(op, 0) + 1
-    operators_ranked = sorted(operator_counts.items(), key=lambda kv: (-kv[1], kv[0]))
-    OTHER_COLOR = "#888888"
-    UNKNOWN_COLOR = "#444444"
-    MAX_OPERATOR_COLORS = 19
-    tab20 = cm.get_cmap("tab20", 20)
-    operator_to_color = {}
-    for i, (op, _cnt) in enumerate(operators_ranked):
-        if i < MAX_OPERATOR_COLORS:
-            operator_to_color[op] = tab20(i)
-        else:
-            operator_to_color[op] = OTHER_COLOR
-    api10_to_color = {}
-    for api10 in api10_to_name.keys():
-        op = api10_to_operator.get(api10)
-        if op and op in operator_to_color:
-            api10_to_color[api10] = operator_to_color[op]
-        else:
-            api10_to_color[api10] = UNKNOWN_COLOR
-    operator_legend_entries = [(op, operator_to_color[op], cnt) for op, cnt in operators_ranked[:MAX_OPERATOR_COLORS]]
-    other_count = sum(cnt for _op, cnt in operators_ranked[MAX_OPERATOR_COLORS:])
-    if other_count:
-        operator_legend_entries.append((f"Other ({len(operators_ranked) - MAX_OPERATOR_COLORS} ops)", OTHER_COLOR, other_count))
+    # All offset wellbores render uniform black — operator coloring removed per request.
+    OFFSET_LINE_COLOR = "black"
+
+    # Determine landing zones to render. If subsurface has multiple Formation values
+    # (one per AFE landing zone), render one page per (parameter, formation) combo —
+    # parameter-major ordering: TVD/zoneA, TVD/zoneB, SW_Avg/zoneA, SW_Avg/zoneB, ...
+    # The DSU box and map extent are GLOBAL — only the heatmap data and per-formation
+    # legend (offset wells + AFE permits matching this Landing Zone) change per page.
+    if "Formation" in df.columns:
+        formations = sorted(df["Formation"].dropna().astype(str).str.upper().unique().tolist())
+    else:
+        formations = []
+    if not formations:
+        formations = [None]
 
     print(f"Generating heat map PDF: {pdfPath}")
     with PdfPages(pdfPath) as pdf:
@@ -1045,251 +1115,272 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
                 print(f"  Skipping {param}: column not in subsurface data")
                 continue
 
-            values = pd.to_numeric(df[param], errors="coerce")
-            mask = values.notna()
-            if mask.sum() < 4:
-                print(f"  Skipping {param}: only {mask.sum()} valid values (need >= 4 for interpolation)")
-                continue
+            for fm_label in formations:
+                # Slice subsurface, wellbores, offset legend, and AFE legend to this
+                # formation. Map extent + DSU box + basemap stay GLOBAL — only the
+                # heatmap data and the side legend change per formation page.
+                if fm_label is None:
+                    df_fm = df
+                    api10_set_fm = None
+                else:
+                    df_fm = df[df["Formation"].astype(str).str.upper() == fm_label]
+                    api10_set_fm = set(df_fm["API10"].astype(str).tolist())
 
-            # Linear interpolation — NaN outside the convex hull (no dishonest extrapolation)
-            interp = griddata(
-                points[mask],
-                values[mask].values,
-                (grid_lon, grid_lat),
-                method="linear",
-            )
+                values = pd.to_numeric(df_fm[param], errors="coerce")
+                mask = values.notna()
+                if mask.sum() < 4:
+                    print(f"  Skipping {param} [{fm_label or 'ALL'}]: only {mask.sum()} valid values (need >= 4 for interpolation)")
+                    continue
 
-            # Wider figure when we have a numbered-well legend to render on the right
-            if numbered_wells:
-                fig, ax = plt.subplots(figsize=(14, 8.5))
-                fig.subplots_adjust(left=0.06, right=0.69, top=0.93, bottom=0.07)
-            else:
-                fig, ax = plt.subplots(figsize=(11, 8.5))
-            import matplotlib.patheffects as path_effects
+                points_fm = df_fm[["Longitude", "Latitude"]].values
 
-            # Layer order (bottom → top):
-            #  1. Operator acreage underlay
-            #  2. County boundaries
-            #  3. PLSS section boundaries (subtle grid)
-            #  4. Heat map contourf
-            #  5. Wellbore lateral paths
-            #  6. PLSS township boundaries (brown)
-            #  7. State boundaries (black)
-            #  8. Offset well markers (small black dots)
-            #  9. AFE permit stars (red)
-            # 10. PLSS section number labels
-            # 11. PLSS township T/R labels
-            # 12. AFE permit name labels
-            # All labels are at the top of the stack so they're never covered by data layers.
-
-            if all_clip is not None and not all_clip.empty:
-                all_clip.plot(ax=ax, facecolor="#f0f0f0", edgecolor="#cccccc", linewidth=0.2, zorder=1)
-            if not counties_clip.empty:
-                counties_clip.boundary.plot(ax=ax, color="#999999", linewidth=0.4, zorder=2)
-
-            if plss_sections is not None and not plss_sections.empty:
-                plss_sections.boundary.plot(ax=ax, color="#bbbbbb", linewidth=0.3, alpha=0.4, zorder=3)
-
-            cf = ax.contourf(grid_lon, grid_lat, interp, levels=20, cmap="viridis", zorder=4, alpha=0.85)
-
-            # Offset well lateral paths — colored by operator (most common operators get
-            # tab20 colors, rare ones collapse to a single "Other" gray)
-            if wb_groups is not None:
-                for api10, group in wb_groups:
-                    ax.plot(
-                        group["Longitude"].values,
-                        group["Latitude"].values,
-                        color=api10_to_color.get(api10, UNKNOWN_COLOR),
-                        linewidth=1.2,
-                        alpha=0.85,
-                        zorder=5,
+                # Filter wellbores and offset numbering to this formation's API10s
+                if api10_set_fm is None:
+                    wb_groups_fm = wb_groups
+                    numbered_wells_fm = numbered_wells
+                else:
+                    wb_groups_fm = (
+                        [(a, g) for a, g in wb_groups if str(a) in api10_set_fm]
+                        if wb_groups is not None else None
                     )
+                    numbered_wells_fm = [w for w in numbered_wells if str(w[1]) in api10_set_fm]
 
-            if plss_townships is not None and not plss_townships.empty:
-                plss_townships.boundary.plot(ax=ax, color="#8b6914", linewidth=0.7, alpha=0.7, zorder=6)
+                # Filter AFE permit legend by Landing Zone (DSU box stays global)
+                if fm_label is None:
+                    numbered_permits_fm = numbered_permits
+                    permit_fallbacks_fm = permit_fallbacks
+                else:
+                    numbered_permits_fm = [p for p in numbered_permits if p[2] == fm_label]
+                    permit_fallbacks_fm = [p for p in permit_fallbacks if p[4] == fm_label]
 
-            if not states_clip.empty:
-                states_clip.boundary.plot(ax=ax, color="black", linewidth=1.0, zorder=7)
-
-            ax.scatter(
-                df["Longitude"][mask], df["Latitude"][mask],
-                c="black", s=6, alpha=0.6, zorder=8, label="Offset Wells",
-            )
-
-            # AFE DSU highlight — bold black perimeter around the union of all DSU sections.
-            # For multi-section DSUs (e.g. "9,10") the unary_union drops internal shared edges
-            # so the box outlines only the outer perimeter of the combined sections.
-            from shapely.ops import unary_union
-            for _letter, _name, sec_gdf in dsu_section_groups:
-                union_geom = unary_union(list(sec_gdf.geometry))
-                gpd.GeoSeries([union_geom], crs=sec_gdf.crs).boundary.plot(
-                    ax=ax, color="black", linewidth=2.2, zorder=9,
+                # Linear interpolation — NaN outside the convex hull (no dishonest extrapolation)
+                interp = griddata(
+                    points_fm[mask.values],
+                    values[mask].values,
+                    (grid_lon, grid_lat),
+                    method="linear",
                 )
-            # Star fallback for AFE rows with no PLSS section match (TX, PA, etc.)
-            if permit_fallbacks:
-                fb_lon = [f[2] for f in permit_fallbacks]
-                fb_lat = [f[3] for f in permit_fallbacks]
+
+                # Wider figure when we have a numbered-well legend to render on the right
+                if numbered_wells_fm:
+                    fig, ax = plt.subplots(figsize=(14, 8.5))
+                    fig.subplots_adjust(left=0.06, right=0.69, top=0.93, bottom=0.07)
+                else:
+                    fig, ax = plt.subplots(figsize=(11, 8.5))
+                import matplotlib.patheffects as path_effects
+
+                # Layer order (bottom → top):
+                #  1. Operator acreage underlay
+                #  2. County boundaries
+                #  3. PLSS section boundaries (subtle grid)
+                #  4. Heat map contourf
+                #  5. Wellbore lateral paths (uniform black)
+                #  6. PLSS township boundaries (brown)
+                #  7. State boundaries (black)
+                #  8. Offset well markers (small black dots)
+                #  9. AFE DSU section box (black, GLOBAL — same on every page)
+                #  9. AFE permit stars (red, filtered to this formation)
+                # 10. PLSS section number labels
+                # 11. PLSS township T/R labels
+                # 12. AFE permit name labels
+
+                if all_clip is not None and not all_clip.empty:
+                    all_clip.plot(ax=ax, facecolor="#f0f0f0", edgecolor="#cccccc", linewidth=0.2, zorder=1)
+                if not counties_clip.empty:
+                    counties_clip.boundary.plot(ax=ax, color="#999999", linewidth=0.4, zorder=2)
+
+                if plss_sections is not None and not plss_sections.empty:
+                    plss_sections.boundary.plot(ax=ax, color="#bbbbbb", linewidth=0.3, alpha=0.4, zorder=3)
+
+                cf = ax.contourf(grid_lon, grid_lat, interp, levels=20, cmap="viridis", zorder=4, alpha=0.85)
+
+                # Offset well lateral paths — uniform black (no operator coloring)
+                if wb_groups_fm is not None:
+                    for _api10, group in wb_groups_fm:
+                        ax.plot(
+                            group["Longitude"].values,
+                            group["Latitude"].values,
+                            color=OFFSET_LINE_COLOR,
+                            linewidth=1.0,
+                            alpha=0.85,
+                            zorder=5,
+                        )
+
+                if plss_townships is not None and not plss_townships.empty:
+                    plss_townships.boundary.plot(ax=ax, color="#8b6914", linewidth=0.7, alpha=0.7, zorder=6)
+
+                if not states_clip.empty:
+                    states_clip.boundary.plot(ax=ax, color="black", linewidth=1.0, zorder=7)
+
                 ax.scatter(
-                    fb_lon, fb_lat,
-                    marker="*", c="red", s=180, edgecolor="black", linewidth=0.8,
-                    zorder=9, label="AFE Permit (no PLSS)",
+                    df_fm["Longitude"][mask], df_fm["Latitude"][mask],
+                    c="black", s=6, alpha=0.6, zorder=8, label="Offset Wells",
                 )
 
-            # === Labels (all on top of data layers) ===
-
-            # Section number labels — small, light gray, thin halo
-            if plss_sections is not None and not plss_sections.empty and "FRSTDIVLAB" in plss_sections.columns:
-                sec_halo = [path_effects.withStroke(linewidth=1.5, foreground="white")]
-                for _, sec in plss_sections.iterrows():
-                    c = sec.geometry.centroid
-                    if lon_min <= c.x <= lon_max and lat_min <= c.y <= lat_max:
-                        ax.annotate(
-                            str(sec["FRSTDIVLAB"]),
-                            xy=(c.x, c.y),
-                            ha="center", va="center",
-                            fontsize=5,
-                            color="#555555",
-                            zorder=10,
-                            path_effects=sec_halo,
-                        )
-
-            # Township T/R labels — bold brown, thicker halo
-            if plss_townships is not None and not plss_townships.empty and "TWNSHPLAB" in plss_townships.columns:
-                tr_halo = [path_effects.withStroke(linewidth=2.0, foreground="white")]
-                for _, twp in plss_townships.iterrows():
-                    c = twp.geometry.centroid
-                    if lon_min <= c.x <= lon_max and lat_min <= c.y <= lat_max:
-                        ax.annotate(
-                            str(twp["TWNSHPLAB"]),
-                            xy=(c.x, c.y),
-                            ha="center", va="center",
-                            fontsize=7,
-                            fontweight="bold",
-                            color="#5a4509",
-                            zorder=11,
-                            path_effects=tr_halo,
-                        )
-
-            # Offset well numbers — drawn at the heel of each lateral, styled as a small
-            # navy-on-white boxed badge so they read as clearly distinct from the gray PLSS
-            # section numbers (which are unboxed, centered, and lighter).
-            # Falls back to MPLatitude/MPLongitude if a well has no wellbore trajectory data.
-            if numbered_wells:
-                num_box = dict(
-                    boxstyle="round,pad=0.15",
-                    facecolor="white",
-                    edgecolor="#0a2a5e",
-                    linewidth=0.5,
-                )
-                for number, api10, _name, _op, _dmi, _fp in numbered_wells:
-                    if api10 in wb_heels:
-                        lon, lat = wb_heels[api10]
-                    elif api10 in api10_to_fallback_pos:
-                        lon, lat = api10_to_fallback_pos[api10]
-                    else:
-                        continue
-                    if not (lon_min <= lon <= lon_max and lat_min <= lat <= lat_max):
-                        continue
-                    ax.annotate(
-                        str(number),
-                        xy=(lon, lat),
-                        xytext=(4, 4),
-                        textcoords="offset points",
-                        fontsize=5,
-                        fontweight="bold",
-                        color="#0a2a5e",
-                        zorder=11,
-                        bbox=num_box,
+                # AFE DSU highlight — bold black perimeter around the union of all DSU sections.
+                # GLOBAL: drawn from the unfiltered dsu_section_groups so the box always
+                # appears on every formation page regardless of Landing Zone matching.
+                from shapely.ops import unary_union
+                for _letter, _name, sec_gdf in dsu_section_groups:
+                    union_geom = unary_union(list(sec_gdf.geometry))
+                    gpd.GeoSeries([union_geom], crs=sec_gdf.crs).boundary.plot(
+                        ax=ax, color="black", linewidth=2.2, zorder=9,
+                    )
+                # Star fallback for AFE rows with no PLSS section match (TX, PA, etc.)
+                if permit_fallbacks_fm:
+                    fb_lon = [f[2] for f in permit_fallbacks_fm]
+                    fb_lat = [f[3] for f in permit_fallbacks_fm]
+                    ax.scatter(
+                        fb_lon, fb_lat,
+                        marker="*", c="red", s=180, edgecolor="black", linewidth=0.8,
+                        zorder=9, label="AFE Permit (no PLSS)",
                     )
 
-            # AFE letter labels — only rendered for non-PLSS fallback stars (TX, PA).
-            # The DSU section boxes themselves are left unlabeled per user request — the
-            # box alone identifies the DSU, and the side legend maps letters to well names.
-            permit_halo = [path_effects.withStroke(linewidth=2.5, foreground="white")]
-            for letter, _name, lon, lat in permit_fallbacks:
-                ax.annotate(
-                    letter,
-                    xy=(lon, lat),
-                    xytext=(8, 8),
-                    textcoords="offset points",
-                    fontsize=12,
-                    fontweight="bold",
-                    color="darkred",
-                    zorder=12,
-                    path_effects=permit_halo,
-                )
+                # === Labels (all on top of data layers) ===
 
-            ax.set_xlim(lon_min, lon_max)
-            ax.set_ylim(lat_min, lat_max)
-            ax.set_xlabel("Longitude")
-            ax.set_ylabel("Latitude")
-            ax.set_title(f"{param} — {mask.sum():,} wells")
-            ax.legend(loc="upper right", fontsize=8)
-            ax.set_aspect("equal", adjustable="box")
-            cbar = plt.colorbar(cf, ax=ax, shrink=0.8)
-            cbar.set_label(param)
+                if plss_sections is not None and not plss_sections.empty and "FRSTDIVLAB" in plss_sections.columns:
+                    sec_halo = [path_effects.withStroke(linewidth=1.5, foreground="white")]
+                    for _, sec in plss_sections.iterrows():
+                        c = sec.geometry.centroid
+                        if lon_min <= c.x <= lon_max and lat_min <= c.y <= lat_max:
+                            ax.annotate(
+                                str(sec["FRSTDIVLAB"]),
+                                xy=(c.x, c.y),
+                                ha="center", va="center",
+                                fontsize=5,
+                                color="#555555",
+                                zorder=10,
+                                path_effects=sec_halo,
+                            )
 
-            # Side legend: AFE permits at top (bold), offset wells below.
-            # Stack is dynamically centered vertically around y=0.5 (right-middle of the figure).
-            # Permits use uppercase letters (A, B, C...) bold; offsets use lowercase letters (a, b, c...).
-            MAX_NAME_LEN = 38
-            PERMIT_LINE_H = 0.018  # approximate fig-y units per 7pt monospace line
-            OFFSET_LINE_H = 0.016  # approximate fig-y units per 6.5pt monospace line
-            STACK_GAP = 0.04
+                if plss_townships is not None and not plss_townships.empty and "TWNSHPLAB" in plss_townships.columns:
+                    tr_halo = [path_effects.withStroke(linewidth=2.0, foreground="white")]
+                    for _, twp in plss_townships.iterrows():
+                        c = twp.geometry.centroid
+                        if lon_min <= c.x <= lon_max and lat_min <= c.y <= lat_max:
+                            ax.annotate(
+                                str(twp["TWNSHPLAB"]),
+                                xy=(c.x, c.y),
+                                ha="center", va="center",
+                                fontsize=7,
+                                fontweight="bold",
+                                color="#5a4509",
+                                zorder=11,
+                                path_effects=tr_halo,
+                            )
 
-            permit_box_h = ((len(numbered_permits) + 2) * PERMIT_LINE_H) if numbered_permits else 0
-            offset_box_h = ((len(numbered_wells) + 2) * OFFSET_LINE_H) if numbered_wells else 0
-            total_h = permit_box_h + (STACK_GAP if (permit_box_h and offset_box_h) else 0) + offset_box_h
-            stack_top = 0.5 + total_h / 2
+                # Offset well numbers — small navy boxed badges at each lateral's heel
+                if numbered_wells_fm:
+                    num_box = dict(
+                        boxstyle="round,pad=0.15",
+                        facecolor="white",
+                        edgecolor="#0a2a5e",
+                        linewidth=0.5,
+                    )
+                    for number, api10, _name, _op, _dmi, _fp in numbered_wells_fm:
+                        if api10 in wb_heels:
+                            lon, lat = wb_heels[api10]
+                        elif api10 in api10_to_fallback_pos:
+                            lon, lat = api10_to_fallback_pos[api10]
+                        else:
+                            continue
+                        if not (lon_min <= lon <= lon_max and lat_min <= lat <= lat_max):
+                            continue
+                        ax.annotate(
+                            str(number),
+                            xy=(lon, lat),
+                            xytext=(4, 4),
+                            textcoords="offset points",
+                            fontsize=5,
+                            fontweight="bold",
+                            color="#0a2a5e",
+                            zorder=11,
+                            bbox=num_box,
+                        )
 
-            permit_y_top = stack_top  # top of the permits box
-            if numbered_permits:
-                permit_lines = ["AFE Permits", "-" * 32]
-                for letter, name in numbered_permits:
-                    display = name if len(name) <= MAX_NAME_LEN else name[: MAX_NAME_LEN - 3] + "..."
-                    permit_lines.append(f"{letter}. {display}")
-                permit_text = "\n".join(permit_lines)
-                fig.text(
-                    0.71, permit_y_top, permit_text,
-                    fontsize=7,
-                    family="monospace",
-                    fontweight="bold",
-                    verticalalignment="top",
-                    horizontalalignment="left",
-                    bbox=dict(facecolor="white", edgecolor="black", linewidth=0.6, pad=6),
-                )
+                # AFE letter labels — only rendered for non-PLSS fallback stars (TX, PA)
+                permit_halo = [path_effects.withStroke(linewidth=2.5, foreground="white")]
+                for letter, _name, lon, lat, _lz in permit_fallbacks_fm:
+                    ax.annotate(
+                        letter,
+                        xy=(lon, lat),
+                        xytext=(8, 8),
+                        textcoords="offset points",
+                        fontsize=12,
+                        fontweight="bold",
+                        color="darkred",
+                        zorder=12,
+                        path_effects=permit_halo,
+                    )
 
-            if numbered_wells:
-                # Position the offset table directly below the permits box (with gap).
-                # Wells are numbered 1..N by distance from the AFE permit centroid; numbers
-                # match the small navy badges drawn at each lateral's heel on the map.
-                offset_y_top = stack_top - permit_box_h - (STACK_GAP if permit_box_h else 0)
-                offset_lines = [f"Offset Wells (by distance, n={len(numbered_wells)})", "-" * 32]
-                num_width = len(str(len(numbered_wells)))
-                for number, _api10, name, _op, _dmi, _fp in numbered_wells:
-                    display = name if len(name) <= MAX_NAME_LEN else name[: MAX_NAME_LEN - 3] + "..."
-                    offset_lines.append(f"{str(number).rjust(num_width)}. {display}")
-                offset_text = "\n".join(offset_lines)
-                fig.text(
-                    0.71, offset_y_top, offset_text,
-                    fontsize=6.5,
-                    family="monospace",
-                    verticalalignment="top",
-                    horizontalalignment="left",
-                    bbox=dict(facecolor="white", edgecolor="black", linewidth=0.6, pad=6),
-                )
+                ax.set_xlim(lon_min, lon_max)
+                ax.set_ylim(lat_min, lat_max)
+                ax.set_xlabel("Longitude")
+                ax.set_ylabel("Latitude")
+                title_suffix = f" [{fm_label}]" if fm_label else ""
+                ax.set_title(f"{param}{title_suffix} — {mask.sum():,} wells")
+                ax.legend(loc="upper right", fontsize=8)
+                ax.set_aspect("equal", adjustable="box")
+                cbar = plt.colorbar(cf, ax=ax, shrink=0.8)
+                cbar.set_label(param)
 
-            pdf.savefig(fig, bbox_inches="tight")
-            plt.close(fig)
-            print(f"  Plotted {param} ({mask.sum():,} wells)")
+                # Side legend: AFE permits + offset wells, both filtered to this formation
+                MAX_NAME_LEN = 38
+                PERMIT_LINE_H = 0.018
+                OFFSET_LINE_H = 0.016
+                STACK_GAP = 0.04
+
+                permit_box_h = ((len(numbered_permits_fm) + 2) * PERMIT_LINE_H) if numbered_permits_fm else 0
+                offset_box_h = ((len(numbered_wells_fm) + 2) * OFFSET_LINE_H) if numbered_wells_fm else 0
+                total_h = permit_box_h + (STACK_GAP if (permit_box_h and offset_box_h) else 0) + offset_box_h
+                stack_top = 0.5 + total_h / 2
+
+                permit_y_top = stack_top
+                if numbered_permits_fm:
+                    header = f"AFE Permits [{fm_label}]" if fm_label else "AFE Permits"
+                    permit_lines = [header, "-" * 32]
+                    for letter, name, _lz in numbered_permits_fm:
+                        display = name if len(name) <= MAX_NAME_LEN else name[: MAX_NAME_LEN - 3] + "..."
+                        permit_lines.append(f"{letter}. {display}")
+                    permit_text = "\n".join(permit_lines)
+                    fig.text(
+                        0.71, permit_y_top, permit_text,
+                        fontsize=7,
+                        family="monospace",
+                        fontweight="bold",
+                        verticalalignment="top",
+                        horizontalalignment="left",
+                        bbox=dict(facecolor="white", edgecolor="black", linewidth=0.6, pad=6),
+                    )
+
+                if numbered_wells_fm:
+                    offset_y_top = stack_top - permit_box_h - (STACK_GAP if permit_box_h else 0)
+                    offset_lines = [f"Offset Wells (by distance, n={len(numbered_wells_fm)})", "-" * 32]
+                    num_width = len(str(len(numbered_wells_fm)))
+                    for number, _api10, name, _op, _dmi, _fp in numbered_wells_fm:
+                        display = name if len(name) <= MAX_NAME_LEN else name[: MAX_NAME_LEN - 3] + "..."
+                        offset_lines.append(f"{str(number).rjust(num_width)}. {display}")
+                    offset_text = "\n".join(offset_lines)
+                    fig.text(
+                        0.71, offset_y_top, offset_text,
+                        fontsize=6.5,
+                        family="monospace",
+                        verticalalignment="top",
+                        horizontalalignment="left",
+                        bbox=dict(facecolor="white", edgecolor="black", linewidth=0.6, pad=6),
+                    )
+
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close(fig)
+                print(f"  Plotted {param} [{fm_label or 'ALL'}] ({mask.sum():,} wells)")
 
         # === Appendix pages ===
-        # Full offset well index (number → name → operator → API10 → distance → first prod year)
-        # plus the operator color key. Rendered as multi-page tables, ~50 rows per page.
+        # Full offset well index (number → name → API10 → distance → first prod year),
+        # rendered as multi-page tables, ~50 rows per page. Operator column removed.
         if numbered_wells:
             ROWS_PER_PAGE = 50
-            COL_HEADERS = ["#", "Well Name", "Operator", "API10", "Dist (mi)", "1st Prod"]
-            COL_WIDTHS = [0.05, 0.40, 0.27, 0.13, 0.08, 0.07]  # fractions of table width
+            COL_HEADERS = ["#", "Well Name", "API10", "Dist (mi)", "1st Prod"]
+            COL_WIDTHS = [0.05, 0.55, 0.18, 0.10, 0.09]
 
             def _truncate(s, n):
                 s = str(s) if s is not None else ""
@@ -1311,11 +1402,10 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
 
                 # Build table data
                 table_data = []
-                for number, api10, name, op, dmi, fp in page_rows:
+                for number, api10, name, _op, dmi, fp in page_rows:
                     table_data.append([
                         str(number),
-                        _truncate(name, 48),
-                        _truncate(op, 32),
+                        _truncate(name, 64),
                         str(api10),
                         f"{dmi:.2f}" if dmi is not None else "",
                         str(fp) if fp is not None else "",
@@ -1338,48 +1428,8 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
                     cell.set_facecolor("#0a2a5e")
                     cell.set_text_props(color="white", fontweight="bold")
 
-                # Color the operator cell background by the operator color (subtle tint)
-                for row_i, (_n, _a, _name, op, _d, _fp) in enumerate(page_rows, start=1):
-                    color = operator_to_color.get(op)
-                    if color is not None:
-                        cell = table[(row_i, 2)]  # operator column
-                        # Lighten by blending with white at 70% white
-                        try:
-                            r, g, b = color[0], color[1], color[2]
-                            tint = (0.7 + 0.3 * r, 0.7 + 0.3 * g, 0.7 + 0.3 * b)
-                            cell.set_facecolor(tint)
-                        except (TypeError, IndexError):
-                            pass
-
                 pdf.savefig(fig, bbox_inches="tight")
                 plt.close(fig)
-
-            # Operator color key page (compact, fits on one page even with 19 entries)
-            if operator_legend_entries:
-                from matplotlib.lines import Line2D
-                fig = plt.figure(figsize=(11, 8.5))
-                ax = fig.add_subplot(111)
-                ax.axis("off")
-                ax.set_title(
-                    f"Operator Color Key — {dsuName}",
-                    fontsize=12, fontweight="bold", loc="left", pad=14,
-                )
-                handles = [
-                    Line2D([0], [0], color=color, linewidth=3.0,
-                           label=f"{op[:50]}{'...' if len(op) > 50 else ''}  —  {cnt} well(s)")
-                    for op, color, cnt in operator_legend_entries
-                ]
-                ax.legend(
-                    handles=handles,
-                    loc="upper left",
-                    fontsize=10,
-                    frameon=False,
-                    handlelength=3.0,
-                    labelspacing=0.7,
-                )
-                pdf.savefig(fig, bbox_inches="tight")
-                plt.close(fig)
-                print(f"  Appended operator color key page ({len(operator_legend_entries)} entries)")
 
             print(f"  Appended {total_pages} offset well index page(s)")
 

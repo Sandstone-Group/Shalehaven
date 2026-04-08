@@ -41,6 +41,10 @@ pathToBallardData = os.getenv("SHALEHAVEN_BALLARD_PATH")
 pathToMonthlyPDSData = os.getenv("SHALEHAVEN_MONTHLY_PDS_PATH")
 pathToDatabase = os.getenv("SHALEHAVEN_DATABASE_PATH")
 
+# Flatten Deal Evaluation Review Sheet (SHLP25 + SHLP26 tabs) for Power BI
+pathToDealSheet = os.getenv("SHALEHAVEN_DEAL_SHEET_PATH")
+dealsheet.buildDealPipeline(pathToDealSheet)
+
 # Get Wells From ComboCurve and Split by Operator
 wells = combocurve.getWellsFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
 huntWells = wells[wells['currentOperator'] == 'HUNT OIL COMPANY']
@@ -89,9 +93,5 @@ mergedUpdatedTypeCurves = production.mergeProductionWithTypeCurves(dailyProducti
 
 # Cumulative Summaries
 cumulativeProduction = production.cumulativeProduction(mergedUpdatedTypeCurves, pathToDatabase)
-
-# Flatten Deal Evaluation Review Sheet (SHLP25 + SHLP26 tabs) for Power BI
-pathToDealSheet = os.getenv("SHALEHAVEN_DEAL_SHEET_PATH")
-dealsheet.buildDealPipeline(pathToDealSheet)
 
 print("End Shalehaven ETL Process")
