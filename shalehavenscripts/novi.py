@@ -834,31 +834,42 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
 
     # Pre-group wellbore trajectories by API10 (sorted by Path) for fast per-page plotting
     wb_groups = None
-    wb_midpoints = {}  # api10 -> (lon, lat) midpoint of trajectory, for label placement
+    wb_midpoints = {}  # api10 -> (lon, lat) midpoint of trajectory (used for distance ranking)
+    wb_heels = {}      # api10 -> (lon, lat) heel of lateral (first path point) for number labels
     if wellboreLocationsData is not None and not wellboreLocationsData.empty:
         wb_clean = wellboreLocationsData.dropna(subset=["Latitude", "Longitude"])
         wb_groups = list(wb_clean.sort_values(["API10", "Path"]).groupby("API10"))
         for api10, group in wb_groups:
             mid = len(group) // 2
             wb_midpoints[api10] = (group["Longitude"].iloc[mid], group["Latitude"].iloc[mid])
+            wb_heels[api10] = (group["Longitude"].iloc[0], group["Latitude"].iloc[0])
         print(f"  Loaded {len(wb_groups)} offset well trajectories ({len(wb_clean):,} total points)")
 
-    # Build api10 -> WellName lookup from offsetData (used for labeling nearest-N wells)
+    # Build api10 -> WellName / operator / first-prod-year lookup from offsetData
     # plus a fallback (lon, lat) using MPLatitude/MPLongitude for wells without wellbore trajectory data.
     api10_to_name = {}
+    api10_to_operator = {}
+    api10_to_first_prod = {}
     api10_to_fallback_pos = {}
     if offsetData is not None and not offsetData.empty:
-        cols_needed = ["API10", "WellName"]
-        if "MPLatitude" in offsetData.columns and "MPLongitude" in offsetData.columns:
-            cols_needed += ["MPLatitude", "MPLongitude"]
+        optional_cols = ["WellName", "MPLatitude", "MPLongitude", "CurrentOperator", "FirstProductionYear"]
+        cols_needed = ["API10"] + [c for c in optional_cols if c in offsetData.columns]
         sub = offsetData[cols_needed].copy()
         for _, r in sub.iterrows():
             api10 = str(r["API10"]) if pd.notna(r["API10"]) else None
             if not api10:
                 continue
-            if pd.notna(r.get("WellName")):
+            if "WellName" in sub.columns and pd.notna(r.get("WellName")):
                 api10_to_name[api10] = str(r["WellName"])
-            if "MPLatitude" in sub.columns and pd.notna(r.get("MPLatitude")) and pd.notna(r.get("MPLongitude")):
+            if "CurrentOperator" in sub.columns and pd.notna(r.get("CurrentOperator")):
+                api10_to_operator[api10] = str(r["CurrentOperator"])
+            if "FirstProductionYear" in sub.columns and pd.notna(r.get("FirstProductionYear")):
+                try:
+                    api10_to_first_prod[api10] = int(r["FirstProductionYear"])
+                except (ValueError, TypeError):
+                    pass
+            if "MPLatitude" in sub.columns and "MPLongitude" in sub.columns \
+                    and pd.notna(r.get("MPLatitude")) and pd.notna(r.get("MPLongitude")):
                 api10_to_fallback_pos[api10] = (float(r["MPLongitude"]), float(r["MPLatitude"]))
 
     # AFE-driven DSU section matching:
@@ -947,19 +958,14 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
                 else:
                     print(f"  {letter}. {well_name}: no PLSS section match and no permit point — skipping marker")
 
-    # Compute the N offset wells nearest to the permits for labeling.
-    # Lettered a..z (lowercase) starting from the closest — lowercase letters avoid collision
-    # with both uppercase AFE permit letters and PLSS section numbers (01-36).
-    # The map shows just the letter; the side legend maps letter → well name.
-    numbered_wells = []  # list of (letter, api10, name) ordered by distance to permit centroid
-    api10_to_letter = {}
+    # Number EVERY offset well sequentially (1, 2, 3, ...) ordered by distance from the
+    # AFE permit centroid. The on-map number is the lookup key; the full name → operator →
+    # API → distance table is rendered on a dedicated appendix page at the end of the PDF.
+    # `labelNearestN` is preserved for back-compat: 0 (default) means "label all".
+    numbered_wells = []          # list of (number, api10, name, operator, dist_mi, first_prod) sorted by distance
+    api10_to_number = {}
+    api10_to_distance_mi = {}
 
-    def _offset_letter(i):
-        if i < 26:
-            return chr(ord("a") + i)
-        return chr(ord("a") + (i // 26 - 1)) + chr(ord("a") + (i % 26))
-
-    # Permit centroid for distance ranking — derive from permitData
     permit_pts = None
     if permitData is not None and not permitData.empty:
         permit_pts = permitData.dropna(subset=["Latitude", "Longitude"])
@@ -967,25 +973,70 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
     if (
         permit_pts is not None
         and not permit_pts.empty
-        and wb_midpoints
         and api10_to_name
-        and labelNearestN > 0
     ):
         permit_centroid_lon = permit_pts["Longitude"].mean()
         permit_centroid_lat = permit_pts["Latitude"].mean()
-        # Distance in degrees is fine for ranking — no need for true geodesic at this scale
+        # Distance in degrees for ranking; converted to miles below using local cos(lat) factor
+        deg_to_mi_lat = 69.0
+        deg_to_mi_lon = 69.0 * abs(math.cos(math.radians(permit_centroid_lat)))
+
         dists = []
-        for api10, (lon, lat) in wb_midpoints.items():
-            d = ((lon - permit_centroid_lon) ** 2 + (lat - permit_centroid_lat) ** 2) ** 0.5
-            dists.append((d, api10))
+        for api10 in api10_to_name.keys():
+            # Prefer wellbore midpoint, fall back to MP (surface point) if no trajectory data
+            if api10 in wb_midpoints:
+                lon, lat = wb_midpoints[api10]
+            elif api10 in api10_to_fallback_pos:
+                lon, lat = api10_to_fallback_pos[api10]
+            else:
+                continue
+            d_deg = ((lon - permit_centroid_lon) ** 2 + (lat - permit_centroid_lat) ** 2) ** 0.5
+            d_mi = (((lon - permit_centroid_lon) * deg_to_mi_lon) ** 2
+                    + ((lat - permit_centroid_lat) * deg_to_mi_lat) ** 2) ** 0.5
+            dists.append((d_deg, d_mi, api10))
         dists.sort()
-        for i, (_, api10) in enumerate(dists[:labelNearestN]):
+
+        # Optional cap for back-compat — 0 / None / negative means "all"
+        cap = labelNearestN if (labelNearestN and labelNearestN > 0) else len(dists)
+        for i, (_d_deg, d_mi, api10) in enumerate(dists[:cap], start=1):
             name = api10_to_name.get(api10, "")
-            if name:
-                letter = _offset_letter(i)
-                numbered_wells.append((letter, api10, name))
-                api10_to_letter[api10] = letter
-        print(f"  Will label nearest {len(numbered_wells)} offset wells to AFE permit centroid")
+            operator = api10_to_operator.get(api10, "")
+            first_prod = api10_to_first_prod.get(api10)
+            numbered_wells.append((i, api10, name, operator, d_mi, first_prod))
+            api10_to_number[api10] = i
+            api10_to_distance_mi[api10] = d_mi
+        print(f"  Numbered {len(numbered_wells)} offset wells by distance from permit centroid")
+
+    # Build operator → color map from offsetData. Most-common operators get the most distinct
+    # tab20 colors; rare operators (rank > 19) collapse to a single gray "Other" bucket so the
+    # legend stays compact and the map stays readable.
+    import matplotlib.cm as cm
+    operator_counts = {}
+    for op in api10_to_operator.values():
+        if op:
+            operator_counts[op] = operator_counts.get(op, 0) + 1
+    operators_ranked = sorted(operator_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    OTHER_COLOR = "#888888"
+    UNKNOWN_COLOR = "#444444"
+    MAX_OPERATOR_COLORS = 19
+    tab20 = cm.get_cmap("tab20", 20)
+    operator_to_color = {}
+    for i, (op, _cnt) in enumerate(operators_ranked):
+        if i < MAX_OPERATOR_COLORS:
+            operator_to_color[op] = tab20(i)
+        else:
+            operator_to_color[op] = OTHER_COLOR
+    api10_to_color = {}
+    for api10 in api10_to_name.keys():
+        op = api10_to_operator.get(api10)
+        if op and op in operator_to_color:
+            api10_to_color[api10] = operator_to_color[op]
+        else:
+            api10_to_color[api10] = UNKNOWN_COLOR
+    operator_legend_entries = [(op, operator_to_color[op], cnt) for op, cnt in operators_ranked[:MAX_OPERATOR_COLORS]]
+    other_count = sum(cnt for _op, cnt in operators_ranked[MAX_OPERATOR_COLORS:])
+    if other_count:
+        operator_legend_entries.append((f"Other ({len(operators_ranked) - MAX_OPERATOR_COLORS} ops)", OTHER_COLOR, other_count))
 
     print(f"Generating heat map PDF: {pdfPath}")
     with PdfPages(pdfPath) as pdf:
@@ -1041,15 +1092,16 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
 
             cf = ax.contourf(grid_lon, grid_lat, interp, levels=20, cmap="viridis", zorder=4, alpha=0.85)
 
-            # Offset well lateral paths — black, slightly thicker
+            # Offset well lateral paths — colored by operator (most common operators get
+            # tab20 colors, rare ones collapse to a single "Other" gray)
             if wb_groups is not None:
                 for api10, group in wb_groups:
                     ax.plot(
                         group["Longitude"].values,
                         group["Latitude"].values,
-                        color="black",
-                        linewidth=1.0,
-                        alpha=0.75,
+                        color=api10_to_color.get(api10, UNKNOWN_COLOR),
+                        linewidth=1.2,
+                        alpha=0.85,
                         zorder=5,
                     )
 
@@ -1118,13 +1170,20 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
                             path_effects=tr_halo,
                         )
 
-            # Nearest-N offset wells — lowercase letter labels at lateral midpoint.
+            # Offset well numbers — drawn at the heel of each lateral, styled as a small
+            # navy-on-white boxed badge so they read as clearly distinct from the gray PLSS
+            # section numbers (which are unboxed, centered, and lighter).
             # Falls back to MPLatitude/MPLongitude if a well has no wellbore trajectory data.
             if numbered_wells:
-                num_halo = [path_effects.withStroke(linewidth=2.0, foreground="white")]
-                for letter, api10, _name in numbered_wells:
-                    if api10 in wb_midpoints:
-                        lon, lat = wb_midpoints[api10]
+                num_box = dict(
+                    boxstyle="round,pad=0.15",
+                    facecolor="white",
+                    edgecolor="#0a2a5e",
+                    linewidth=0.5,
+                )
+                for number, api10, _name, _op, _dmi, _fp in numbered_wells:
+                    if api10 in wb_heels:
+                        lon, lat = wb_heels[api10]
                     elif api10 in api10_to_fallback_pos:
                         lon, lat = api10_to_fallback_pos[api10]
                     else:
@@ -1132,15 +1191,15 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
                     if not (lon_min <= lon <= lon_max and lat_min <= lat <= lat_max):
                         continue
                     ax.annotate(
-                        letter,
+                        str(number),
                         xy=(lon, lat),
-                        xytext=(3, 3),
+                        xytext=(4, 4),
                         textcoords="offset points",
-                        fontsize=6,
+                        fontsize=5,
                         fontweight="bold",
-                        color="black",
+                        color="#0a2a5e",
                         zorder=11,
-                        path_effects=num_halo,
+                        bbox=num_box,
                     )
 
             # AFE letter labels — only rendered for non-PLSS fallback stars (TX, PA).
@@ -1201,12 +1260,15 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
                 )
 
             if numbered_wells:
-                # Position the offset table directly below the permits box (with gap)
+                # Position the offset table directly below the permits box (with gap).
+                # Wells are numbered 1..N by distance from the AFE permit centroid; numbers
+                # match the small navy badges drawn at each lateral's heel on the map.
                 offset_y_top = stack_top - permit_box_h - (STACK_GAP if permit_box_h else 0)
-                offset_lines = ["Offset Wells (nearest to AFE)", "-" * 32]
-                for letter, _api10, name in numbered_wells:
+                offset_lines = [f"Offset Wells (by distance, n={len(numbered_wells)})", "-" * 32]
+                num_width = len(str(len(numbered_wells)))
+                for number, _api10, name, _op, _dmi, _fp in numbered_wells:
                     display = name if len(name) <= MAX_NAME_LEN else name[: MAX_NAME_LEN - 3] + "..."
-                    offset_lines.append(f"{letter}. {display}")
+                    offset_lines.append(f"{str(number).rjust(num_width)}. {display}")
                 offset_text = "\n".join(offset_lines)
                 fig.text(
                     0.71, offset_y_top, offset_text,
@@ -1220,6 +1282,106 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
             pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
             print(f"  Plotted {param} ({mask.sum():,} wells)")
+
+        # === Appendix pages ===
+        # Full offset well index (number → name → operator → API10 → distance → first prod year)
+        # plus the operator color key. Rendered as multi-page tables, ~50 rows per page.
+        if numbered_wells:
+            ROWS_PER_PAGE = 50
+            COL_HEADERS = ["#", "Well Name", "Operator", "API10", "Dist (mi)", "1st Prod"]
+            COL_WIDTHS = [0.05, 0.40, 0.27, 0.13, 0.08, 0.07]  # fractions of table width
+
+            def _truncate(s, n):
+                s = str(s) if s is not None else ""
+                return s if len(s) <= n else s[: n - 1] + "…"
+
+            total_pages = (len(numbered_wells) + ROWS_PER_PAGE - 1) // ROWS_PER_PAGE
+            for page_i in range(total_pages):
+                start = page_i * ROWS_PER_PAGE
+                end = min(start + ROWS_PER_PAGE, len(numbered_wells))
+                page_rows = numbered_wells[start:end]
+
+                fig = plt.figure(figsize=(11, 8.5))
+                fig.subplots_adjust(left=0.04, right=0.96, top=0.94, bottom=0.05)
+                ax = fig.add_subplot(111)
+                ax.axis("off")
+
+                title = f"Offset Well Index — {dsuName}  (page {page_i + 1}/{total_pages}, wells {start + 1}-{end} of {len(numbered_wells)})"
+                ax.set_title(title, fontsize=11, fontweight="bold", loc="left", pad=14)
+
+                # Build table data
+                table_data = []
+                for number, api10, name, op, dmi, fp in page_rows:
+                    table_data.append([
+                        str(number),
+                        _truncate(name, 48),
+                        _truncate(op, 32),
+                        str(api10),
+                        f"{dmi:.2f}" if dmi is not None else "",
+                        str(fp) if fp is not None else "",
+                    ])
+
+                table = ax.table(
+                    cellText=table_data,
+                    colLabels=COL_HEADERS,
+                    colWidths=COL_WIDTHS,
+                    loc="upper left",
+                    cellLoc="left",
+                )
+                table.auto_set_font_size(False)
+                table.set_fontsize(7)
+                table.scale(1.0, 1.15)
+
+                # Style header row
+                for col_i in range(len(COL_HEADERS)):
+                    cell = table[(0, col_i)]
+                    cell.set_facecolor("#0a2a5e")
+                    cell.set_text_props(color="white", fontweight="bold")
+
+                # Color the operator cell background by the operator color (subtle tint)
+                for row_i, (_n, _a, _name, op, _d, _fp) in enumerate(page_rows, start=1):
+                    color = operator_to_color.get(op)
+                    if color is not None:
+                        cell = table[(row_i, 2)]  # operator column
+                        # Lighten by blending with white at 70% white
+                        try:
+                            r, g, b = color[0], color[1], color[2]
+                            tint = (0.7 + 0.3 * r, 0.7 + 0.3 * g, 0.7 + 0.3 * b)
+                            cell.set_facecolor(tint)
+                        except (TypeError, IndexError):
+                            pass
+
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close(fig)
+
+            # Operator color key page (compact, fits on one page even with 19 entries)
+            if operator_legend_entries:
+                from matplotlib.lines import Line2D
+                fig = plt.figure(figsize=(11, 8.5))
+                ax = fig.add_subplot(111)
+                ax.axis("off")
+                ax.set_title(
+                    f"Operator Color Key — {dsuName}",
+                    fontsize=12, fontweight="bold", loc="left", pad=14,
+                )
+                handles = [
+                    Line2D([0], [0], color=color, linewidth=3.0,
+                           label=f"{op[:50]}{'...' if len(op) > 50 else ''}  —  {cnt} well(s)")
+                    for op, color, cnt in operator_legend_entries
+                ]
+                ax.legend(
+                    handles=handles,
+                    loc="upper left",
+                    fontsize=10,
+                    frameon=False,
+                    handlelength=3.0,
+                    labelspacing=0.7,
+                )
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close(fig)
+                print(f"  Appended operator color key page ({len(operator_legend_entries)} entries)")
+
+            print(f"  Appended {total_pages} offset well index page(s)")
 
     print(f"Done. Saved heat maps to {pdfPath}")
 

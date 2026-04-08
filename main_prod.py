@@ -4,6 +4,7 @@
 # Imports - SHEM Scripts
 import shalehavenscripts.production as production
 import shalehavenscripts.combocurve as combocurve
+import shalehavenscripts.dealsheet as dealsheet
 
 # Imports - General
 import pandas as pd
@@ -88,5 +89,9 @@ mergedUpdatedTypeCurves = production.mergeProductionWithTypeCurves(dailyProducti
 
 # Cumulative Summaries
 cumulativeProduction = production.cumulativeProduction(mergedUpdatedTypeCurves, pathToDatabase)
+
+# Flatten Deal Evaluation Review Sheet (SHLP25 + SHLP26 tabs) for Power BI
+pathToDealSheet = os.getenv("SHALEHAVEN_DEAL_SHEET_PATH")
+dealsheet.buildDealPipeline(pathToDealSheet)
 
 print("End Shalehaven ETL Process")
