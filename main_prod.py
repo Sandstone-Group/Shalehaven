@@ -42,7 +42,7 @@ pathToMonthlyPDSData = os.getenv("SHALEHAVEN_MONTHLY_PDS_PATH")
 pathToDatabase = os.getenv("SHALEHAVEN_DATABASE_PATH")
 pathToDealSheet = os.getenv("SHALEHAVEN_DEAL_SHEET_PATH")
 
-runDealSheet = False # Set to False to skip deal sheet processing and just run production data ETL
+runDealSheet = True # Set to False to skip deal sheet processing and just run production data ETL
 
 # Deal Evaluation Review Sheet (SHLP25 + SHLP26 tabs) for Power BI - if runDealSheet is True, will read the xlsm, flatten it, and write to an xlsx for Power BI. Also returns the combined DataFrame.
 if runDealSheet:

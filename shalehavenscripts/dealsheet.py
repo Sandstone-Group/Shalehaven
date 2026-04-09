@@ -141,6 +141,46 @@ def buildDealPipeline(pathToWorkbook, outputPath=None, tabs=None):
         os.makedirs(outputDir, exist_ok=True)
         outputPath = os.path.join(outputDir, "deal_pipeline_flat.xlsx")
 
-    combined.to_excel(outputPath, index=False, sheet_name="DealPipeline")
-    print(f"Wrote {len(combined)} rows × {len(combined.columns)} cols to {outputPath}")
+    # Parse Contact List tab if present — flat table + bridge table for Basins slicer
+    contactDf = None
+    basinsBridge = None
+    if "Contact List" in wb.sheetnames:
+        ws = wb["Contact List"]
+        rows = list(ws.iter_rows(values_only=True))
+        if rows:
+            headers = [str(c).strip() if c else f"Col{i}" for i, c in enumerate(rows[0])]
+            contactDf = pd.DataFrame(rows[1:], columns=headers)
+            contactDf = contactDf.dropna(how="all")
+            contactDf.insert(0, "ContactID", range(1, len(contactDf) + 1))
+            # Coerce date columns
+            for col in contactDf.columns:
+                if any(k in col.lower() for k in ("date", "touch")):
+                    contactDf[col] = pd.to_datetime(contactDf[col], errors="coerce")
+            # Build bridge table: one row per (ContactID, Basin) for Power BI slicer
+            if "Basins" in contactDf.columns:
+                bridge_rows = []
+                for _, row in contactDf.iterrows():
+                    basins_raw = str(row["Basins"]) if pd.notna(row["Basins"]) else ""
+                    for basin in basins_raw.split(","):
+                        basin = basin.strip()
+                        if basin:
+                            bridge_rows.append({"ContactID": row["ContactID"], "Basin": basin})
+                basinsBridge = pd.DataFrame(bridge_rows)
+            # Drop Basins from the main contact table since the bridge replaces it
+            if "Basins" in contactDf.columns:
+                contactDf = contactDf.drop(columns=["Basins"])
+            print(f"  Contact List: parsed {len(contactDf)} contacts, {len(basinsBridge) if basinsBridge is not None else 0} basin mappings")
+
+    with pd.ExcelWriter(outputPath, engine="openpyxl") as writer:
+        combined.to_excel(writer, index=False, sheet_name="DealPipeline")
+        if contactDf is not None:
+            contactDf.to_excel(writer, index=False, sheet_name="ContactList")
+        if basinsBridge is not None:
+            basinsBridge.to_excel(writer, index=False, sheet_name="ContactBasins")
+
+    print(f"Wrote {len(combined)} deal rows × {len(combined.columns)} cols to {outputPath}")
+    if contactDf is not None:
+        print(f"Wrote {len(contactDf)} contacts to ContactList sheet")
+    if basinsBridge is not None:
+        print(f"Wrote {len(basinsBridge)} basin mappings to ContactBasins sheet")
     return combined
