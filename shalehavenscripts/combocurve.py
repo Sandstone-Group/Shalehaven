@@ -5,8 +5,90 @@ import json
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from combocurve_api_v1 import ComboCurveAuth, ServiceAccount
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import os
 
+
+"""
+
+    ComboCurve client wrapper - pooled session, retries, paginated reads.
+
+"""
+
+class ComboCurveClient:
+    """Thin wrapper around ComboCurve auth + a pooled, retrying requests Session."""
+
+    BASE_URL = "https://api.combocurve.com"
+
+    def __init__(self, service_account_path, api_key, base_url=None):
+        self._auth = ComboCurveAuth(
+            ServiceAccount.from_file(service_account_path),
+            api_key,
+        )
+        self.base_url = base_url or self.BASE_URL
+        self.session = self._build_session()
+
+    @classmethod
+    def from_env(cls,
+                 service_account_var="SANDSTONE_COMBOCURVE_API_SEC_CODE",
+                 api_key_var="SANDSTONE_COMBOCURVE_API_KEY_PASS",
+                 base_url=None):
+        """Build a client from environment variables (loads .env automatically)."""
+        load_dotenv()
+        service_account_path = os.getenv(service_account_var)
+        api_key = os.getenv(api_key_var)
+        if not service_account_path or not api_key:
+            raise RuntimeError(
+                f"ComboCurveClient.from_env: missing {service_account_var} or {api_key_var}"
+            )
+        return cls(service_account_path, api_key, base_url=base_url)
+
+    @staticmethod
+    def _build_session():
+        s = requests.Session()
+        retry = Retry(
+            total=5,
+            backoff_factor=1.0,                       # 1s, 2s, 4s, 8s, 16s
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=("GET", "HEAD", "PUT", "POST", "PATCH", "DELETE"),
+            respect_retry_after_header=True,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+        s.mount("https://", adapter)
+        return s
+
+    def _headers(self):
+        # CC tokens are short-lived; refetch each call so the SDK handles refresh
+        return self._auth.get_auth_headers()
+
+    def request(self, method, path, **kwargs):
+        url = path if path.startswith("http") else f"{self.base_url}{path}"
+        kwargs.setdefault("timeout", 60)
+        resp = self.session.request(method, url, headers=self._headers(), **kwargs)
+        resp.raise_for_status()
+        return resp
+
+    def get(self, path, **kw):    return self.request("GET", path, **kw)
+    def put(self, path, **kw):    return self.request("PUT", path, **kw)
+    def post(self, path, **kw):   return self.request("POST", path, **kw)
+    def patch(self, path, **kw):  return self.request("PATCH", path, **kw)
+    def delete(self, path, **kw): return self.request("DELETE", path, **kw)
+
+    def paginate(self, path, params=None, take=1000):
+        """Yield items from a paginated CC list endpoint."""
+        params = dict(params or {})
+        params["take"] = take
+        skip = 0
+        while True:
+            params["skip"] = skip
+            batch = self.get(path, params=params).json()
+            if not batch:
+                return
+            yield from batch
+            if len(batch) < take:
+                return
+            skip += take
 
 
 """
@@ -15,28 +97,10 @@ import os
 
 """
 
-def putDataComboCurveDaily(data, serviceAccount, comboCurveApi):
-    
-    load_dotenv()  # load enviroment variables
-    
-    # connect to service account
-    service_account = ServiceAccount.from_file(serviceAccount)
-    # set API Key from enviroment variable
-    api_key = comboCurveApi
-    # specific Python ComboCurve authentication
-    combocurve_auth = ComboCurveAuth(service_account, api_key)
+def putDataComboCurveDaily(client, data):
 
-    columnsComboCurve = [
-        "date",
-        "chosenID",
-        "oil",
-        "gas",
-        "water",
-        "dataSource",
-    ]
-    
     cleanComboCurveData = data
-    
+
     # drop all rows with chosenId = 123456789
     cleanComboCurveData = cleanComboCurveData[cleanComboCurveData["chosenID"] != "123456789"]
     ##drop index column
@@ -46,27 +110,19 @@ def putDataComboCurveDaily(data, serviceAccount, comboCurveApi):
     cleanComboCurveData["date"] = pd.to_datetime(cleanComboCurveData["date"])
     cleanComboCurveData["date"] = cleanComboCurveData["date"].dt.strftime("%Y-%m-%d")
     ## convert date to string
-    cleanComboCurveData["date"] = cleanComboCurveData["date"].astype(str)      
+    cleanComboCurveData["date"] = cleanComboCurveData["date"].astype(str)
     ## convert API to string
     cleanComboCurveData["chosenID"] = cleanComboCurveData["chosenID"].astype(str)
-    
-    
+
+
     totalAssetProductionJson = cleanComboCurveData.to_json(
         orient="records"
     )  # converts to internal json format
-    
+
     # loads json into format that can be sent to ComboCurve
     cleanTotalAssetProduction = json.loads(totalAssetProductionJson)
 
-    # sets url to daily production for combo curve for daily production
-    url = "https://api.combocurve.com/v1/daily-productions"
-    auth_headers = combocurve_auth.get_auth_headers()  # authenticates ComboCurve
-
-    # put request to ComboCurve
-    response = requests.put(url, headers=auth_headers, json=cleanTotalAssetProduction)
-
-    responseCode = response.status_code  # sets response code to the current state
-    responseText = response.text  # sets response text to the current state
+    response = client.put("/v1/daily-productions", json=cleanTotalAssetProduction)
 
     responseJson = response.json()
     successCount = responseJson.get("successCount", 0)
@@ -90,33 +146,16 @@ def putDataComboCurveDaily(data, serviceAccount, comboCurveApi):
 
 """
 
-def putDataComboCurveMonthly(data, serviceAccount, comboCurveApi):
-    
-    load_dotenv()  # load enviroment variables
-    
-    # connect to service account
-    service_account = ServiceAccount.from_file(serviceAccount)
-    # set API Key from enviroment variable
-    api_key = comboCurveApi
-    # specific Python ComboCurve authentication
-    combocurve_auth = ComboCurveAuth(service_account, api_key)
+def putDataComboCurveMonthly(client, data):
 
     totalAssetProductionJson = data.to_json(
         orient="records"
     )  # converts to internal json format
-    
+
     # loads json into format that can be sent to ComboCurve
     cleanTotalAssetProduction = json.loads(totalAssetProductionJson)
 
-    # sets url to monthly production for combo curve for monthly production
-    url = "https://api.combocurve.com/v1/monthly-productions"
-    auth_headers = combocurve_auth.get_auth_headers()  # authenticates ComboCurve
-
-    # put request to ComboCurve
-    response = requests.put(url, headers=auth_headers, json=cleanTotalAssetProduction)
-
-    responseCode = response.status_code  # sets response code to the current state
-    responseText = response.text  # sets response text to the current state
+    response = client.put("/v1/monthly-productions", json=cleanTotalAssetProduction)
 
     responseJson = response.json()
     successCount = responseJson.get("successCount", 0)
@@ -136,163 +175,83 @@ def putDataComboCurveMonthly(data, serviceAccount, comboCurveApi):
 
 
 """
-    
+
     Getting Wells from ComboCurve (company list) and filtering by Shalehaven - production-ready
-    
+
 """
 
-def getWellsFromComboCurve(serviceAccount, comboCurveApi):
-    
-    load_dotenv()  # load enviroment variables
-    
+def getWellsFromComboCurve(client):
+
     print("Getting Shalehaven Wells from ComboCurve")
 
-    # connect to service account
-    service_account = ServiceAccount.from_file(serviceAccount)
-    # set API Key from enviroment variable
-    api_key = comboCurveApi
-    # specific Python ComboCurve authentication
-    combocurve_auth = ComboCurveAuth(service_account, api_key)
+    wellsData = list(client.paginate("/v1/wells", take=200))
 
-    url = "https://api.combocurve.com/v1/wells?take=200"
-    auth_headers = combocurve_auth.get_auth_headers()  # authenticates ComboCurve
+    print("Successfully fetched Shalehaven wells from ComboCurve")
 
-    response = requests.get(url, headers=auth_headers)
-
-    responseCode = response.status_code  # sets response code to the current state
-    responseText = response.text  # sets response text to the current state
-    
-    if responseCode != 200:
-        print("Error: Unable to fetch wells from ComboCurve")
-    else:
-        print("Successfully fetched Shalehaven wells from ComboCurve")
-
-    wellsData = json.loads(responseText)
-    
     wellsDataDf = pd.DataFrame(wellsData)
-    
+
     # drop wells not in company "Shalehaven Asset Management"
     wellsDataDf = wellsDataDf[wellsDataDf["customString0"] == "Shalehaven Asset Management"]
-    
+
     return wellsDataDf
 
 """
 
-    Getting Daily Productions from ComboCurve for Shalehaven - production-ready    
-    
+    Getting Daily Productions from ComboCurve for Shalehaven - production-ready
+
 """
 
-def getDailyProductionFromComboCurve(serviceAccount, comboCurveApi, wellList, pathToDatabase):
-    
-    load_dotenv()  # load enviroment variables
-    
+def getDailyProductionFromComboCurve(client, wellList, pathToDatabase):
+
     print("Getting Daily Productions from ComboCurve")
 
-    # connect to service account
-    service_account = ServiceAccount.from_file(serviceAccount)
-    # set API Key from enviroment variable
-    api_key = comboCurveApi
-    # specific Python ComboCurve authentication
-    combocurve_auth = ComboCurveAuth(service_account, api_key)
-    
-    # paginate through all daily productions 1000 at a time
-    all_daily_productions = []
-    take = 1000
-    skip = 0
-    while True:
-        url = f"https://api.combocurve.com/v1/daily-productions?take={take}&skip={skip}"
-        auth_headers = combocurve_auth.get_auth_headers()  # authenticates ComboCurve
+    all_daily_productions = list(client.paginate("/v1/daily-productions", take=1000))
 
-        response = requests.get(url, headers=auth_headers)
+    print(f"Successfully fetched {len(all_daily_productions)} daily productions from ComboCurve")
 
-        responseCode = response.status_code  # sets response code to the current state
-        responseText = response.text  # sets response text to the current state
-        
-        if responseCode != 200:
-            print("Error: Unable to fetch daily productions from ComboCurve")
-            break
-        else:
-            print(f"Successfully fetched {take} daily productions from ComboCurve (skip={skip})")
-
-        dailyProductionsData = json.loads(responseText)
-        
-        if not dailyProductionsData:
-            break
-        
-        all_daily_productions.extend(dailyProductionsData)
-        skip += take
-    
     dailyProductionsDf = pd.DataFrame(all_daily_productions)
 
     # filter dailyProductionsDf by wellList chosenID
     dailyProductionsDf = dailyProductionsDf[dailyProductionsDf["well"].isin(wellList["id"])]
-    
+
     # add wellName and API column to dailyProductionsDf by matching well in dailyProductionsDf with id in wellList not using merge
     dailyProductionsDf["wellName"] = dailyProductionsDf["well"].map(wellList.set_index("id")["wellName"])
     dailyProductionsDf["API"] = dailyProductionsDf["well"].map(wellList.set_index("id")["chosenID"])
-    
+
     # drop createdAt, updatedAt columns
     dailyProductionsDf = dailyProductionsDf.drop(columns=["createdAt", "updatedAt"])
 
     dailyProductionsDf.to_excel(os.path.join(pathToDatabase, r"daily_production.xlsx"))
 
-    
+
     print("Finished Getting Daily Productions from ComboCurve")
-    
+
     return dailyProductionsDf
 
 """
-  
-  Get Daily Forecast From ComboCurve - production-ready  
-    
+
+  Get Daily Forecast From ComboCurve - production-ready
+
 """
 
-def getDailyForecastFromComboCurve(serviceAccount, comboCurveApi, projectId, forecastId, wellList):
+def getDailyForecastFromComboCurve(client, projectId, forecastId, wellList):
 
-    load_dotenv()  # load enviroment variables
-    
     print("Getting Daily Forecast from ComboCurve")
 
-    # connect to service account
-    service_account = ServiceAccount.from_file(serviceAccount)
-    # set API Key from enviroment variable
-    api_key = comboCurveApi
-    # specific Python ComboCurve authentication
-    combocurve_auth = ComboCurveAuth(service_account, api_key)
-    
-    # paginate through all daily forecasts 200 at a time
-    all_daily_forecasts = []
-    take = 200  # max take is 200
-    skip = 0
-    while True:
-        url = f"https://api.combocurve.com/v1/forecast-daily-volumes?project={projectId}&forecast={forecastId}&take={take}&skip={skip}"
-        auth_headers = combocurve_auth.get_auth_headers()  # authenticates ComboCurve
+    all_daily_forecasts = list(client.paginate(
+        "/v1/forecast-daily-volumes",
+        params={"project": projectId, "forecast": forecastId},
+        take=200,  # max take is 200
+    ))
 
-        response = requests.get(url, headers=auth_headers)
-
-        responseCode = response.status_code  # sets response code to the current state
-        responseText = response.text  # sets response text to the current state
-        
-        if responseCode != 200:
-            print("Error: Unable to fetch daily forecasts from ComboCurve")
-            break
-        else:
-            print(f"Successfully fetched {take} daily forecasts from ComboCurve (skip={skip})")
-
-        dailyForecastData = json.loads(responseText)
-        
-        if not dailyForecastData:
-            break
-        
-        all_daily_forecasts.extend(dailyForecastData)
-        skip += take
+    print(f"Successfully fetched {len(all_daily_forecasts)} daily forecasts from ComboCurve")
 
     # Initialize lists to store DataFrame data
     wells = []
     dates = []
     phases = []
     volumes = []
-    
+
     for entry in all_daily_forecasts:
         wellId = entry["well"]
         for phaseData in entry["phases"]:
@@ -301,7 +260,7 @@ def getDailyForecastFromComboCurve(serviceAccount, comboCurveApi, projectId, for
             startDate = datetime.strptime(series["startDate"], "%Y-%m-%dT%H:%M:%S.%fZ")
             endDate = datetime.strptime(series["endDate"], "%Y-%m-%dT%H:%M:%S.%fZ")
             volumeList = series["volumes"]
-            
+
             # generate dates from startDate to endDate
             currentDate = startDate
             dayIndex = 0
@@ -315,7 +274,7 @@ def getDailyForecastFromComboCurve(serviceAccount, comboCurveApi, projectId, for
 
                 currentDate += timedelta(days=1)
                 dayIndex += 1
-    
+
     # Create DataFrame from lists
     dailyForecastDf = pd.DataFrame({
         "well": wells,
@@ -323,11 +282,11 @@ def getDailyForecastFromComboCurve(serviceAccount, comboCurveApi, projectId, for
         "phase": phases,
         "volume": volumes
     })
-    
+
     # add wellName and API column by matching wellId with wellList
     dailyForecastDf["wellName"] = dailyForecastDf["well"].map(wellList.set_index("id")["wellName"])
     dailyForecastDf["API"] = dailyForecastDf["well"].map(wellList.set_index("id")["chosenID"])
-    
+
     # Pivot the DataFrame to have separate columns for oil, gas, and water, well, date, wellName, API
     pivotDailyForecast = dailyForecastDf.pivot_table(
         index=["date", "well", "wellName", "API"],
@@ -346,7 +305,7 @@ def getDailyForecastFromComboCurve(serviceAccount, comboCurveApi, projectId, for
 
     # Reorder columns to match requested order
     pivotDailyForecast = pivotDailyForecast[["date", "well", "oil", "gas", "water", "wellName", "API"]]
-    
+
     print("Finished Getting Daily Forecast from ComboCurve")
 
     return pivotDailyForecast

@@ -40,13 +40,21 @@ pathToSpurData = os.getenv("SHALEHAVEN_SPUR_PATH")
 pathToBallardData = os.getenv("SHALEHAVEN_BALLARD_PATH")
 pathToMonthlyPDSData = os.getenv("SHALEHAVEN_MONTHLY_PDS_PATH")
 pathToDatabase = os.getenv("SHALEHAVEN_DATABASE_PATH")
-
-# Flatten Deal Evaluation Review Sheet (SHLP25 + SHLP26 tabs) for Power BI
 pathToDealSheet = os.getenv("SHALEHAVEN_DEAL_SHEET_PATH")
-dealsheet.buildDealPipeline(pathToDealSheet)
+
+runDealSheet = False # Set to False to skip deal sheet processing and just run production data ETL
+
+# Deal Evaluation Review Sheet (SHLP25 + SHLP26 tabs) for Power BI - if runDealSheet is True, will read the xlsm, flatten it, and write to an xlsx for Power BI. Also returns the combined DataFrame.
+if runDealSheet:
+    dealsheet.buildDealPipeline(pathToDealSheet)
+else:
+        print("Skipping Deal Sheet")
+
+# Build a single ComboCurve client (pooled session, retries, env-driven auth)
+ccClient = combocurve.ComboCurveClient.from_env()
 
 # Get Wells From ComboCurve and Split by Operator
-wells = combocurve.getWellsFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
+wells = combocurve.getWellsFromComboCurve(ccClient)
 huntWells = wells[wells['currentOperator'] == 'HUNT OIL COMPANY']
 admiralWells = wells[wells['currentOperator'] == 'ADMIRAL PERMIAN OPERATING LLC']
 aethonWells = wells[wells['currentOperator'] == 'AETHON ENERGY OPERATING LLC']
@@ -72,21 +80,21 @@ ballardProductionData = production.ballardProductionData(pathToBallardData)
 monthlyPds = production.pdsMonthlyData(pathToMonthlyPDSData)
 
 # Put Production Data to ComboCurve
-combocurve.putDataComboCurveDaily(admiralPermianProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
-combocurve.putDataComboCurveDaily(huntOilProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
-combocurve.putDataComboCurveDaily(aethonProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
-combocurve.putDataComboCurveDaily(devonProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
-combocurve.putDataComboCurveDaily(copProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
-combocurve.putDataComboCurveDaily(spurProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
-combocurve.putDataComboCurveDaily(ballardProductionData,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
-combocurve.putDataComboCurveMonthly(monthlyPds,sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey)
+combocurve.putDataComboCurveDaily(ccClient, admiralPermianProductionData)
+combocurve.putDataComboCurveDaily(ccClient, huntOilProductionData)
+combocurve.putDataComboCurveDaily(ccClient, aethonProductionData)
+combocurve.putDataComboCurveDaily(ccClient, devonProductionData)
+combocurve.putDataComboCurveDaily(ccClient, copProductionData)
+combocurve.putDataComboCurveDaily(ccClient, spurProductionData)
+combocurve.putDataComboCurveDaily(ccClient, ballardProductionData)
+combocurve.putDataComboCurveMonthly(ccClient, monthlyPds)
 
 # Get Daily Productions from ComboCurve for Shalehaven
-dailyProductions = combocurve.getDailyProductionFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, fundWells, pathToDatabase)
+dailyProductions = combocurve.getDailyProductionFromComboCurve(ccClient, fundWells, pathToDatabase)
 
 # Get Updated and Original Type Curves from ComboCurve for Shalehaven LP 2024
-updatedTypeCurves = combocurve.getDailyForecastFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, shalehavenProjectId, shalehavenForcastIdUpdatedTypeCurve, fundWells)
-originalTypeCurves = combocurve.getDailyForecastFromComboCurve(sandstoneComboCurveServiceAccount,sandstoneComboCurveApiKey, shalehavenProjectId, shalehavenForcastIdOriginalTypeCurve, fundWells)
+updatedTypeCurves = combocurve.getDailyForecastFromComboCurve(ccClient, shalehavenProjectId, shalehavenForcastIdUpdatedTypeCurve, fundWells)
+originalTypeCurves = combocurve.getDailyForecastFromComboCurve(ccClient, shalehavenProjectId, shalehavenForcastIdOriginalTypeCurve, fundWells)
 
 # Merge Type Curves Updated and Orginal
 mergedUpdatedTypeCurves = production.mergeProductionWithTypeCurves(dailyProductions,updatedTypeCurves, originalTypeCurves, fundWells, pathToDatabase)
