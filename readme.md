@@ -155,4 +155,6 @@ Process geospatial constraints, run production models, and evaluate economics to
 python main_los.py
 python main_model.py
 python main_prod.py
+python main_analysis.py
+```
 
