@@ -1597,3 +1597,815 @@ def printData(forecastData, monthlyForecastData, monthlyProductionData, pathToAf
     productionPath = os.path.join(outputDir, f"monthly_production_{dsuName}.xlsx")
     monthlyProductionData.to_excel(productionPath, index=False)
     print(f"Exported {len(monthlyProductionData)} monthly production rows to {productionPath}")
+
+
+## Pull WellDetails + WellSpacing for operator analysis
+## Filters by operator name (fuzzy matched) and formation(s) from the AFE Summary.
+## Returns a merged DataFrame with completion, production, and spacing columns.
+def getOperatorAnalysisData(afeData):
+
+    paths = getNoviBulkPaths()
+
+    # Resolve operator and formations from AFE
+    operators = afeData["Operator"].dropna().str.strip().unique().tolist()
+    formations = afeData["Landing Zone"].dropna().str.upper().unique().tolist()
+    if "POINT PLEASANT" in formations and "UTICA" not in formations:
+        formations.append("UTICA")
+    elif "UTICA" in formations and "POINT PLEASANT" not in formations:
+        formations.append("POINT PLEASANT")
+
+    print(f"Loading operator analysis data for: {operators}")
+    print(f"  Formations: {formations}")
+
+    # Load WellDetails
+    wells = pd.read_csv(
+        paths["tsv"]["WellDetails"], sep="\t", low_memory=False, dtype={"API10": "string"}
+    )
+
+    # Fuzzy match operator — match if the AFE operator string appears anywhere in CurrentOperator
+    op_pattern = "|".join(re.escape(op.upper()) for op in operators)
+    op_mask = wells["CurrentOperator"].fillna("").str.upper().str.contains(op_pattern, regex=True)
+    fm_mask = wells["Formation"].fillna("").str.upper().isin(formations)
+    hz_mask = wells["IsHorizontalWell"].astype(str).str.lower().isin(["t", "true", "1"])
+
+    filtered = wells[op_mask & fm_mask & hz_mask].copy()
+    print(f"  {len(filtered):,} horizontal wells match operator + formation filter")
+
+    if filtered.empty:
+        return filtered
+
+    # Compute derived completion metrics
+    filtered["ProppantLbsPerFt"] = pd.to_numeric(filtered["FirstCompletionProppantLbsPerFt"], errors="coerce")
+    filtered["FluidBblPerFt"] = (
+        pd.to_numeric(filtered["FirstCompletionFluidVolume"], errors="coerce") / 42.0
+        / pd.to_numeric(filtered["LateralLength"], errors="coerce").replace(0, float("nan"))
+    )
+    filtered["Cum12MBOEPerFt"] = (
+        pd.to_numeric(filtered["Cum12MBOE"], errors="coerce")
+        / pd.to_numeric(filtered["LateralLength"], errors="coerce").replace(0, float("nan"))
+    )
+
+    # Merge spacing data
+    spacing = pd.read_csv(
+        paths["tsv"]["WellSpacing"], sep="\t", low_memory=False, dtype={"API10": "string"}
+    )
+    filtered = filtered.merge(spacing[["API10", "ClosestWellXY", "WellsInRadius", "IsChild",
+                                        "BoundednessScore"]], on="API10", how="left",
+                               suffixes=("", "_spacing"))
+    print(f"  Merged spacing data. {filtered['IsChild'].notna().sum():,} wells have spacing info.")
+
+    # Classify frac type from FracFocus ingredients
+    filtered = _mergeFracType(filtered, paths)
+
+    return filtered
+
+
+## Classify each well's frac type from FracFocusIngredients.
+## Scans ffPurpose, ffTradeName, and ffIngredientName for keywords — newer FracFocus filings
+## often bundle everything under "Ingredient Container Purpose" with no specific purpose labels,
+## so trade names and ingredient names are checked as a fallback.
+## Returns: "Gel/Hybrid" if gel/crosslink/guar detected, "Slickwater" if friction reducer only,
+## "Unknown" if no FracFocus data. Chunked read since FracFocusIngredients is ~1.6 GB.
+def _classifyFracType(api10_set, paths):
+
+    ingredientsPath = paths["tsv"]["FracFocusIngredients"]
+
+    GEL_KEYWORDS = ["gel", "cross", "guar", "viscosif"]
+    FR_KEYWORDS = ["friction", "fr-", "fr ", "slickwater", "slick water"]
+    # Ingredient/trade name indicators for wells using the "Ingredient Container" format
+    GEL_INGREDIENTS = ["guar", "crosslink", "cross link", "xlink", "viscosif", "gelling agent"]
+    FR_INGREDIENTS = ["friction reducer", "polyacrylamide", "slickwater",
+                      "polyacrylate", "acrylamide polymer", "acrylate copoly"]
+
+    chunk_size = 1_000_000
+    well_flags = {}  # api10 -> {"gel": bool, "fr": bool}
+
+    print(f"  Classifying frac type for {len(api10_set):,} wells from FracFocusIngredients...")
+    rows_scanned = 0
+
+    for i, chunk in enumerate(
+        pd.read_csv(
+            ingredientsPath,
+            sep="\t",
+            chunksize=chunk_size,
+            low_memory=False,
+            dtype={"API10": "string"},
+            usecols=["API10", "ffPurpose", "ffTradeName", "ffIngredientName"],
+        ),
+        1,
+    ):
+        rows_scanned += len(chunk)
+        hits = chunk[chunk["API10"].isin(api10_set)].copy()
+        if hits.empty:
+            continue
+
+        for _, row in hits.iterrows():
+            api10 = row["API10"]
+            if api10 not in well_flags:
+                well_flags[api10] = {"gel": False, "fr": False}
+
+            # Check all three text fields for indicators
+            texts = [
+                str(row.get("ffPurpose", "")).lower(),
+                str(row.get("ffTradeName", "")).lower(),
+                str(row.get("ffIngredientName", "")).lower(),
+            ]
+            combined = " ".join(texts)
+
+            if any(kw in combined for kw in GEL_KEYWORDS + GEL_INGREDIENTS):
+                well_flags[api10]["gel"] = True
+            if any(kw in combined for kw in FR_KEYWORDS + FR_INGREDIENTS):
+                well_flags[api10]["fr"] = True
+
+        if i % 5 == 0:
+            print(f"    Chunk {i}: scanned {rows_scanned:,} rows, matched {len(well_flags):,} wells")
+
+    # Classify — gel/crosslink chemicals are distinctive and always appear in any disclosure
+    # format, so if a well has FracFocus data but no gel indicators, it's slickwater.
+    # "Unknown" only when the well has no FracFocus filing at all.
+    result = {}
+    for api10 in api10_set:
+        flags = well_flags.get(api10)
+        if flags is None:
+            result[api10] = "Unknown"
+        elif flags["gel"]:
+            result[api10] = "Gel/Hybrid"
+        else:
+            result[api10] = "Slickwater"
+
+    counts = pd.Series(result.values()).value_counts().to_dict()
+    print(f"  Frac type classification: {counts}")
+
+    return result
+
+
+## Merge frac type classification into a DataFrame with API10 column
+def _mergeFracType(df, paths):
+    api10_set = set(df["API10"].astype("string").tolist())
+    frac_types = _classifyFracType(api10_set, paths)
+    df = df.copy()
+    df["FracType"] = df["API10"].astype("string").map(frac_types).fillna("Unknown")
+    return df
+
+
+## Pull ALL horizontal wells within 5 miles of the AFE location for peer comparison.
+## Resolves AFE location from T/R/S (via BLM PLSS) or local permits, builds a 5-mile
+## bounding box, and returns WellDetails + WellSpacing for every operator in the area.
+def getPeerAnalysisData(afeData):
+
+    paths = getNoviBulkPaths()
+
+    formations = afeData["Landing Zone"].dropna().str.upper().unique().tolist()
+    if "POINT PLEASANT" in formations and "UTICA" not in formations:
+        formations.append("UTICA")
+    elif "UTICA" in formations and "POINT PLEASANT" not in formations:
+        formations.append("POINT PLEASANT")
+
+    # Resolve AFE well locations from T/R/S
+    lats, lons = [], []
+    for _, row in afeData.iterrows():
+        twp = str(row.get("Township", "")).strip()
+        rng = str(row.get("Range", "")).strip()
+        sec = str(row.get("Section", "")).strip()
+        state_abbr = STATE_ABBR_MAP.get(str(row.get("State", "")).strip().lower())
+        if twp and rng and sec and state_abbr:
+            centroid = _fetchSectionCentroid(state_abbr, twp, rng, sec)
+            if centroid:
+                lats.append(centroid[0])
+                lons.append(centroid[1])
+
+    # Fall back to local permits if T/R/S didn't produce any locations
+    if not lats:
+        localPermits = pd.read_csv(
+            paths["tsv"]["WellPermits"], sep="\t", low_memory=False,
+            dtype={"API10": "string", "ID": "string"},
+        )
+        for _, row in afeData.iterrows():
+            api_number = str(row["API Number"])
+            county = row["County"]
+            state = row["State"]
+            is_texas = str(state).strip().lower() == "texas"
+            if is_texas:
+                match = localPermits[(localPermits["API10"] == api_number) & (localPermits["County"] == county)]
+            else:
+                match = localPermits[(localPermits["ID"] == api_number) & (localPermits["County"] == county)]
+            match = match.dropna(subset=["Latitude", "Longitude"])
+            if not match.empty:
+                lats.append(match["Latitude"].iloc[0])
+                lons.append(match["Longitude"].iloc[0])
+
+    if not lats:
+        print("  Could not resolve any AFE locations for peer analysis.")
+        return pd.DataFrame()
+
+    # Build 5-mile bounding box around centroid of all AFE wells
+    center_lat = sum(lats) / len(lats)
+    center_lon = sum(lons) / len(lons)
+    miles = 5.0
+    lat_offset = miles / 69.0
+    lon_offset = miles / (69.0 * abs(math.cos(math.radians(center_lat))))
+
+    min_lat = center_lat - lat_offset
+    max_lat = center_lat + lat_offset
+    min_lon = center_lon - lon_offset
+    max_lon = center_lon + lon_offset
+
+    print(f"Loading peer analysis data within {miles} mi of ({center_lat:.4f}, {center_lon:.4f})")
+    print(f"  Formations: {formations}")
+    print(f"  Bounding box: Lat [{min_lat:.4f}, {max_lat:.4f}], Lon [{min_lon:.4f}, {max_lon:.4f}]")
+
+    wells = pd.read_csv(
+        paths["tsv"]["WellDetails"], sep="\t", low_memory=False, dtype={"API10": "string"}
+    )
+
+    hz_mask = wells["IsHorizontalWell"].astype(str).str.lower().isin(["t", "true", "1"])
+    fm_mask = wells["Formation"].fillna("").str.upper().isin(formations)
+    geo_mask = (
+        (wells["MPLatitude"] >= min_lat) & (wells["MPLatitude"] <= max_lat)
+        & (wells["MPLongitude"] >= min_lon) & (wells["MPLongitude"] <= max_lon)
+    )
+
+    filtered = wells[hz_mask & fm_mask & geo_mask].copy()
+    print(f"  {len(filtered):,} horizontal wells in area across {filtered['CurrentOperator'].nunique()} operators")
+
+    if filtered.empty:
+        return filtered
+
+    # Derived metrics (same as getOperatorAnalysisData)
+    filtered["ProppantLbsPerFt"] = pd.to_numeric(filtered["FirstCompletionProppantLbsPerFt"], errors="coerce")
+    filtered["FluidBblPerFt"] = (
+        pd.to_numeric(filtered["FirstCompletionFluidVolume"], errors="coerce") / 42.0
+        / pd.to_numeric(filtered["LateralLength"], errors="coerce").replace(0, float("nan"))
+    )
+    filtered["Cum12MBOEPerFt"] = (
+        pd.to_numeric(filtered["Cum12MBOE"], errors="coerce")
+        / pd.to_numeric(filtered["LateralLength"], errors="coerce").replace(0, float("nan"))
+    )
+    filtered["EUR50YRBOEPerFt"] = (
+        pd.to_numeric(filtered["EUR50YRBOE"], errors="coerce")
+        / pd.to_numeric(filtered["LateralLength"], errors="coerce").replace(0, float("nan"))
+    )
+
+    # Merge spacing
+    spacing = pd.read_csv(
+        paths["tsv"]["WellSpacing"], sep="\t", low_memory=False, dtype={"API10": "string"}
+    )
+    filtered = filtered.merge(spacing[["API10", "ClosestWellXY", "WellsInRadius", "IsChild",
+                                        "BoundednessScore"]], on="API10", how="left",
+                               suffixes=("", "_spacing"))
+
+    # Classify frac type
+    filtered = _mergeFracType(filtered, paths)
+
+    # Report operator breakdown
+    op_counts = filtered["CurrentOperator"].value_counts()
+    print(f"  Operator breakdown:")
+    for op, count in op_counts.items():
+        print(f"    {op}: {count} wells")
+
+    return filtered
+
+
+## Generate operator analysis PDF with completion trends, production performance, spacing impact,
+## and peer comparison pages. Exports to Data/ folder as operator_analysis_{DSU Name}.pdf.
+def plotOperatorAnalysis(analysisData, pathToAfeSummary, peerData=None):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+    import numpy as np
+
+    if analysisData is None or analysisData.empty:
+        print("No operator analysis data — skipping PDF export.")
+        return
+
+    # Resolve output path
+    afeDir = os.path.dirname(pathToAfeSummary)
+    afeFilename = os.path.splitext(os.path.basename(pathToAfeSummary))[0]
+    dsuName = afeFilename.split("-", 1)[1].strip() if "-" in afeFilename else afeFilename
+    outputDir = os.path.join(afeDir, "Data")
+    os.makedirs(outputDir, exist_ok=True)
+    pdfPath = os.path.join(outputDir, f"operator_analysis_{dsuName}.pdf")
+
+    operator = analysisData["CurrentOperator"].mode().iloc[0] if not analysisData["CurrentOperator"].empty else "Unknown"
+    formations = sorted(analysisData["Formation"].dropna().str.upper().unique().tolist())
+    fm_label = " / ".join(formations) if formations else "ALL"
+
+    df = analysisData.copy()
+    df["Vintage"] = pd.to_numeric(df["FirstProductionYear"], errors="coerce")
+    df = df[df["Vintage"].notna() & (df["Vintage"] >= 2014)].copy()
+    df["Vintage"] = df["Vintage"].astype(int)
+
+    print(f"Generating operator analysis PDF: {pdfPath}")
+    print(f"  Operator: {operator}")
+    print(f"  Formations: {fm_label}")
+    print(f"  Vintage range: {df['Vintage'].min()}-{df['Vintage'].max()}, {len(df):,} wells")
+
+    with PdfPages(pdfPath) as pdf:
+
+        # === PAGE 1: Completion Design Trends ===
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig.suptitle(f"Completion Design Trends — {operator}\n{fm_label}", fontsize=13, fontweight="bold")
+
+        # Top row + bottom-left: bar charts by vintage
+        bar_metrics = [
+            ("LateralLength", "Avg Lateral Length (ft)", "steelblue"),
+            ("ProppantLbsPerFt", "Avg Proppant (lbs/ft)", "firebrick"),
+            ("FluidBblPerFt", "Avg Fluid (bbl/ft)", "teal"),
+        ]
+
+        for ax, (col, label, color) in zip([axes[0, 0], axes[0, 1], axes[1, 0]], bar_metrics):
+            col_numeric = pd.to_numeric(df[col], errors="coerce")
+            grouped = df.assign(_val=col_numeric).groupby("Vintage")["_val"]
+            means = grouped.mean()
+            counts = grouped.count()
+            valid = means[counts >= 3].dropna()
+            if valid.empty:
+                ax.text(0.5, 0.5, f"Insufficient data\nfor {label}", ha="center", va="center", transform=ax.transAxes)
+                ax.set_title(label)
+                continue
+            ax.bar(valid.index, valid.values, color=color, alpha=0.8, edgecolor="black", linewidth=0.3)
+            for x, y, n in zip(valid.index, valid.values, counts[valid.index]):
+                ax.annotate(f"n={n}", xy=(x, y), ha="center", va="bottom", fontsize=7, color="#444444")
+            ax.set_title(label)
+            ax.set_xlabel("First Production Year")
+            ax.set_ylabel(label)
+            ax.grid(axis="y", alpha=0.3)
+
+        # Bottom-right: Proppant/Fluid ratio vs EUR 50yr BOE scatter
+        ax = axes[1, 1]
+        prop = pd.to_numeric(df["FirstCompletionProppantMass"], errors="coerce")
+        fluid = pd.to_numeric(df["FirstCompletionFluidVolume"], errors="coerce") / 42.0
+        eur50 = pd.to_numeric(df["EUR50YRBOE"], errors="coerce")
+        prop_fluid = (prop / fluid.replace(0, float("nan")))
+        scatter_mask = prop_fluid.notna() & eur50.notna()
+        if scatter_mask.sum() >= 3:
+            sc = ax.scatter(prop_fluid[scatter_mask], eur50[scatter_mask],
+                           c=df.loc[scatter_mask, "Vintage"], cmap="plasma",
+                           s=20, alpha=0.7, edgecolor="black", linewidth=0.2)
+            plt.colorbar(sc, ax=ax, label="Vintage", shrink=0.8)
+        else:
+            ax.text(0.5, 0.5, "Insufficient data", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title("Proppant/Fluid Ratio vs EUR 50yr BOE")
+        ax.set_xlabel("Proppant / Fluid (lbs/bbl)")
+        ax.set_ylabel("EUR 50yr BOE")
+        ax.grid(alpha=0.3)
+
+        fig.tight_layout(rect=[0, 0, 1, 0.93])
+        pdf.savefig(fig)
+        plt.close(fig)
+        print("  Page 1: Completion Design Trends")
+
+        # === PAGE 2: Production Performance ===
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig.suptitle(f"Production Performance — {operator}\n{fm_label}", fontsize=13, fontweight="bold")
+
+        # 2a: Cum12M BOE/ft by vintage — only wells with >= 12 months on production
+        ax = axes[0, 0]
+        months_on = pd.to_numeric(df["LastReportedMonthsOnProduction"], errors="coerce")
+        df_12m = df[months_on >= 12]
+        col_numeric = pd.to_numeric(df_12m["Cum12MBOEPerFt"], errors="coerce")
+        grouped = df_12m.assign(_val=col_numeric).groupby("Vintage")["_val"]
+        means = grouped.mean()
+        counts = grouped.count()
+        valid = means[counts >= 3].dropna()
+        if not valid.empty:
+            ax.bar(valid.index, valid.values, color="steelblue", alpha=0.8, edgecolor="black", linewidth=0.3)
+            for x, y, n in zip(valid.index, valid.values, counts[valid.index]):
+                ax.annotate(f"n={n}", xy=(x, y), ha="center", va="bottom", fontsize=7, color="#444444")
+        ax.set_title("Cum 12M BOE / Lateral Foot")
+        ax.set_xlabel("First Production Year")
+        ax.set_ylabel("BOE/ft")
+        ax.grid(axis="y", alpha=0.3)
+
+        # 2b: EUR50yr BOE vs lateral length scatter
+        ax = axes[0, 1]
+        eur = pd.to_numeric(df["EUR50YRBOE"], errors="coerce")
+        ll = pd.to_numeric(df["LateralLength"], errors="coerce")
+        scatter_mask = eur.notna() & ll.notna()
+        if scatter_mask.sum() >= 3:
+            sc = ax.scatter(ll[scatter_mask], eur[scatter_mask], c=df.loc[scatter_mask, "Vintage"],
+                           cmap="plasma", s=20, alpha=0.7, edgecolor="black", linewidth=0.2)
+            plt.colorbar(sc, ax=ax, label="Vintage", shrink=0.8)
+        ax.set_title("EUR 50yr BOE vs Lateral Length")
+        ax.set_xlabel("Lateral Length (ft)")
+        ax.set_ylabel("EUR 50yr BOE")
+        ax.grid(alpha=0.3)
+
+        # 2c: Peak month BOE rate by vintage
+        ax = axes[1, 0]
+        col_numeric = pd.to_numeric(df["PeakMonthBOERate"], errors="coerce")
+        grouped = df.assign(_val=col_numeric).groupby("Vintage")["_val"]
+        means = grouped.mean()
+        counts = grouped.count()
+        valid = means[counts >= 3].dropna()
+        if not valid.empty:
+            ax.bar(valid.index, valid.values, color="darkorange", alpha=0.8, edgecolor="black", linewidth=0.3)
+            for x, y, n in zip(valid.index, valid.values, counts[valid.index]):
+                ax.annotate(f"n={n}", xy=(x, y), ha="center", va="bottom", fontsize=7, color="#444444")
+        ax.set_title("Avg Peak Month BOE Rate")
+        ax.set_xlabel("First Production Year")
+        ax.set_ylabel("BOE/month")
+        ax.grid(axis="y", alpha=0.3)
+
+        # 2d: Cum Life GOR by vintage
+        ax = axes[1, 1]
+        col_numeric = pd.to_numeric(df["CumLifeGOR"], errors="coerce")
+        grouped = df.assign(_val=col_numeric).groupby("Vintage")["_val"]
+        means = grouped.mean()
+        counts = grouped.count()
+        valid = means[counts >= 3].dropna()
+        if not valid.empty:
+            ax.bar(valid.index, valid.values, color="gray", alpha=0.8, edgecolor="black", linewidth=0.3)
+            for x, y, n in zip(valid.index, valid.values, counts[valid.index]):
+                ax.annotate(f"n={n}", xy=(x, y), ha="center", va="bottom", fontsize=7, color="#444444")
+        ax.set_title("Avg Cum Life GOR")
+        ax.set_xlabel("First Production Year")
+        ax.set_ylabel("GOR (scf/bbl)")
+        ax.grid(axis="y", alpha=0.3)
+
+        fig.tight_layout(rect=[0, 0, 1, 0.93])
+        pdf.savefig(fig)
+        plt.close(fig)
+        print("  Page 2: Production Performance")
+
+        # === PAGE 3: Spacing Impact ===
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig.suptitle(f"Spacing Impact — {operator}\n{fm_label}", fontsize=13, fontweight="bold")
+
+        cum12m = pd.to_numeric(df["Cum12MBOE"], errors="coerce")
+
+        # 3a: Child vs Parent Cum12M BOE
+        ax = axes[0, 0]
+        is_child = df["IsChild"]
+        child_vals = cum12m[is_child == True].dropna()
+        parent_vals = cum12m[is_child == False].dropna()
+        if len(child_vals) >= 3 and len(parent_vals) >= 3:
+            bp = ax.boxplot(
+                [parent_vals.values, child_vals.values],
+                labels=[f"Parent (n={len(parent_vals)})", f"Child (n={len(child_vals)})"],
+                patch_artist=True,
+            )
+            bp["boxes"][0].set_facecolor("steelblue")
+            bp["boxes"][1].set_facecolor("firebrick")
+        else:
+            ax.text(0.5, 0.5, "Insufficient child/parent\ndata for comparison",
+                    ha="center", va="center", transform=ax.transAxes)
+        ax.set_title("Child vs Parent — Cum 12M BOE")
+        ax.set_ylabel("Cum 12M BOE")
+        ax.grid(axis="y", alpha=0.3)
+
+        # 3b: Boundedness Score vs Cum12M BOE
+        ax = axes[0, 1]
+        bound = pd.to_numeric(df["BoundednessScore"], errors="coerce")
+        scatter_mask = bound.notna() & cum12m.notna()
+        if scatter_mask.sum() >= 3:
+            ax.scatter(bound[scatter_mask], cum12m[scatter_mask], s=20, alpha=0.6,
+                      color="teal", edgecolor="black", linewidth=0.2)
+        ax.set_title("Boundedness Score vs Cum 12M BOE")
+        ax.set_xlabel("Boundedness Score")
+        ax.set_ylabel("Cum 12M BOE")
+        ax.grid(alpha=0.3)
+
+        # 3c: Closest Well Distance vs Cum12M BOE
+        ax = axes[1, 0]
+        closest = pd.to_numeric(df["ClosestWellXY"], errors="coerce")
+        scatter_mask = closest.notna() & cum12m.notna()
+        if scatter_mask.sum() >= 3:
+            ax.scatter(closest[scatter_mask], cum12m[scatter_mask], s=20, alpha=0.6,
+                      color="darkorange", edgecolor="black", linewidth=0.2)
+        ax.set_title("Closest Well Distance vs Cum 12M BOE")
+        ax.set_xlabel("Closest Well (ft)")
+        ax.set_ylabel("Cum 12M BOE")
+        ax.grid(alpha=0.3)
+
+        # 3d: Wells in Radius vs Cum12M BOE
+        ax = axes[1, 1]
+        wir = pd.to_numeric(df["WellsInRadius"], errors="coerce")
+        scatter_mask = wir.notna() & cum12m.notna()
+        if scatter_mask.sum() >= 3:
+            ax.scatter(wir[scatter_mask], cum12m[scatter_mask], s=20, alpha=0.6,
+                      color="purple", edgecolor="black", linewidth=0.2)
+        ax.set_title("Wells in Radius vs Cum 12M BOE")
+        ax.set_xlabel("Wells in Radius")
+        ax.set_ylabel("Cum 12M BOE")
+        ax.grid(alpha=0.3)
+
+        fig.tight_layout(rect=[0, 0, 1, 0.93])
+        pdf.savefig(fig)
+        plt.close(fig)
+        print("  Page 3: Spacing Impact")
+
+        # === PAGE 4: Frac Type Analysis ===
+        if "FracType" in df.columns:
+            fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+            fig.suptitle(f"Frac Type Analysis — {operator}\n{fm_label}", fontsize=13, fontweight="bold")
+
+            frac_colors = {"Slickwater": "steelblue", "Gel/Hybrid": "firebrick", "Unknown": "lightgray"}
+
+            # 4a: Frac type breakdown by vintage (stacked bar)
+            ax = axes[0]
+            frac_by_year = df.groupby(["Vintage", "FracType"]).size().unstack(fill_value=0)
+            # Reorder columns for consistent stacking
+            frac_cols = [c for c in ["Slickwater", "Gel/Hybrid", "Unknown"] if c in frac_by_year.columns]
+            if frac_cols:
+                frac_by_year = frac_by_year[frac_cols]
+                frac_by_year.plot(kind="bar", stacked=True, ax=ax,
+                                  color=[frac_colors.get(c, "gray") for c in frac_cols],
+                                  edgecolor="black", linewidth=0.3)
+                ax.legend(fontsize=8)
+            ax.set_title("Frac Type by Vintage Year")
+            ax.set_xlabel("First Production Year")
+            ax.set_ylabel("Well Count")
+            ax.grid(axis="y", alpha=0.3)
+
+            # 4b: Cum12M BOE by frac type (box plot)
+            ax = axes[1]
+            months_on_ft = pd.to_numeric(df["LastReportedMonthsOnProduction"], errors="coerce")
+            df_ft = df[months_on_ft >= 12]
+            frac_types_present = [ft for ft in ["Slickwater", "Gel/Hybrid"] if ft in df_ft["FracType"].values]
+            if len(frac_types_present) >= 1:
+                box_data = [pd.to_numeric(df_ft[df_ft["FracType"] == ft]["Cum12MBOE"], errors="coerce").dropna().values
+                            for ft in frac_types_present]
+                box_labels = [f"{ft}\n(n={len(d)})" for ft, d in zip(frac_types_present, box_data)]
+                bp = ax.boxplot(box_data, labels=box_labels, patch_artist=True)
+                for patch, ft in zip(bp["boxes"], frac_types_present):
+                    patch.set_facecolor(frac_colors.get(ft, "gray"))
+            else:
+                ax.text(0.5, 0.5, "Insufficient data", ha="center", va="center", transform=ax.transAxes)
+            ax.set_title("Cum 12M BOE by Frac Type")
+            ax.set_ylabel("Cum 12M BOE")
+            ax.grid(axis="y", alpha=0.3)
+
+            fig.tight_layout(rect=[0, 0, 1, 0.91])
+            pdf.savefig(fig)
+            plt.close(fig)
+            print("  Page 4: Frac Type Analysis")
+
+        # === PEER COMPARISON PAGES ===
+        if peerData is not None and not peerData.empty:
+            peer = peerData.copy()
+            peer["Vintage"] = pd.to_numeric(peer["FirstProductionYear"], errors="coerce")
+            peer = peer[peer["Vintage"].notna() & (peer["Vintage"] >= 2020)].copy()
+            peer["Vintage"] = peer["Vintage"].astype(int)
+
+            # Only include active operators with 20+ wells since 2020
+            op_counts = peer["CurrentOperator"].value_counts()
+            valid_ops = op_counts[op_counts >= 20].index.tolist()
+            peer = peer[peer["CurrentOperator"].isin(valid_ops)].copy()
+
+            if len(valid_ops) >= 2:
+                # Highlight the AFE operator
+                afe_operator = operator.upper()
+
+                def _op_colors(ops):
+                    colors = []
+                    for op in ops:
+                        if op.upper() == afe_operator.upper():
+                            colors.append("steelblue")
+                        else:
+                            colors.append("lightgray")
+                    return colors
+
+                def _op_short(name, maxlen=20):
+                    return name if len(name) <= maxlen else name[:maxlen - 1] + "…"
+
+                # === PAGE 4: Peer EUR & Production Comparison ===
+                fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+                fig.suptitle(f"Peer Comparison — {fm_label}\n(5-mile radius, 20+ wells since 2020)",
+                             fontsize=13, fontweight="bold")
+
+                # 4a: EUR 50yr BOE/ft by operator
+                ax = axes[0, 0]
+                eur_ft = pd.to_numeric(peer["EUR50YRBOEPerFt"], errors="coerce")
+                grouped = peer.assign(_val=eur_ft).groupby("CurrentOperator")["_val"]
+                means = grouped.mean().dropna().sort_values(ascending=False)
+                if not means.empty:
+                    labels = [_op_short(op) for op in means.index]
+                    colors = _op_colors(means.index)
+                    counts = grouped.count()
+                    ax.barh(range(len(means)), means.values, color=colors, edgecolor="black", linewidth=0.3)
+                    ax.set_yticks(range(len(means)))
+                    ax.set_yticklabels(labels, fontsize=8)
+                    for i, (val, op) in enumerate(zip(means.values, means.index)):
+                        ax.annotate(f"n={counts[op]}", xy=(val, i), va="center", fontsize=7, color="#444444")
+                    ax.invert_yaxis()
+                ax.set_title("EUR 50yr BOE / Lateral Foot")
+                ax.set_xlabel("BOE/ft")
+                ax.grid(axis="x", alpha=0.3)
+
+                # 4b: Cum12M BOE/ft by operator (only wells with 12+ months)
+                ax = axes[0, 1]
+                months_on_peer = pd.to_numeric(peer["LastReportedMonthsOnProduction"], errors="coerce")
+                peer_12m = peer[months_on_peer >= 12]
+                cum_ft = pd.to_numeric(peer_12m["Cum12MBOEPerFt"], errors="coerce")
+                grouped = peer_12m.assign(_val=cum_ft).groupby("CurrentOperator")["_val"]
+                means = grouped.mean().dropna().sort_values(ascending=False)
+                if not means.empty:
+                    labels = [_op_short(op) for op in means.index]
+                    colors = _op_colors(means.index)
+                    counts = grouped.count()
+                    ax.barh(range(len(means)), means.values, color=colors, edgecolor="black", linewidth=0.3)
+                    ax.set_yticks(range(len(means)))
+                    ax.set_yticklabels(labels, fontsize=8)
+                    for i, (val, op) in enumerate(zip(means.values, means.index)):
+                        ax.annotate(f"n={counts[op]}", xy=(val, i), va="center", fontsize=7, color="#444444")
+                    ax.invert_yaxis()
+                ax.set_title("Cum 12M BOE / Lateral Foot")
+                ax.set_xlabel("BOE/ft")
+                ax.grid(axis="x", alpha=0.3)
+
+                # 4c: Peak month BOE rate by operator
+                ax = axes[1, 0]
+                peak = pd.to_numeric(peer["PeakMonthBOERate"], errors="coerce")
+                grouped = peer.assign(_val=peak).groupby("CurrentOperator")["_val"]
+                means = grouped.mean().dropna().sort_values(ascending=False)
+                if not means.empty:
+                    labels = [_op_short(op) for op in means.index]
+                    colors = _op_colors(means.index)
+                    counts = grouped.count()
+                    ax.barh(range(len(means)), means.values, color=colors, edgecolor="black", linewidth=0.3)
+                    ax.set_yticks(range(len(means)))
+                    ax.set_yticklabels(labels, fontsize=8)
+                    for i, (val, op) in enumerate(zip(means.values, means.index)):
+                        ax.annotate(f"n={counts[op]}", xy=(val, i), va="center", fontsize=7, color="#444444")
+                    ax.invert_yaxis()
+                ax.set_title("Avg Peak Month BOE Rate")
+                ax.set_xlabel("BOE/month")
+                ax.grid(axis="x", alpha=0.3)
+
+                # 4d: GOR by operator
+                ax = axes[1, 1]
+                gor = pd.to_numeric(peer["CumLifeGOR"], errors="coerce")
+                grouped = peer.assign(_val=gor).groupby("CurrentOperator")["_val"]
+                means = grouped.mean().dropna().sort_values(ascending=False)
+                if not means.empty:
+                    labels = [_op_short(op) for op in means.index]
+                    colors = _op_colors(means.index)
+                    counts = grouped.count()
+                    ax.barh(range(len(means)), means.values, color=colors, edgecolor="black", linewidth=0.3)
+                    ax.set_yticks(range(len(means)))
+                    ax.set_yticklabels(labels, fontsize=8)
+                    for i, (val, op) in enumerate(zip(means.values, means.index)):
+                        ax.annotate(f"n={counts[op]}", xy=(val, i), va="center", fontsize=7, color="#444444")
+                    ax.invert_yaxis()
+                ax.set_title("Avg Cum Life GOR")
+                ax.set_xlabel("GOR (scf/bbl)")
+                ax.grid(axis="x", alpha=0.3)
+
+                fig.tight_layout(rect=[0, 0, 1, 0.91])
+                pdf.savefig(fig)
+                plt.close(fig)
+                print("  Page 4: Peer EUR & Production Comparison")
+
+                # === PAGE 5: Peer Completion Design Comparison ===
+                fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+                fig.suptitle(f"Peer Completion Design — {fm_label}\n(5-mile radius, 20+ wells since 2020)",
+                             fontsize=13, fontweight="bold")
+
+                # 5a: Avg lateral length by operator
+                ax = axes[0, 0]
+                ll = pd.to_numeric(peer["LateralLength"], errors="coerce")
+                grouped = peer.assign(_val=ll).groupby("CurrentOperator")["_val"]
+                means = grouped.mean().dropna().sort_values(ascending=False)
+                if not means.empty:
+                    labels = [_op_short(op) for op in means.index]
+                    colors = _op_colors(means.index)
+                    counts = grouped.count()
+                    ax.barh(range(len(means)), means.values, color=colors, edgecolor="black", linewidth=0.3)
+                    ax.set_yticks(range(len(means)))
+                    ax.set_yticklabels(labels, fontsize=8)
+                    for i, (val, op) in enumerate(zip(means.values, means.index)):
+                        ax.annotate(f"n={counts[op]}", xy=(val, i), va="center", fontsize=7, color="#444444")
+                    ax.invert_yaxis()
+                ax.set_title("Avg Lateral Length (ft)")
+                ax.set_xlabel("Lateral Length (ft)")
+                ax.grid(axis="x", alpha=0.3)
+
+                # 5b: Avg proppant lbs/ft by operator
+                ax = axes[0, 1]
+                prop = pd.to_numeric(peer["ProppantLbsPerFt"], errors="coerce")
+                grouped = peer.assign(_val=prop).groupby("CurrentOperator")["_val"]
+                means = grouped.mean().dropna().sort_values(ascending=False)
+                if not means.empty:
+                    labels = [_op_short(op) for op in means.index]
+                    colors = _op_colors(means.index)
+                    counts = grouped.count()
+                    ax.barh(range(len(means)), means.values, color=colors, edgecolor="black", linewidth=0.3)
+                    ax.set_yticks(range(len(means)))
+                    ax.set_yticklabels(labels, fontsize=8)
+                    for i, (val, op) in enumerate(zip(means.values, means.index)):
+                        ax.annotate(f"n={counts[op]}", xy=(val, i), va="center", fontsize=7, color="#444444")
+                    ax.invert_yaxis()
+                ax.set_title("Avg Proppant (lbs/ft)")
+                ax.set_xlabel("lbs/ft")
+                ax.grid(axis="x", alpha=0.3)
+
+                # 5c: Avg fluid bbl/ft by operator
+                ax = axes[1, 0]
+                fluid = pd.to_numeric(peer["FluidBblPerFt"], errors="coerce")
+                grouped = peer.assign(_val=fluid).groupby("CurrentOperator")["_val"]
+                means = grouped.mean().dropna().sort_values(ascending=False)
+                if not means.empty:
+                    labels = [_op_short(op) for op in means.index]
+                    colors = _op_colors(means.index)
+                    counts = grouped.count()
+                    ax.barh(range(len(means)), means.values, color=colors, edgecolor="black", linewidth=0.3)
+                    ax.set_yticks(range(len(means)))
+                    ax.set_yticklabels(labels, fontsize=8)
+                    for i, (val, op) in enumerate(zip(means.values, means.index)):
+                        ax.annotate(f"n={counts[op]}", xy=(val, i), va="center", fontsize=7, color="#444444")
+                    ax.invert_yaxis()
+                ax.set_title("Avg Fluid (bbl/ft)")
+                ax.set_xlabel("bbl/ft")
+                ax.grid(axis="x", alpha=0.3)
+
+                # 5d: Proppant/Fluid ratio by operator
+                ax = axes[1, 1]
+                prop_raw = pd.to_numeric(peer["FirstCompletionProppantMass"], errors="coerce")
+                fluid_raw = pd.to_numeric(peer["FirstCompletionFluidVolume"], errors="coerce") / 42.0
+                prop_fluid = prop_raw / fluid_raw.replace(0, float("nan"))
+                grouped = peer.assign(_val=prop_fluid).groupby("CurrentOperator")["_val"]
+                means = grouped.mean().dropna().sort_values(ascending=False)
+                if not means.empty:
+                    labels = [_op_short(op) for op in means.index]
+                    colors = _op_colors(means.index)
+                    counts = grouped.count()
+                    ax.barh(range(len(means)), means.values, color=colors, edgecolor="black", linewidth=0.3)
+                    ax.set_yticks(range(len(means)))
+                    ax.set_yticklabels(labels, fontsize=8)
+                    for i, (val, op) in enumerate(zip(means.values, means.index)):
+                        ax.annotate(f"n={counts[op]}", xy=(val, i), va="center", fontsize=7, color="#444444")
+                    ax.invert_yaxis()
+                ax.set_title("Avg Proppant/Fluid Ratio (lbs/bbl)")
+                ax.set_xlabel("lbs/bbl")
+                ax.grid(axis="x", alpha=0.3)
+
+                fig.tight_layout(rect=[0, 0, 1, 0.91])
+                pdf.savefig(fig)
+                plt.close(fig)
+                print("  Page 5: Peer Completion Design Comparison")
+
+                # === PAGE 6: Peer Frac Type Comparison ===
+                if "FracType" in peer.columns:
+                    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+                    fig.suptitle(f"Peer Frac Type Comparison — {fm_label}\n(5-mile radius, 20+ wells since 2020)",
+                                 fontsize=13, fontweight="bold")
+
+                    frac_colors = {"Slickwater": "steelblue", "Gel/Hybrid": "firebrick", "Unknown": "lightgray"}
+
+                    # 6a: Frac type % by operator (stacked horizontal bar)
+                    ax = axes[0]
+                    frac_pct = peer.groupby(["CurrentOperator", "FracType"]).size().unstack(fill_value=0)
+                    frac_cols = [c for c in ["Slickwater", "Gel/Hybrid", "Unknown"] if c in frac_pct.columns]
+                    if frac_cols:
+                        frac_pct = frac_pct[frac_cols]
+                        frac_pct_norm = frac_pct.div(frac_pct.sum(axis=1), axis=0) * 100
+                        # Sort by slickwater % descending
+                        sort_col = "Slickwater" if "Slickwater" in frac_pct_norm.columns else frac_cols[0]
+                        frac_pct_norm = frac_pct_norm.sort_values(sort_col, ascending=True)
+                        labels = [_op_short(op) for op in frac_pct_norm.index]
+                        frac_pct_norm.index = labels
+                        frac_pct_norm.plot(kind="barh", stacked=True, ax=ax,
+                                           color=[frac_colors.get(c, "gray") for c in frac_cols],
+                                           edgecolor="black", linewidth=0.3)
+                        # Add well count annotations
+                        totals = frac_pct.sum(axis=1)
+                        for i_bar, (op, total) in enumerate(zip(frac_pct.index, totals)):
+                            short = _op_short(op)
+                            idx = list(frac_pct_norm.index).index(short) if short in frac_pct_norm.index else None
+                            if idx is not None:
+                                ax.annotate(f"n={total}", xy=(101, idx), va="center", fontsize=7, color="#444444")
+                        ax.legend(fontsize=8, loc="lower right")
+                    ax.set_title("Frac Type Mix by Operator (%)")
+                    ax.set_xlabel("% of Wells")
+                    ax.set_xlim(0, 115)
+
+                    # 6b: Cum12M BOE by frac type across all peers (box plot)
+                    ax = axes[1]
+                    months_on_peer2 = pd.to_numeric(peer["LastReportedMonthsOnProduction"], errors="coerce")
+                    peer_12m2 = peer[months_on_peer2 >= 12]
+                    frac_types_present = [ft for ft in ["Slickwater", "Gel/Hybrid"]
+                                          if ft in peer_12m2["FracType"].values]
+                    if len(frac_types_present) >= 1:
+                        box_data = [pd.to_numeric(peer_12m2[peer_12m2["FracType"] == ft]["Cum12MBOE"],
+                                    errors="coerce").dropna().values for ft in frac_types_present]
+                        box_labels = [f"{ft}\n(n={len(d)})" for ft, d in zip(frac_types_present, box_data)]
+                        bp = ax.boxplot(box_data, labels=box_labels, patch_artist=True)
+                        for patch, ft in zip(bp["boxes"], frac_types_present):
+                            patch.set_facecolor(frac_colors.get(ft, "gray"))
+                    else:
+                        ax.text(0.5, 0.5, "Insufficient data", ha="center", va="center", transform=ax.transAxes)
+                    ax.set_title("Cum 12M BOE by Frac Type (All Peers)")
+                    ax.set_ylabel("Cum 12M BOE")
+                    ax.grid(axis="y", alpha=0.3)
+
+                    fig.tight_layout(rect=[0, 0, 1, 0.91])
+                    pdf.savefig(fig)
+                    plt.close(fig)
+                    print("  Page 6: Peer Frac Type Comparison")
+
+            else:
+                print("  Skipping peer pages: fewer than 2 operators with 20+ wells since 2020 in area")
+
+    print(f"Done. Saved operator analysis to {pdfPath}")

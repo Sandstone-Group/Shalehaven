@@ -13,6 +13,7 @@ print("Successfully Authenticated with Novi Token")
 # Read in AFE Summary
 pathToAfeSummary = input("Enter the path to the AFE Summary file: ").strip().strip('"').strip("'")
 runForecasts = input("Run forecasts & production export? (Y/N): ").strip().upper() == "Y"
+runAnalysis = input("Run operator analysis? (Y/N): ").strip().upper() == "Y"
 
 afeData = novi.readAFESummary(pathToAfeSummary) # This should be the AFE Summary file provided by the user, containing at least the "Landing Zone" column.
 permitData = novi.getWellPermits(token, afeData) # This function retrieves well permits from the Novi API based on the landing zone specified in the AFE Summary. It returns a DataFrame with permit locations (latitude and longitude) that will be used to find nearby wells.
@@ -28,5 +29,11 @@ if runForecasts:
 subsurfaceData = novi.getNoviSubsurface(token, offsetData) # Retrieve subsurface petrophysical data for offset wells (formation-aware)
 wellboreLocationsData = novi.getNoviWellboreLocations(token, offsetData) # Retrieve lateral path points for offset wells
 novi.plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, permitData=permitData, wellboreLocationsData=wellboreLocationsData, offsetData=offsetData, afeData=afeData) # PDF heat maps with DSU section boxes (from AFE T/R/S) + lettered permits + nearest offset well names
+
+if runAnalysis:
+    analysisData = novi.getOperatorAnalysisData(afeData)
+    peerData = novi.getPeerAnalysisData(afeData)
+    novi.plotOperatorAnalysis(analysisData, pathToAfeSummary, peerData=peerData)
+    print("Operator Analysis Completed Successfully")
 
 print("SHP Modeling Pipeline Completed Successfully")
