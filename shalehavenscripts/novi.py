@@ -5,10 +5,149 @@ import requests
 import os
 import math
 import difflib
+import re
 import pandas as pd
 
 
 BASE_URL = "https://insight.novilabs.com/api/"
+
+STATE_ABBR_MAP = {
+    "new mexico": "NM", "colorado": "CO", "wyoming": "WY", "north dakota": "ND",
+    "montana": "MT", "ohio": "OH", "pennsylvania": "PA", "texas": "TX",
+    "south dakota": "SD", "oklahoma": "OK", "kansas": "KS", "louisiana": "LA",
+    "california": "CA", "utah": "UT", "alaska": "AK",
+}
+# Also accept abbreviations directly (AFE files sometimes use "OH" instead of "Ohio")
+STATE_ABBR_MAP.update({v.lower(): v for v in STATE_ABBR_MAP.values()})
+
+
+## Parse township/range string like "18S", "T18S", "18 South", "T-18-S" into (number, direction)
+## Returns (zero-padded 3-digit string, direction letter) or (None, None) on failure
+def _parse_tr(s, kind):
+    if not s:
+        return None, None
+    s_up = str(s).upper()
+    m = re.search(r"(\d+)", s_up)
+    if not m:
+        return None, None
+    num = m.group(1).zfill(3)
+    valid = ("N", "S") if kind == "twp" else ("E", "W")
+    d = next((ch for ch in s_up if ch in valid), None)
+    return num, d
+
+
+## Query BLM PLSS for specific section(s) by state/township/range/section and return the
+## centroid (lat, lon) of the union of matched section polygons.
+## Supports comma-separated sections (e.g. "9,10"). Caches results to D:\novi\basemaps\plss\.
+## Returns (lat, lon) tuple or None if the section can't be found.
+def _fetchSectionCentroid(state_abbr, township_str, range_str, section_str, outputDir=None):
+    import json
+    import time
+    import urllib.request
+    import urllib.error
+    import urllib.parse
+    from shapely.geometry import shape
+    from shapely.ops import unary_union
+
+    if outputDir is None:
+        outputDir = os.environ.get("NOVI_BULK_DATA_PATH", r"D:\novi")
+
+    plssDir = os.path.join(outputDir, "basemaps", "plss")
+    os.makedirs(plssDir, exist_ok=True)
+
+    BLM_BASE = "https://gis.blm.gov/arcgis/rest/services/Cadastral/BLM_Natl_PLSS_CadNSDI/MapServer"
+
+    twp_no, twp_dir = _parse_tr(township_str, "twp")
+    rng_no, rng_dir = _parse_tr(range_str, "rng")
+
+    if not all([twp_no, twp_dir, rng_no, rng_dir]):
+        print(f"  Could not parse T/R: twp={township_str!r} rng={range_str!r}")
+        return None
+
+    try:
+        sec_nums = [s.strip().zfill(2) for s in str(section_str).split(",") if s.strip()]
+    except Exception:
+        sec_nums = []
+    if not sec_nums:
+        print(f"  Could not parse section: {section_str!r}")
+        return None
+
+    # Cache by (state, T, R, sections) so repeated runs skip the BLM query
+    cache_key = f"{state_abbr}_{twp_no}{twp_dir}_{rng_no}{rng_dir}_{'_'.join(sec_nums)}"
+    cache_path = os.path.join(plssDir, f"centroid_{cache_key}.json")
+
+    if os.path.exists(cache_path):
+        with open(cache_path, "r") as f:
+            cached = json.load(f)
+        return (cached["lat"], cached["lon"])
+
+    def _blm_query(url):
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(url, timeout=30) as r:
+                    return json.loads(r.read())
+            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
+                if attempt < 2:
+                    time.sleep(1.5 * (attempt + 1))
+                else:
+                    raise
+
+    # Step 1: find the township PLSSID
+    twp_where = (
+        f"STATEABBR='{state_abbr}' AND "
+        f"TWNSHPNO='{twp_no}' AND TWNSHPDIR='{twp_dir}' AND "
+        f"RANGENO='{rng_no}' AND RANGEDIR='{rng_dir}'"
+    )
+    twp_url = (
+        f"{BLM_BASE}/1/query"
+        f"?where={urllib.parse.quote(twp_where)}"
+        f"&outFields=PLSSID&f=json&returnGeometry=false"
+    )
+
+    try:
+        twp_data = _blm_query(twp_url)
+    except Exception as e:
+        print(f"  BLM township query failed: {e}")
+        return None
+
+    twp_features = twp_data.get("features", [])
+    if not twp_features:
+        print(f"  No BLM township found for {state_abbr} T{twp_no}{twp_dir} R{rng_no}{rng_dir}")
+        return None
+
+    plssids = [f["attributes"]["PLSSID"] for f in twp_features]
+
+    # Step 2: query sections by PLSSID + section number
+    plssid_in = ",".join(f"'{p}'" for p in plssids)
+    sec_in = ",".join(f"'{s}'" for s in sec_nums)
+    sec_where = f"PLSSID IN ({plssid_in}) AND FRSTDIVNO IN ({sec_in})"
+    sec_url = (
+        f"{BLM_BASE}/2/query"
+        f"?where={urllib.parse.quote(sec_where)}"
+        f"&outFields=PLSSID,FRSTDIVNO&f=geojson&outSR=4326&returnGeometry=true"
+    )
+
+    try:
+        sec_data = _blm_query(sec_url)
+    except Exception as e:
+        print(f"  BLM section query failed: {e}")
+        return None
+
+    sec_features = sec_data.get("features", [])
+    if not sec_features:
+        print(f"  No BLM sections found for T{twp_no}{twp_dir} R{rng_no}{rng_dir} sec {sec_nums}")
+        return None
+
+    # Centroid of the union of all matched sections
+    geometries = [shape(f["geometry"]) for f in sec_features]
+    union = unary_union(geometries)
+    centroid = union.centroid
+
+    result = {"lat": centroid.y, "lon": centroid.x}
+    with open(cache_path, "w") as f:
+        json.dump(result, f)
+
+    return (centroid.y, centroid.x)
 
 
 ## Read in AFE Summary from Excel file
@@ -58,6 +197,13 @@ def getWells(token, permitData, afeData, scope="us-horizontals"):
     # Pull all unique formations from AFE Summary and uppercase to match Novi format
     formations = afeData["Landing Zone"].dropna().str.upper().unique().tolist()
 
+    # Point Pleasant and Utica are stacked in the Appalachian basin —
+    # when evaluating either, pull both so they share one offset set
+    if "POINT PLEASANT" in formations and "UTICA" not in formations:
+        formations.append("UTICA")
+    elif "UTICA" in formations and "POINT PLEASANT" not in formations:
+        formations.append("POINT PLEASANT")
+
     print(f"Searching for wells within {miles} miles of permit locations, Formations: {formations}")
     print(f"Bounding box: Lat [{min_lat:.4f}, {max_lat:.4f}], Lon [{min_lon:.4f}, {max_lon:.4f}]")
 
@@ -88,10 +234,9 @@ def getWells(token, permitData, afeData, scope="us-horizontals"):
 
 
 ## Retrieve well permits from Novi for each AFE row
-## Tries the local bulk export first, falls back to the API only when local returns zero matches.
-## Why hybrid: bulk export refreshes weekly, so a permit dropping mid-week (e.g. Tuesday)
-## won't be in the local TSV until the next refresh. API fallback catches brand-new wells.
-## Texas wells: matched by API10. Non-Texas: matched by ID (Novi's standard permit ID field).
+## Looks up permits from the local bulk export (D:\novi). Texas wells matched by API10,
+## non-Texas matched by ID. If no local match exists (e.g. unpermitted well), falls back
+## to resolving the well's Township/Range/Section via BLM PLSS to get a section centroid.
 def getWellPermits(token, afeData, scope="us-horizontals"):
 
     # Load local permits TSV once (~130 MB) — single read for the whole AFE list
@@ -106,7 +251,7 @@ def getWellPermits(token, afeData, scope="us-horizontals"):
     print(f"  Loaded {len(localPermits):,} local permits")
 
     all_permits = []
-    api_fallback_count = 0
+    trs_fallback_count = 0
 
     # Loop through each well in the AFE Summary
     for index, row in afeData.iterrows():
@@ -137,67 +282,41 @@ def getWellPermits(token, afeData, scope="us-horizontals"):
             all_permits.append(local_match)
             continue
 
-        # Zero local matches — fall back to API for this well in case the permit dropped
-        # after the last bulk export refresh
-        print(f"  No local match — falling back to API")
-        api_fallback_count += 1
+        # No local match — resolve location from AFE Township/Range/Section via BLM PLSS
+        print(f"  No local match — resolving location from T/R/S")
+        twp_str = str(row.get("Township", "")).strip()
+        rng_str = str(row.get("Range", "")).strip()
+        sec_str = str(row.get("Section", "")).strip()
+        state_abbr = STATE_ABBR_MAP.get(str(state).strip().lower())
 
-        if is_texas:
-            params = {
-                "authentication_token": token,
-                "scope": scope,
-                "q[API10_eq]": api_number,
-                "q[County_eq]": county,
-                "q[State_eq]": state,
-            }
+        if twp_str and rng_str and sec_str and state_abbr:
+            centroid = _fetchSectionCentroid(state_abbr, twp_str, rng_str, sec_str)
+            if centroid:
+                lat, lon = centroid
+                well_name = str(row.get("Well Name", f"Well {index + 1}")).strip()
+                synthetic = pd.DataFrame([{
+                    "Latitude": lat,
+                    "Longitude": lon,
+                    "WellName": well_name,
+                    "County": county,
+                    "State": state,
+                    "API10": api_number if api_number else None,
+                }])
+                all_permits.append(synthetic)
+                trs_fallback_count += 1
+                print(f"  Placed at PLSS section centroid: ({lat:.6f}, {lon:.6f})")
+            else:
+                print(f"  Could not resolve T/R/S to PLSS section — well will be missing from analysis")
         else:
-            params = {
-                "authentication_token": token,
-                "scope": scope,
-                "q[ID_eq]": api_number,
-                "q[County_eq]": county,
-                "q[State_eq]": state,
-            }
+            print(f"  No T/R/S data in AFE — well will be missing from analysis")
 
-        # Paginate through API permit results for this well
-        page = 1
-        well_permits_api = []
-        while True:
-            params["page"] = page
-            print(f"  Fetching API page {page}...")
-
-            for attempt in range(1, 6):
-                try:
-                    response = requests.get(BASE_URL + "v3/well_permits.json", params=params, timeout=300)
-                    response.raise_for_status()
-                    break
-                except requests.exceptions.ReadTimeout:
-                    print(f"  Request timed out (attempt {attempt}/5), retrying...")
-                    if attempt == 5:
-                        raise
-
-            data = response.json()
-            if not data:
-                break
-
-            well_permits_api.extend(data)
-            print(f"  API page {page} returned {len(data)} permits ({len(well_permits_api)} total so far)")
-
-            if len(data) < 100:
-                break
-
-            page += 1
-
-        if well_permits_api:
-            all_permits.append(pd.DataFrame(well_permits_api))
-
-    # Concatenate all matches (mix of DataFrames from local + API)
+    # Concatenate all matches (mix of local permit DataFrames + synthetic T/R/S rows)
     if all_permits:
         permitDf = pd.concat(all_permits, ignore_index=True)
     else:
         permitDf = pd.DataFrame()
 
-    print(f"\nDone. Retrieved {len(permitDf)} well permits total ({api_fallback_count} wells fell back to API).")
+    print(f"\nDone. Retrieved {len(permitDf)} well permits total ({trs_fallback_count} wells resolved via T/R/S).")
 
     # Texas permits often have null Lat/Lon but BHL coordinates are populated - use those as fallback
     if "Latitude" in permitDf.columns and "BHLLatitude" in permitDf.columns:
@@ -933,13 +1052,6 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
     # For each AFE row, parse Township/Range/Section and find matching BLM PLSS section polygons.
     # Each AFE row gets a letter (A, B, C, ...) and may span multiple sections (e.g. "9,10").
     # Wells with no PLSS match (TX, PA, missing T/R/S) fall back to a red star at the permit point.
-    STATE_ABBR_MAP = {
-        "new mexico": "NM", "colorado": "CO", "wyoming": "WY", "north dakota": "ND",
-        "montana": "MT", "ohio": "OH", "pennsylvania": "PA", "texas": "TX",
-        "south dakota": "SD", "oklahoma": "OK", "kansas": "KS", "louisiana": "LA",
-        "california": "CA", "utah": "UT", "alaska": "AK",
-    }
-
     def _afe_letter(i):
         if i < 26:
             return chr(ord("A") + i)
@@ -951,21 +1063,6 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
     numbered_permits = []   # list of (letter, well_name, lz_upper)
     dsu_section_groups = [] # list of (letter, well_name, sections_gdf) — global, never filtered
     permit_fallbacks = []   # list of (letter, well_name, lon, lat, lz_upper)
-
-    # Robust T/R/S parser. Accepts "18S", "T18S", "18 South", "T-18-S", "T.18.S", etc.
-    # Pulls the first run of digits and the first N/S (Township) or E/W (Range) letter.
-    import re
-    def _parse_tr(s, kind):
-        if not s:
-            return None, None
-        s_up = str(s).upper()
-        m = re.search(r"(\d+)", s_up)
-        if not m:
-            return None, None
-        num = m.group(1).zfill(3)
-        valid = ("N", "S") if kind == "twp" else ("E", "W")
-        d = next((ch for ch in s_up if ch in valid), None)
-        return num, d
 
     if afeData is not None and not afeData.empty:
         print(f"Matching {len(afeData)} AFE rows to PLSS sections...")
@@ -1093,18 +1190,33 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
             api10_to_distance_mi[api10] = d_mi
         print(f"  Numbered {len(numbered_wells)} offset wells by distance from permit centroid")
 
-    # All offset wellbores render uniform black — operator coloring removed per request.
-    OFFSET_LINE_COLOR = "black"
+    # Build API10 -> Formation lookup for per-formation lateral coloring
+    # (Point Pleasant = black, Utica = orange; all others = black)
+    api10_to_formation = {}
+    if offsetData is not None and "Formation" in offsetData.columns:
+        for _, r in offsetData[["API10", "Formation"]].dropna().iterrows():
+            api10_to_formation[str(r["API10"])] = str(r["Formation"]).upper()
+
+    PP_UTICA = {"POINT PLEASANT", "UTICA"}
 
     # Determine landing zones to render. If subsurface has multiple Formation values
-    # (one per AFE landing zone), render one page per (parameter, formation) combo —
-    # parameter-major ordering: TVD/zoneA, TVD/zoneB, SW_Avg/zoneA, SW_Avg/zoneB, ...
-    # The DSU box and map extent are GLOBAL — only the heatmap data and per-formation
-    # legend (offset wells + AFE permits matching this Landing Zone) change per page.
+    # (one per AFE landing zone), render one page per (parameter, formation) combo.
+    # Point Pleasant + Utica are merged into a single page.
     if "Formation" in df.columns:
         formations = sorted(df["Formation"].dropna().astype(str).str.upper().unique().tolist())
     else:
         formations = []
+
+    # Merge PP + Utica into one combined label if both are present
+    if PP_UTICA.issubset(set(formations)):
+        formations = [f for f in formations if f not in PP_UTICA]
+        formations.insert(0, "POINT PLEASANT / UTICA")
+    elif "POINT PLEASANT" in formations or "UTICA" in formations:
+        # Only one present but might still want the combined label for consistency
+        present = [f for f in formations if f in PP_UTICA]
+        formations = [f for f in formations if f not in PP_UTICA]
+        formations.insert(0, "POINT PLEASANT / UTICA")
+
     if not formations:
         formations = [None]
 
@@ -1122,6 +1234,9 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
                 if fm_label is None:
                     df_fm = df
                     api10_set_fm = None
+                elif fm_label == "POINT PLEASANT / UTICA":
+                    df_fm = df[df["Formation"].astype(str).str.upper().isin(PP_UTICA)]
+                    api10_set_fm = set(df_fm["API10"].astype(str).tolist())
                 else:
                     df_fm = df[df["Formation"].astype(str).str.upper() == fm_label]
                     api10_set_fm = set(df_fm["API10"].astype(str).tolist())
@@ -1149,6 +1264,9 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
                 if fm_label is None:
                     numbered_permits_fm = numbered_permits
                     permit_fallbacks_fm = permit_fallbacks
+                elif fm_label == "POINT PLEASANT / UTICA":
+                    numbered_permits_fm = [p for p in numbered_permits if p[2] in PP_UTICA]
+                    permit_fallbacks_fm = [p for p in permit_fallbacks if p[4] in PP_UTICA]
                 else:
                     numbered_permits_fm = [p for p in numbered_permits if p[2] == fm_label]
                     permit_fallbacks_fm = [p for p in permit_fallbacks if p[4] == fm_label]
@@ -1194,17 +1312,32 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
 
                 cf = ax.contourf(grid_lon, grid_lat, interp, levels=20, cmap="viridis", zorder=4, alpha=0.85)
 
-                # Offset well lateral paths — uniform black (no operator coloring)
+                # Offset well lateral paths — colored by formation for PP/Utica combo
                 if wb_groups_fm is not None:
+                    has_pp = False
+                    has_utica = False
                     for _api10, group in wb_groups_fm:
+                        fm = api10_to_formation.get(str(_api10), "")
+                        if fm == "UTICA":
+                            color = "orange"
+                            has_utica = True
+                        else:
+                            color = "black"
+                            if fm == "POINT PLEASANT":
+                                has_pp = True
                         ax.plot(
                             group["Longitude"].values,
                             group["Latitude"].values,
-                            color=OFFSET_LINE_COLOR,
+                            color=color,
                             linewidth=1.0,
                             alpha=0.85,
                             zorder=5,
                         )
+                    # Add formation color legend entries for PP/Utica pages
+                    if has_pp:
+                        ax.plot([], [], color="black", linewidth=1.0, label="Point Pleasant")
+                    if has_utica:
+                        ax.plot([], [], color="orange", linewidth=1.0, label="Utica")
 
                 if plss_townships is not None and not plss_townships.empty:
                     plss_townships.boundary.plot(ax=ax, color="#8b6914", linewidth=0.7, alpha=0.7, zorder=6)

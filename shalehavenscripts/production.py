@@ -386,7 +386,7 @@ def ballardProductionData(pathToData):
 
 def mergeProductionWithTypeCurves(dailyprod, updated, original, wellList, pathToDatabase):
     
-    print("Begin Merging dailyprod with  Orginal and Updated Type Curves")
+    print("Begin Merging dailyprod with Orginal and Updated Type Curves")
     
     # ensure date columns are datetime64[ns]
     dailyprod['date'] = pd.to_datetime(dailyprod['date'], format="%Y-%m-%dT%H:%M:%S.%fZ", utc=True).dt.tz_localize(None)
