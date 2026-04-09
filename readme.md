@@ -10,13 +10,13 @@ Process geospatial constraints, run production models, and evaluate economics to
   P/L Analysis - in progress.
 
 - **`main_prod.py`**  
-  Production ETL pipeline — pulls Shalehaven wells from ComboCurve, processes operator-specific production (Admiral Permian, Hunt Oil, Aethon, Devon, ConocoPhillips, Spur, Ballard, monthly PDS), pushes daily/monthly volumes back to ComboCurve, then merges actuals with updated and original type curves and exports cumulative summaries.
+  Production ETL pipeline
 
 - **`main_model.py`**  
-  Core SHP modeling pipeline — authenticates with Novi, prompts the user for an AFE Summary file path, whether to run forecasts & production export, and whether to run operator analysis. Retrieves well permits (or resolves unpermitted wells via BLM PLSS T/R/S centroid) and offset wells within a user-specified search radius from the local Novi bulk export. When forecasts are enabled, fetches yearly EUR + monthly forecasts + historical monthly production for each offset and exports to Excel. Always pulls subsurface petrophysics + wellbore trajectories and renders a multi-page PDF with DSU section overlays, lettered permit locations, and the nearest offset well names. When operator analysis is enabled, generates a separate PDF with completion design trends, production performance, spacing impact, frac type analysis, and peer comparison charts.
+  Core SHP modeling pipeline 
 
 - **`main_analysis.py`**  
-  Standalone operator analysis pipeline — reads an AFE Summary, pulls the operator's wells and all peer operators within 5 miles from the local Novi bulk export, and generates a multi-page PDF with completion design trends, production performance by vintage, spacing impact, frac type classification (slickwater vs gel/hybrid from FracFocus), and peer comparison charts. Can be run independently or triggered from `main_model.py`.
+  Standalone operator analysis pipeline. Can be run independently or triggered from `main_model.py`.
  
 ## Package Modules (`shalehavenscripts/`)
 
