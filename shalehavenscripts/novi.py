@@ -1569,6 +1569,446 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
     print(f"Done. Saved heat maps to {pdfPath}")
 
 
+## Generate an interactive HTML page of interpolated heat maps for subsurface parameters
+## Uses Plotly.js (loaded from CDN) for zoomable, hoverable contour maps with well overlays.
+## Mirrors the data pipeline of plotSubsurfaceHeatMaps but outputs a single self-contained HTML
+## file instead of a static PDF.  Open the resulting file in any browser.
+## Output: subsurface_heatmaps_{DSU Name}.html in the AFE Data/ folder.
+def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None, permitData=None,
+                                wellboreLocationsData=None, offsetData=None, labelNearestN=20, afeData=None):
+    from scipy.interpolate import griddata
+    import numpy as np
+    import json as _json
+    import webbrowser
+
+    if parameters is None:
+        parameters = [
+            "TVD", "TOC_Avg", "SW_Avg", "Porosity_Avg",
+            "Permeability_Avg", "Thickness_Avg", "VClay_Avg", "Brittleness_Avg",
+        ]
+
+    afeDir = os.path.dirname(pathToAfeSummary)
+    afeFilename = os.path.splitext(os.path.basename(pathToAfeSummary))[0]
+    dsuName = afeFilename.split("-", 1)[1].strip() if "-" in afeFilename else afeFilename
+    outputDir = os.path.join(afeDir, "Data")
+    os.makedirs(outputDir, exist_ok=True)
+    htmlPath = os.path.join(outputDir, f"subsurface_heatmaps_{dsuName}.html")
+
+    if subsurfaceData is None or subsurfaceData.empty:
+        print("No subsurface data — skipping HTML heat map export.")
+        return
+
+    df = subsurfaceData.dropna(subset=["Latitude", "Longitude"]).copy()
+    if df.empty:
+        print("No subsurface rows with valid Lat/Lon — skipping HTML heat map export.")
+        return
+
+    # Interpolation grid
+    margin = 0.05
+    lon_min, lon_max = df["Longitude"].min() - margin, df["Longitude"].max() + margin
+    lat_min, lat_max = df["Latitude"].min() - margin, df["Latitude"].max() + margin
+    grid_lon, grid_lat = np.meshgrid(
+        np.linspace(lon_min, lon_max, 200),
+        np.linspace(lat_min, lat_max, 200),
+    )
+    lon_list = np.linspace(lon_min, lon_max, 200).tolist()
+    lat_list = np.linspace(lat_min, lat_max, 200).tolist()
+    points = df[["Longitude", "Latitude"]].values
+
+    # Build api10 lookups from offsetData
+    api10_to_name = {}
+    api10_to_first_prod = {}
+    api10_to_fallback_pos = {}
+    if offsetData is not None and not offsetData.empty:
+        for _, r in offsetData.iterrows():
+            api10 = str(r["API10"]) if pd.notna(r.get("API10")) else None
+            if not api10:
+                continue
+            if "WellName" in offsetData.columns and pd.notna(r.get("WellName")):
+                api10_to_name[api10] = str(r["WellName"])
+            if "FirstProductionYear" in offsetData.columns and pd.notna(r.get("FirstProductionYear")):
+                try:
+                    api10_to_first_prod[api10] = int(r["FirstProductionYear"])
+                except (ValueError, TypeError):
+                    pass
+            if "MPLatitude" in offsetData.columns and "MPLongitude" in offsetData.columns \
+                    and pd.notna(r.get("MPLatitude")) and pd.notna(r.get("MPLongitude")):
+                api10_to_fallback_pos[api10] = (float(r["MPLongitude"]), float(r["MPLatitude"]))
+
+    # Wellbore trajectories
+    wb_groups = None
+    wb_midpoints = {}
+    wb_heels = {}
+    if wellboreLocationsData is not None and not wellboreLocationsData.empty:
+        wb_clean = wellboreLocationsData.dropna(subset=["Latitude", "Longitude"])
+        wb_groups = list(wb_clean.sort_values(["API10", "Path"]).groupby("API10"))
+        for api10, group in wb_groups:
+            mid = len(group) // 2
+            wb_midpoints[api10] = (group["Longitude"].iloc[mid], group["Latitude"].iloc[mid])
+            wb_heels[api10] = (group["Longitude"].iloc[0], group["Latitude"].iloc[0])
+
+    # Numbered wells by distance from permit centroid
+    numbered_wells = []
+    api10_to_number = {}
+    permit_pts = None
+    if permitData is not None and not permitData.empty:
+        permit_pts = permitData.dropna(subset=["Latitude", "Longitude"])
+    if permit_pts is not None and not permit_pts.empty and api10_to_name:
+        cx = permit_pts["Longitude"].mean()
+        cy = permit_pts["Latitude"].mean()
+        deg_to_mi_lat = 69.0
+        deg_to_mi_lon = 69.0 * abs(math.cos(math.radians(cy)))
+        dists = []
+        for api10 in api10_to_name:
+            if api10 in wb_midpoints:
+                lon, lat = wb_midpoints[api10]
+            elif api10 in api10_to_fallback_pos:
+                lon, lat = api10_to_fallback_pos[api10]
+            else:
+                continue
+            d_mi = (((lon - cx) * deg_to_mi_lon) ** 2 + ((lat - cy) * deg_to_mi_lat) ** 2) ** 0.5
+            dists.append((d_mi, api10))
+        dists.sort()
+        cap = labelNearestN if (labelNearestN and labelNearestN > 0) else len(dists)
+        for i, (d_mi, api10) in enumerate(dists[:cap], start=1):
+            numbered_wells.append({
+                "num": i, "api10": api10,
+                "name": api10_to_name.get(api10, ""),
+                "dist_mi": round(d_mi, 2),
+                "first_prod": api10_to_first_prod.get(api10),
+            })
+            api10_to_number[api10] = i
+
+    # AFE permit info
+    afe_permits = []
+    if afeData is not None and not afeData.empty:
+        for i, (_idx, row) in enumerate(afeData.iterrows()):
+            letter = chr(ord("A") + i) if i < 26 else chr(ord("A") + (i // 26 - 1)) + chr(ord("A") + (i % 26))
+            afe_permits.append({
+                "letter": letter,
+                "name": str(row.get("Well Name", f"Well {i+1}")).strip(),
+                "lz": str(row.get("Landing Zone", "")).strip().upper(),
+            })
+
+    # Permit locations for star markers
+    permit_markers = []
+    if permit_pts is not None and not permit_pts.empty:
+        for _, r in permit_pts.iterrows():
+            permit_markers.append({
+                "lon": float(r["Longitude"]), "lat": float(r["Latitude"]),
+                "name": str(r.get("WellName", "")) if pd.notna(r.get("WellName")) else "",
+            })
+
+    # Determine formations
+    PP_UTICA = {"POINT PLEASANT", "UTICA"}
+    if "Formation" in df.columns:
+        formations = sorted(df["Formation"].dropna().astype(str).str.upper().unique().tolist())
+    else:
+        formations = []
+    if PP_UTICA.issubset(set(formations)):
+        formations = [f for f in formations if f not in PP_UTICA]
+        formations.insert(0, "POINT PLEASANT / UTICA")
+    elif any(f in PP_UTICA for f in formations):
+        formations = [f for f in formations if f not in PP_UTICA]
+        formations.insert(0, "POINT PLEASANT / UTICA")
+    if not formations:
+        formations = [None]
+
+    api10_to_formation = {}
+    if offsetData is not None and "Formation" in offsetData.columns:
+        for _, r in offsetData[["API10", "Formation"]].dropna().iterrows():
+            api10_to_formation[str(r["API10"])] = str(r["Formation"]).upper()
+
+    # Build Plotly figure JSON for each (parameter, formation) combo
+    print(f"Generating interactive HTML heat maps: {htmlPath}")
+    figures = []  # list of {title, plotly_json}
+
+    for param in parameters:
+        if param not in df.columns:
+            print(f"  Skipping {param}: column not in subsurface data")
+            continue
+
+        for fm_label in formations:
+            if fm_label is None:
+                df_fm = df
+                api10_set_fm = None
+            elif fm_label == "POINT PLEASANT / UTICA":
+                df_fm = df[df["Formation"].astype(str).str.upper().isin(PP_UTICA)]
+                api10_set_fm = set(df_fm["API10"].astype(str).tolist())
+            else:
+                df_fm = df[df["Formation"].astype(str).str.upper() == fm_label]
+                api10_set_fm = set(df_fm["API10"].astype(str).tolist())
+
+            values = pd.to_numeric(df_fm[param], errors="coerce")
+            mask = values.notna()
+            if mask.sum() < 4:
+                continue
+
+            points_fm = df_fm[["Longitude", "Latitude"]].values
+            interp = griddata(
+                points_fm[mask.values], values[mask].values,
+                (grid_lon, grid_lat), method="linear",
+            )
+
+            # Replace NaN with None for JSON
+            z_data = []
+            for row in interp.tolist():
+                z_data.append([None if (v is None or v != v) else round(v, 4) for v in row])
+
+            # Wellbore traces
+            wb_traces = []
+            if wb_groups is not None:
+                for _api10, group in wb_groups:
+                    if api10_set_fm is not None and str(_api10) not in api10_set_fm:
+                        continue
+                    num = api10_to_number.get(str(_api10))
+                    name = api10_to_name.get(str(_api10), str(_api10))
+                    label = f"#{num} {name}" if num else name
+                    wb_traces.append({
+                        "lon": group["Longitude"].values.tolist(),
+                        "lat": group["Latitude"].values.tolist(),
+                        "label": label,
+                    })
+
+            # Well number markers at heels
+            num_markers = []
+            nw_fm = numbered_wells if api10_set_fm is None else [w for w in numbered_wells if w["api10"] in api10_set_fm]
+            for w in nw_fm:
+                api10 = w["api10"]
+                if api10 in wb_heels:
+                    lon, lat = wb_heels[api10]
+                elif api10 in api10_to_fallback_pos:
+                    lon, lat = api10_to_fallback_pos[api10]
+                else:
+                    continue
+                num_markers.append({
+                    "lon": lon, "lat": lat,
+                    "num": w["num"], "name": w["name"],
+                    "dist": w["dist_mi"],
+                    "first_prod": w["first_prod"],
+                })
+
+            title_suffix = f" [{fm_label}]" if fm_label else ""
+            figures.append({
+                "title": f"{param}{title_suffix} — {mask.sum()} wells",
+                "param": param,
+                "z": z_data,
+                "lon": lon_list,
+                "lat": lat_list,
+                "wb_traces": wb_traces,
+                "num_markers": num_markers,
+                "permit_markers": permit_markers,
+            })
+            print(f"  Prepared {param} [{fm_label or 'ALL'}] ({mask.sum()} wells)")
+
+    # Build well index table data
+    well_index = numbered_wells
+
+    # Assemble HTML
+    html_parts = []
+    html_parts.append(f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Subsurface Heat Maps — {dsuName}</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+         background: #f5f5f5; color: #333; }}
+  .header {{ background: #0a2a5e; color: white; padding: 18px 28px; }}
+  .header h1 {{ font-size: 22px; font-weight: 600; }}
+  .header .sub {{ font-size: 13px; opacity: 0.8; margin-top: 4px; }}
+  .tabs {{ display: flex; flex-wrap: wrap; gap: 6px; padding: 12px 28px;
+           background: #fff; border-bottom: 1px solid #ddd; position: sticky; top: 0; z-index: 10; }}
+  .tabs button {{ padding: 6px 14px; border: 1px solid #ccc; background: #fff; border-radius: 4px;
+                  cursor: pointer; font-size: 12px; white-space: nowrap; }}
+  .tabs button.active {{ background: #0a2a5e; color: #fff; border-color: #0a2a5e; }}
+  .tabs button:hover:not(.active) {{ background: #eee; }}
+  .page {{ display: none; padding: 16px 28px; }}
+  .page.active {{ display: flex; gap: 20px; }}
+  .plot-wrap {{ flex: 1; min-width: 0; }}
+  .plot-box {{ width: 100%; height: 680px; }}
+  .sidebar {{ width: 320px; flex-shrink: 0; }}
+  .sidebar .panel {{ background: #fff; border: 1px solid #ddd; border-radius: 4px;
+                     padding: 12px; margin-bottom: 12px; font-size: 11px; font-family: monospace; }}
+  .sidebar .panel h3 {{ font-size: 12px; margin-bottom: 6px; font-family: sans-serif; }}
+  .sidebar .panel .row {{ display: flex; gap: 4px; }}
+  .sidebar .panel .row .n {{ min-width: 24px; text-align: right; color: #0a2a5e; font-weight: bold; }}
+  .table-page {{ display: none; padding: 16px 28px; }}
+  .table-page.active {{ display: block; }}
+  table {{ border-collapse: collapse; width: 100%; background: #fff; }}
+  th {{ background: #0a2a5e; color: #fff; text-align: left; padding: 6px 10px; font-size: 12px; }}
+  td {{ padding: 5px 10px; font-size: 11px; border-bottom: 1px solid #eee; font-family: monospace; }}
+  tr:hover td {{ background: #f0f4ff; }}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>Subsurface Heat Maps — {dsuName}</h1>
+  <div class="sub">Interactive viewer &middot; Generated by Shalehaven</div>
+</div>
+<div class="tabs" id="tabs"></div>
+<div id="pages"></div>
+<script>
+const FIGURES = {_json.dumps(figures, separators=(',', ':'))};
+const WELL_INDEX = {_json.dumps(well_index, separators=(',', ':'))};
+const AFE_PERMITS = {_json.dumps(afe_permits, separators=(',', ':'))};
+
+const tabsEl = document.getElementById('tabs');
+const pagesEl = document.getElementById('pages');
+
+function buildPlot(fig, divId) {{
+  const traces = [];
+
+  // Heatmap contour
+  traces.push({{
+    type: 'contour',
+    z: fig.z,
+    x: fig.lon,
+    y: fig.lat,
+    colorscale: 'Viridis',
+    contours: {{ coloring: 'heatmap', showlines: true, showlabels: true, labelfont: {{ size: 9 }} }},
+    colorbar: {{ title: fig.param, thickness: 15, len: 0.8 }},
+    opacity: 0.85,
+    hovertemplate: 'Lon: %{{x:.4f}}<br>Lat: %{{y:.4f}}<br>' + fig.param + ': %{{z:.3f}}<extra></extra>',
+  }});
+
+  // Wellbore lateral paths
+  fig.wb_traces.forEach(wb => {{
+    traces.push({{
+      type: 'scattergl',
+      mode: 'lines',
+      x: wb.lon,
+      y: wb.lat,
+      line: {{ color: 'black', width: 1.5 }},
+      hoverinfo: 'text',
+      text: wb.label,
+      showlegend: false,
+    }});
+  }});
+
+  // Well number markers
+  if (fig.num_markers.length > 0) {{
+    traces.push({{
+      type: 'scatter',
+      mode: 'markers+text',
+      x: fig.num_markers.map(m => m.lon),
+      y: fig.num_markers.map(m => m.lat),
+      text: fig.num_markers.map(m => String(m.num)),
+      textposition: 'top right',
+      textfont: {{ size: 9, color: '#0a2a5e', family: 'monospace' }},
+      marker: {{ size: 5, color: '#0a2a5e' }},
+      hoverinfo: 'text',
+      hovertext: fig.num_markers.map(m =>
+        '#' + m.num + ' ' + m.name + '<br>Dist: ' + m.dist + ' mi' +
+        (m.first_prod ? '<br>1st Prod: ' + m.first_prod : '')),
+      showlegend: false,
+    }});
+  }}
+
+  // AFE permit stars
+  if (fig.permit_markers.length > 0) {{
+    traces.push({{
+      type: 'scatter',
+      mode: 'markers',
+      x: fig.permit_markers.map(m => m.lon),
+      y: fig.permit_markers.map(m => m.lat),
+      marker: {{ symbol: 'star', size: 14, color: 'red', line: {{ color: 'black', width: 1 }} }},
+      hoverinfo: 'text',
+      hovertext: fig.permit_markers.map(m => 'AFE: ' + m.name),
+      name: 'AFE Permits',
+      showlegend: true,
+    }});
+  }}
+
+  const layout = {{
+    title: {{ text: fig.title, font: {{ size: 15 }} }},
+    xaxis: {{ title: 'Longitude', scaleanchor: 'y', scaleratio: 1 }},
+    yaxis: {{ title: 'Latitude' }},
+    margin: {{ l: 60, r: 20, t: 50, b: 50 }},
+    hovermode: 'closest',
+    dragmode: 'zoom',
+  }};
+
+  Plotly.newPlot(divId, traces, layout, {{ responsive: true }});
+}}
+
+// Build tabs + pages
+FIGURES.forEach((fig, i) => {{
+  const btn = document.createElement('button');
+  btn.textContent = fig.title.split(' —')[0];
+  btn.dataset.idx = i;
+  if (i === 0) btn.classList.add('active');
+  tabsEl.appendChild(btn);
+
+  const page = document.createElement('div');
+  page.className = 'page' + (i === 0 ? ' active' : '');
+  page.id = 'page-' + i;
+  page.innerHTML = `
+    <div class="plot-wrap"><div class="plot-box" id="plot-${{i}}"></div></div>
+    <div class="sidebar">
+      <div class="panel">
+        <h3>AFE Permits</h3>
+        ${{AFE_PERMITS.map(p => '<div class="row"><span class="n">' + p.letter + '.</span> ' + p.name + ' [' + p.lz + ']</div>').join('')}}
+      </div>
+      <div class="panel">
+        <h3>Offset Wells (by distance)</h3>
+        ${{fig.num_markers.map(m => '<div class="row"><span class="n">' + m.num + '.</span> ' + m.name + '</div>').join('')}}
+      </div>
+    </div>`;
+  pagesEl.appendChild(page);
+}});
+
+// Well index tab
+const idxBtn = document.createElement('button');
+idxBtn.textContent = 'Well Index';
+idxBtn.dataset.idx = 'idx';
+tabsEl.appendChild(idxBtn);
+
+const idxPage = document.createElement('div');
+idxPage.className = 'table-page';
+idxPage.id = 'page-idx';
+let tableHTML = '<table><tr><th>#</th><th>Well Name</th><th>API10</th><th>Dist (mi)</th><th>1st Prod</th></tr>';
+WELL_INDEX.forEach(w => {{
+  tableHTML += '<tr><td>' + w.num + '</td><td>' + w.name + '</td><td>' + w.api10 +
+    '</td><td>' + w.dist_mi + '</td><td>' + (w.first_prod || '') + '</td></tr>';
+}});
+tableHTML += '</table>';
+idxPage.innerHTML = tableHTML;
+pagesEl.appendChild(idxPage);
+
+// Tab switching
+let plotted = new Set();
+tabsEl.addEventListener('click', e => {{
+  if (e.target.tagName !== 'BUTTON') return;
+  tabsEl.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+  e.target.classList.add('active');
+  document.querySelectorAll('.page, .table-page').forEach(p => p.classList.remove('active'));
+  const idx = e.target.dataset.idx;
+  const el = document.getElementById('page-' + idx);
+  if (el) el.classList.add('active');
+  if (idx !== 'idx' && !plotted.has(idx)) {{
+    buildPlot(FIGURES[parseInt(idx)], 'plot-' + idx);
+    plotted.add(idx);
+  }}
+}});
+
+// Render first plot
+buildPlot(FIGURES[0], 'plot-0');
+plotted.add('0');
+</script>
+</body>
+</html>""")
+
+    html_content = "\n".join(html_parts)
+    with open(htmlPath, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+    print(f"Done. Saved interactive heat maps to {htmlPath}")
+    webbrowser.open(htmlPath)
+
+
 ## Export header data, monthly forecast data, and monthly production to Excel files
 ## headerData_{DSU Name}.xlsx       - offset wells with EUR
 ## forecastData_{DSU Name}.xlsx     - monthly forecast volumes

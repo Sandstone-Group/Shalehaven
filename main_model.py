@@ -29,6 +29,7 @@ if runForecasts:
 subsurfaceData = novi.getNoviSubsurface(token, offsetData) # Retrieve subsurface petrophysical data for offset wells (formation-aware)
 wellboreLocationsData = novi.getNoviWellboreLocations(token, offsetData) # Retrieve lateral path points for offset wells
 novi.plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, permitData=permitData, wellboreLocationsData=wellboreLocationsData, offsetData=offsetData, afeData=afeData) # PDF heat maps with DSU section boxes (from AFE T/R/S) + lettered permits + nearest offset well names
+novi.plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, permitData=permitData, wellboreLocationsData=wellboreLocationsData, offsetData=offsetData, afeData=afeData) # Interactive HTML heat maps (opens in browser)
 
 if runAnalysis:
     analysisData = novi.getOperatorAnalysisData(afeData)
