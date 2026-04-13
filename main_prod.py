@@ -39,11 +39,12 @@ pathToDevonData = os.getenv("SHALEHAVEN_DEVON_PATH")
 pathToCopData = os.getenv("SHALEHAVEN_COP_PATH")
 pathToSpurData = os.getenv("SHALEHAVEN_SPUR_PATH")
 pathToBallardData = os.getenv("SHALEHAVEN_BALLARD_PATH")
+pathToKrakenData = os.getenv("SHALEHAVEN_KRAKEN_PATH")
 pathToMonthlyPDSData = os.getenv("SHALEHAVEN_MONTHLY_PDS_PATH")
 pathToDatabase = os.getenv("SHALEHAVEN_DATABASE_PATH")
 pathToDealSheet = os.getenv("SHALEHAVEN_DEAL_SHEET_PATH")
 
-novi.checkNoviDbStatus()
+novi.checkNoviDbStatus() # checks Novi API bulk download, then replaces data if new DB as dropped
 
 runDealSheet = True # Set to False to skip deal sheet processing and just run production data ETL
 
@@ -65,7 +66,8 @@ devonWells = wells[wells['currentOperator'] == 'DEVON ENERGY PRODUCTION COMPANY 
 copWells = wells[wells['currentOperator'] == 'COG OPERATING LLC']
 spurWells = wells[wells['currentOperator'] == 'Spur Energy Partners LLC']
 ballardWells = wells[wells['currentOperator'] == 'Ballard Petroleum']
-fundWells = pd.concat([huntWells, admiralWells, aethonWells, devonWells, copWells, spurWells, ballardWells]) # merge huntWells with admiralWells, devonWells, aethonWells, copWells, spurWells, and ballardWells
+krakenWells = wells[wells['currentOperator'] == 'Kraken Operating, LLC']
+fundWells = pd.concat([huntWells, admiralWells, aethonWells, devonWells, copWells, spurWells, ballardWells, krakenWells]) # merge huntWells with admiralWells, devonWells, aethonWells, copWells, spurWells, ballardWells, and krakenWells
 
 # print fundWells to database
 fundWells.to_excel(os.path.join(pathToDatabase, r"fundWells.xlsx"))
@@ -80,6 +82,8 @@ copProductionData = production.copProductionData(pathToCopData)
 spurWellMapping = dict(zip(spurWells['wellName'], spurWells['chosenID']))
 spurProductionData = production.spurProductionData(pathToSpurData, spurWellMapping)
 ballardProductionData = production.ballardProductionData(pathToBallardData)
+krakenWellMapping = dict(zip(krakenWells['wellName'], krakenWells['chosenID']))
+krakenProductionData = production.krakenProductionData(pathToKrakenData, krakenWellMapping)
 monthlyPds = production.pdsMonthlyData(pathToMonthlyPDSData)
 
 # Put Production Data to ComboCurve
@@ -90,6 +94,7 @@ combocurve.putDataComboCurveDaily(ccClient, devonProductionData)
 combocurve.putDataComboCurveDaily(ccClient, copProductionData)
 combocurve.putDataComboCurveDaily(ccClient, spurProductionData)
 combocurve.putDataComboCurveDaily(ccClient, ballardProductionData)
+combocurve.putDataComboCurveDaily(ccClient, krakenProductionData)
 combocurve.putDataComboCurveMonthly(ccClient, monthlyPds)
 
 # Get Daily Productions from ComboCurve for Shalehaven

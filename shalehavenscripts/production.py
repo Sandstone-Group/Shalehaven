@@ -375,6 +375,83 @@ def ballardProductionData(pathToData):
     
     return data
 
+"""
+
+Gets Kraken Resources Production Data from  excel and converts to ComboCurve Monthly Format
+
+"""
+
+def krakenProductionData(pathToData, wellMapping):
+
+    print("Getting Kraken Resources Production Data")
+
+    load_dotenv()
+
+    # Update path to include the last file in the directory based on time modified
+    pathToData = max([os.path.join(pathToData, f) for f in os.listdir(pathToData)], key=os.path.getmtime)
+
+    raw = pd.read_excel(pathToData, sheet_name="actual-size", header=None)
+
+    # Row 2 has well names at columns 1, 4, 7, 10, ... (each well spans 3 cols: oil, gas, water)
+    # Row 3 onward is data; column 0 is RecordDate
+    well_row = raw.iloc[2]
+    data_rows = raw.iloc[4:].reset_index(drop=True)
+
+    rows = []
+    # Walk the well name row in steps of 3 starting at col 1
+    well_cols = [(i, str(well_row.iloc[i])) for i in range(1, len(well_row), 3)
+                 if pd.notna(well_row.iloc[i]) and "Total" not in str(well_row.iloc[i])]
+
+    for col_idx, well_name in well_cols:
+        well_name_upper = well_name.strip().upper()
+
+        # Skip Delores — not our well
+        if "DELORES" in well_name_upper:
+            print(f"  Skipping {well_name} (not our well)")
+            continue
+
+        # Match to ComboCurve chosenID via wellMapping
+        # Normalize: strip whitespace, remove '#', case-insensitive
+        def _normalize(s):
+            return s.strip().upper().replace("#", "")
+
+        chosen_id = wellMapping.get(well_name.strip())
+        if chosen_id is None:
+            norm = _normalize(well_name)
+            for k, v in wellMapping.items():
+                if _normalize(k) == norm:
+                    chosen_id = v
+                    break
+        if chosen_id is None:
+            print(f"  Warning: No match found for '{well_name}' in wellMapping, skipping")
+            continue
+
+        for _, row in data_rows.iterrows():
+            date_val = row.iloc[0]
+            if pd.isna(date_val):
+                continue
+            try:
+                parsed_date = pd.to_datetime(date_val)
+            except (ValueError, TypeError):
+                continue
+            oil = row.iloc[col_idx]
+            gas = row.iloc[col_idx + 1]
+            water = row.iloc[col_idx + 2]
+            rows.append({
+                'date': parsed_date,
+                'chosenID': chosen_id,
+                'oil': oil,
+                'gas': gas,
+                'water': water,
+                'dataSource': 'other',
+            })
+
+    data = pd.DataFrame(rows, columns=['date', 'chosenID', 'oil', 'gas', 'water', 'dataSource'])
+    cutoff = pd.Timestamp.now() - pd.Timedelta(days=15)
+    data = data[data['date'] >= cutoff]
+    print(f"  Parsed {len(data)} production rows (last 15 days) for {len(well_cols) - 1} wells")
+
+    return data
 
 
 

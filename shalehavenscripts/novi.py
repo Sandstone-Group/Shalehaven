@@ -197,12 +197,7 @@ def getWells(token, permitData, afeData, scope="us-horizontals"):
     # Pull all unique formations from AFE Summary and uppercase to match Novi format
     formations = afeData["Landing Zone"].dropna().str.upper().unique().tolist()
 
-    # Point Pleasant and Utica are stacked in the Appalachian basin —
-    # when evaluating either, pull both so they share one offset set
-    if "POINT PLEASANT" in formations and "UTICA" not in formations:
-        formations.append("UTICA")
-    elif "UTICA" in formations and "POINT PLEASANT" not in formations:
-        formations.append("POINT PLEASANT")
+    # Point Pleasant and Utica are treated as separate formations
 
     print(f"Searching for wells within {miles} miles of permit locations, Formations: {formations}")
     print(f"Bounding box: Lat [{min_lat:.4f}, {max_lat:.4f}], Lon [{min_lon:.4f}, {max_lon:.4f}]")
@@ -488,6 +483,22 @@ def noviBulk(token, scope="us-horizontals", outputDir=None):
         if existing.get("export_date") == export_date_str:
             print(f"Export {export_date_str} already cached at {extractDir}, skipping download.")
             return extractDir
+
+    # Remove previous extract and zip files before downloading new export
+    if os.path.exists(manifestPath):
+        with open(manifestPath, "r") as f:
+            oldManifest = json.load(f)
+        oldExtractDir = oldManifest.get("extract_dir")
+        if oldExtractDir and os.path.isdir(oldExtractDir) and oldExtractDir != extractDir:
+            import shutil
+            print(f"Removing old export at {oldExtractDir}...")
+            shutil.rmtree(oldExtractDir)
+        # Clean up old zip files
+        for fname in os.listdir(outputDir):
+            if fname.startswith("novi_bulk_") and fname.endswith(".zip"):
+                oldZip = os.path.join(outputDir, fname)
+                print(f"Removing old zip {fname}...")
+                os.remove(oldZip)
 
     os.makedirs(extractDir, exist_ok=True)
 
@@ -1246,8 +1257,6 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
         for _, r in offsetData[["API10", "Formation"]].dropna().iterrows():
             api10_to_formation[str(r["API10"])] = str(r["Formation"]).upper()
 
-    PP_UTICA = {"POINT PLEASANT", "UTICA"}
-
     # Determine landing zones to render. If subsurface has multiple Formation values
     # (one per AFE landing zone), render one page per (parameter, formation) combo.
     # Point Pleasant + Utica are merged into a single page.
@@ -1256,15 +1265,7 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
     else:
         formations = []
 
-    # Merge PP + Utica into one combined label if both are present
-    if PP_UTICA.issubset(set(formations)):
-        formations = [f for f in formations if f not in PP_UTICA]
-        formations.insert(0, "POINT PLEASANT / UTICA")
-    elif "POINT PLEASANT" in formations or "UTICA" in formations:
-        # Only one present but might still want the combined label for consistency
-        present = [f for f in formations if f in PP_UTICA]
-        formations = [f for f in formations if f not in PP_UTICA]
-        formations.insert(0, "POINT PLEASANT / UTICA")
+    # Point Pleasant and Utica each get their own page
 
     if not formations:
         formations = [None]
@@ -1283,9 +1284,6 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
                 if fm_label is None:
                     df_fm = df
                     api10_set_fm = None
-                elif fm_label == "POINT PLEASANT / UTICA":
-                    df_fm = df[df["Formation"].astype(str).str.upper().isin(PP_UTICA)]
-                    api10_set_fm = set(df_fm["API10"].astype(str).tolist())
                 else:
                     df_fm = df[df["Formation"].astype(str).str.upper() == fm_label]
                     api10_set_fm = set(df_fm["API10"].astype(str).tolist())
@@ -1313,9 +1311,6 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
                 if fm_label is None:
                     numbered_permits_fm = numbered_permits
                     permit_fallbacks_fm = permit_fallbacks
-                elif fm_label == "POINT PLEASANT / UTICA":
-                    numbered_permits_fm = [p for p in numbered_permits if p[2] in PP_UTICA]
-                    permit_fallbacks_fm = [p for p in permit_fallbacks if p[4] in PP_UTICA]
                 else:
                     numbered_permits_fm = [p for p in numbered_permits if p[2] == fm_label]
                     permit_fallbacks_fm = [p for p in permit_fallbacks if p[4] == fm_label]
@@ -1361,32 +1356,17 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
 
                 cf = ax.contourf(grid_lon, grid_lat, interp, levels=20, cmap="viridis", zorder=4, alpha=0.85)
 
-                # Offset well lateral paths — colored by formation for PP/Utica combo
+                # Offset well lateral paths
                 if wb_groups_fm is not None:
-                    has_pp = False
-                    has_utica = False
                     for _api10, group in wb_groups_fm:
-                        fm = api10_to_formation.get(str(_api10), "")
-                        if fm == "UTICA":
-                            color = "orange"
-                            has_utica = True
-                        else:
-                            color = "black"
-                            if fm == "POINT PLEASANT":
-                                has_pp = True
                         ax.plot(
                             group["Longitude"].values,
                             group["Latitude"].values,
-                            color=color,
+                            color="black",
                             linewidth=1.0,
                             alpha=0.85,
                             zorder=5,
                         )
-                    # Add formation color legend entries for PP/Utica pages
-                    if has_pp:
-                        ax.plot([], [], color="black", linewidth=1.0, label="Point Pleasant")
-                    if has_utica:
-                        ax.plot([], [], color="orange", linewidth=1.0, label="Utica")
 
                 if plss_townships is not None and not plss_townships.empty:
                     plss_townships.boundary.plot(ax=ax, color="#8b6914", linewidth=0.7, alpha=0.7, zorder=6)
