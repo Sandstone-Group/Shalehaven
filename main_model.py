@@ -35,6 +35,7 @@ if runAnalysis:
     analysisData = novi.getOperatorAnalysisData(afeData)
     peerData = novi.getPeerAnalysisData(afeData)
     novi.plotOperatorAnalysis(analysisData, pathToAfeSummary, peerData=peerData)
+    novi.plotOperatorAnalysisHTML(analysisData, pathToAfeSummary, peerData=peerData)
     print("Operator Analysis Completed Successfully")
 
 print("SHP Modeling Pipeline Completed Successfully")

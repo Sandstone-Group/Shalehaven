@@ -1250,8 +1250,7 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
             api10_to_distance_mi[api10] = d_mi
         print(f"  Numbered {len(numbered_wells)} offset wells by distance from permit centroid")
 
-    # Build API10 -> Formation lookup for per-formation lateral coloring
-    # (Point Pleasant = black, Utica = orange; all others = black)
+    # Build API10 -> Formation lookup
     api10_to_formation = {}
     if offsetData is not None and "Formation" in offsetData.columns:
         for _, r in offsetData[["API10", "Formation"]].dropna().iterrows():
@@ -1259,7 +1258,6 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
 
     # Determine landing zones to render. If subsurface has multiple Formation values
     # (one per AFE landing zone), render one page per (parameter, formation) combo.
-    # Point Pleasant + Utica are merged into a single page.
     if "Formation" in df.columns:
         formations = sorted(df["Formation"].dropna().astype(str).str.upper().unique().tolist())
     else:
@@ -1728,18 +1726,11 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
                 "name": str(r.get("WellName", "")) if pd.notna(r.get("WellName")) else "",
             })
 
-    # Determine formations
-    PP_UTICA = {"POINT PLEASANT", "UTICA"}
+    # Determine formations — each gets its own page
     if "Formation" in df.columns:
         formations = sorted(df["Formation"].dropna().astype(str).str.upper().unique().tolist())
     else:
         formations = []
-    if PP_UTICA.issubset(set(formations)):
-        formations = [f for f in formations if f not in PP_UTICA]
-        formations.insert(0, "POINT PLEASANT / UTICA")
-    elif any(f in PP_UTICA for f in formations):
-        formations = [f for f in formations if f not in PP_UTICA]
-        formations.insert(0, "POINT PLEASANT / UTICA")
     if not formations:
         formations = [None]
 
@@ -1761,9 +1752,6 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
             if fm_label is None:
                 df_fm = df
                 api10_set_fm = None
-            elif fm_label == "POINT PLEASANT / UTICA":
-                df_fm = df[df["Formation"].astype(str).str.upper().isin(PP_UTICA)]
-                api10_set_fm = set(df_fm["API10"].astype(str).tolist())
             else:
                 df_fm = df[df["Formation"].astype(str).str.upper() == fm_label]
                 api10_set_fm = set(df_fm["API10"].astype(str).tolist())
@@ -2078,10 +2066,6 @@ def getOperatorAnalysisData(afeData):
     # Resolve operator and formations from AFE
     operators = afeData["Operator"].dropna().str.strip().unique().tolist()
     formations = afeData["Landing Zone"].dropna().str.upper().unique().tolist()
-    if "POINT PLEASANT" in formations and "UTICA" not in formations:
-        formations.append("UTICA")
-    elif "UTICA" in formations and "POINT PLEASANT" not in formations:
-        formations.append("POINT PLEASANT")
 
     print(f"Loading operator analysis data for: {operators}")
     print(f"  Formations: {formations}")
@@ -2091,10 +2075,19 @@ def getOperatorAnalysisData(afeData):
         paths["tsv"]["WellDetails"], sep="\t", low_memory=False, dtype={"API10": "string"}
     )
 
-    # Fuzzy match operator — match if the AFE operator string appears anywhere in CurrentOperator
-    op_pattern = "|".join(re.escape(op.upper()) for op in operators)
-    op_mask = wells["CurrentOperator"].fillna("").str.upper().str.contains(op_pattern, regex=True)
-    fm_mask = wells["Formation"].fillna("").str.upper().isin(formations)
+    # Fuzzy match operator — match if either name contains the other (handles "Diamondback" vs "Diamondback Energy")
+    def _op_match(novi_op):
+        novi_upper = str(novi_op).upper().strip()
+        for afe_op in operators:
+            afe_upper = afe_op.upper().strip()
+            if afe_upper in novi_upper or novi_upper in afe_upper:
+                return True
+        return False
+    op_mask = wells["CurrentOperator"].fillna("").apply(_op_match)
+    # Fuzzy match formation — match if the AFE formation appears anywhere in the Novi formation name
+    # (handles "WOODFORD" matching "SUB-WOODFORD")
+    fm_pattern = "|".join(re.escape(fm) for fm in formations)
+    fm_mask = wells["Formation"].fillna("").str.upper().str.contains(fm_pattern, regex=True)
     hz_mask = wells["IsHorizontalWell"].astype(str).str.lower().isin(["t", "true", "1"])
 
     filtered = wells[op_mask & fm_mask & hz_mask].copy()
@@ -2225,10 +2218,6 @@ def getPeerAnalysisData(afeData):
     paths = getNoviBulkPaths()
 
     formations = afeData["Landing Zone"].dropna().str.upper().unique().tolist()
-    if "POINT PLEASANT" in formations and "UTICA" not in formations:
-        formations.append("UTICA")
-    elif "UTICA" in formations and "POINT PLEASANT" not in formations:
-        formations.append("POINT PLEASANT")
 
     # Resolve AFE well locations from T/R/S
     lats, lons = [], []
@@ -2288,7 +2277,8 @@ def getPeerAnalysisData(afeData):
     )
 
     hz_mask = wells["IsHorizontalWell"].astype(str).str.lower().isin(["t", "true", "1"])
-    fm_mask = wells["Formation"].fillna("").str.upper().isin(formations)
+    fm_pattern = "|".join(re.escape(fm) for fm in formations)
+    fm_mask = wells["Formation"].fillna("").str.upper().str.contains(fm_pattern, regex=True)
     geo_mask = (
         (wells["MPLatitude"] >= min_lat) & (wells["MPLatitude"] <= max_lat)
         & (wells["MPLongitude"] >= min_lon) & (wells["MPLongitude"] <= max_lon)
@@ -2878,3 +2868,539 @@ def plotOperatorAnalysis(analysisData, pathToAfeSummary, peerData=None):
                 print("  Skipping peer pages: fewer than 2 operators with 20+ wells since 2020 in area")
 
     print(f"Done. Saved operator analysis to {pdfPath}")
+
+
+def plotOperatorAnalysisHTML(analysisData, pathToAfeSummary, peerData=None):
+    import json as _json
+    import webbrowser
+    import numpy as np
+
+    if analysisData is None or analysisData.empty:
+        print("No operator analysis data — skipping HTML export.")
+        return
+
+    # Resolve output path
+    afeDir = os.path.dirname(pathToAfeSummary)
+    afeFilename = os.path.splitext(os.path.basename(pathToAfeSummary))[0]
+    dsuName = afeFilename.split("-", 1)[1].strip() if "-" in afeFilename else afeFilename
+    outputDir = os.path.join(afeDir, "Data")
+    os.makedirs(outputDir, exist_ok=True)
+    htmlPath = os.path.join(outputDir, f"operator_analysis_{dsuName}.html")
+
+    operator = analysisData["CurrentOperator"].mode().iloc[0] if not analysisData["CurrentOperator"].empty else "Unknown"
+    formations = sorted(analysisData["Formation"].dropna().str.upper().unique().tolist())
+    fm_label = " / ".join(formations) if formations else "ALL"
+
+    df = analysisData.copy()
+    df["Vintage"] = pd.to_numeric(df["FirstProductionYear"], errors="coerce")
+    df = df[df["Vintage"].notna() & (df["Vintage"] >= 2014)].copy()
+    df["Vintage"] = df["Vintage"].astype(int)
+
+    print(f"Generating interactive operator analysis HTML: {htmlPath}")
+    print(f"  Operator: {operator}")
+    print(f"  Formations: {fm_label}")
+    print(f"  Vintage range: {df['Vintage'].min()}-{df['Vintage'].max()}, {len(df):,} wells")
+
+    # ---- Helper: build bar chart data grouped by vintage ----
+    def _vintage_bar(dataframe, col, color):
+        col_numeric = pd.to_numeric(dataframe[col], errors="coerce")
+        grouped = dataframe.assign(_val=col_numeric).groupby("Vintage")["_val"]
+        means = grouped.mean()
+        counts = grouped.count()
+        valid = means[counts >= 3].dropna()
+        if valid.empty:
+            return None
+        annotations = [f"n={int(counts[v])}" for v in valid.index]
+        return {
+            "x": valid.index.tolist(),
+            "y": [round(v, 4) for v in valid.values],
+            "annotations": annotations,
+            "color": color,
+        }
+
+    # ---- Helper: build horizontal bar chart data grouped by operator ----
+    def _peer_hbar(dataframe, col, afe_operator_upper):
+        col_numeric = pd.to_numeric(dataframe[col], errors="coerce")
+        grouped = dataframe.assign(_val=col_numeric).groupby("CurrentOperator")["_val"]
+        means = grouped.mean().dropna().sort_values(ascending=True)
+        if means.empty:
+            return None
+        counts = grouped.count()
+        labels = []
+        colors = []
+        anns = []
+        for op in means.index:
+            short = op if len(op) <= 20 else op[:19] + "\u2026"
+            labels.append(short)
+            colors.append("steelblue" if op.upper() == afe_operator_upper else "lightgray")
+            anns.append(f"n={int(counts[op])}")
+        return {
+            "y": labels,
+            "x": [round(v, 4) for v in means.values],
+            "colors": colors,
+            "annotations": anns,
+        }
+
+    # ================================================================
+    # TAB 1: Completion Design Trends
+    # ================================================================
+    tab1_charts = []
+
+    for col, title, color in [
+        ("LateralLength", "Avg Lateral Length (ft)", "steelblue"),
+        ("ProppantLbsPerFt", "Avg Proppant (lbs/ft)", "firebrick"),
+        ("FluidBblPerFt", "Avg Fluid (bbl/ft)", "teal"),
+    ]:
+        bd = _vintage_bar(df, col, color)
+        tab1_charts.append({"type": "bar", "title": title, "data": bd,
+                            "xlabel": "First Production Year", "ylabel": title})
+
+    # Scatter: Proppant/Fluid ratio vs EUR 50yr BOE
+    prop = pd.to_numeric(df["FirstCompletionProppantMass"], errors="coerce")
+    fluid = pd.to_numeric(df["FirstCompletionFluidVolume"], errors="coerce") / 42.0
+    eur50 = pd.to_numeric(df["EUR50YRBOE"], errors="coerce")
+    prop_fluid = prop / fluid.replace(0, float("nan"))
+    scatter_mask = prop_fluid.notna() & eur50.notna()
+    scatter_data = None
+    if scatter_mask.sum() >= 3:
+        scatter_data = {
+            "x": [round(v, 4) for v in prop_fluid[scatter_mask].values],
+            "y": [round(v, 4) for v in eur50[scatter_mask].values],
+            "color": df.loc[scatter_mask, "Vintage"].tolist(),
+        }
+    tab1_charts.append({"type": "scatter", "title": "Proppant/Fluid Ratio vs EUR 50yr BOE",
+                         "data": scatter_data,
+                         "xlabel": "Proppant / Fluid (lbs/bbl)", "ylabel": "EUR 50yr BOE"})
+
+    # ================================================================
+    # TAB 2: Production Performance
+    # ================================================================
+    tab2_charts = []
+
+    # Cum12M BOE/ft (only wells with 12+ months)
+    months_on = pd.to_numeric(df["LastReportedMonthsOnProduction"], errors="coerce")
+    df_12m = df[months_on >= 12]
+    bd = _vintage_bar(df_12m, "Cum12MBOEPerFt", "steelblue")
+    tab2_charts.append({"type": "bar", "title": "Cum 12M BOE / Lateral Foot", "data": bd,
+                         "xlabel": "First Production Year", "ylabel": "BOE/ft"})
+
+    # EUR50yr BOE vs Lateral Length scatter
+    eur = pd.to_numeric(df["EUR50YRBOE"], errors="coerce")
+    ll = pd.to_numeric(df["LateralLength"], errors="coerce")
+    scatter_mask = eur.notna() & ll.notna()
+    scatter_data = None
+    if scatter_mask.sum() >= 3:
+        scatter_data = {
+            "x": [round(v, 4) for v in ll[scatter_mask].values],
+            "y": [round(v, 4) for v in eur[scatter_mask].values],
+            "color": df.loc[scatter_mask, "Vintage"].tolist(),
+        }
+    tab2_charts.append({"type": "scatter", "title": "EUR 50yr BOE vs Lateral Length",
+                         "data": scatter_data,
+                         "xlabel": "Lateral Length (ft)", "ylabel": "EUR 50yr BOE"})
+
+    # Peak Month BOE Rate by vintage
+    bd = _vintage_bar(df, "PeakMonthBOERate", "darkorange")
+    tab2_charts.append({"type": "bar", "title": "Avg Peak Month BOE Rate", "data": bd,
+                         "xlabel": "First Production Year", "ylabel": "BOE/month"})
+
+    # Cum Life GOR by vintage
+    bd = _vintage_bar(df, "CumLifeGOR", "gray")
+    tab2_charts.append({"type": "bar", "title": "Avg Cum Life GOR", "data": bd,
+                         "xlabel": "First Production Year", "ylabel": "GOR (scf/bbl)"})
+
+    # ================================================================
+    # TAB 3: Spacing Impact
+    # ================================================================
+    tab3_charts = []
+    cum12m = pd.to_numeric(df["Cum12MBOE"], errors="coerce")
+
+    # Child vs Parent box plot
+    is_child = df["IsChild"]
+    child_vals = cum12m[is_child == True].dropna()
+    parent_vals = cum12m[is_child == False].dropna()
+    box_data = None
+    if len(child_vals) >= 3 and len(parent_vals) >= 3:
+        box_data = {
+            "labels": [f"Parent (n={len(parent_vals)})", f"Child (n={len(child_vals)})"],
+            "values": [parent_vals.tolist(), child_vals.tolist()],
+            "colors": ["steelblue", "firebrick"],
+        }
+    tab3_charts.append({"type": "box", "title": "Child vs Parent — Cum 12M BOE",
+                         "data": box_data, "ylabel": "Cum 12M BOE"})
+
+    # Boundedness Score scatter
+    bound = pd.to_numeric(df["BoundednessScore"], errors="coerce")
+    sm = bound.notna() & cum12m.notna()
+    sd = None
+    if sm.sum() >= 3:
+        sd = {"x": bound[sm].tolist(), "y": cum12m[sm].tolist(), "color_single": "teal"}
+    tab3_charts.append({"type": "scatter_single", "title": "Boundedness Score vs Cum 12M BOE",
+                         "data": sd, "xlabel": "Boundedness Score", "ylabel": "Cum 12M BOE"})
+
+    # Closest Well Distance scatter
+    closest = pd.to_numeric(df["ClosestWellXY"], errors="coerce")
+    sm = closest.notna() & cum12m.notna()
+    sd = None
+    if sm.sum() >= 3:
+        sd = {"x": closest[sm].tolist(), "y": cum12m[sm].tolist(), "color_single": "darkorange"}
+    tab3_charts.append({"type": "scatter_single", "title": "Closest Well Distance vs Cum 12M BOE",
+                         "data": sd, "xlabel": "Closest Well (ft)", "ylabel": "Cum 12M BOE"})
+
+    # Wells in Radius scatter
+    wir = pd.to_numeric(df["WellsInRadius"], errors="coerce")
+    sm = wir.notna() & cum12m.notna()
+    sd = None
+    if sm.sum() >= 3:
+        sd = {"x": wir[sm].tolist(), "y": cum12m[sm].tolist(), "color_single": "purple"}
+    tab3_charts.append({"type": "scatter_single", "title": "Wells in Radius vs Cum 12M BOE",
+                         "data": sd, "xlabel": "Wells in Radius", "ylabel": "Cum 12M BOE"})
+
+    # ================================================================
+    # TAB 4: Frac Type Analysis
+    # ================================================================
+    tab4_charts = []
+    has_frac = "FracType" in df.columns
+    if has_frac:
+        frac_colors_map = {"Slickwater": "steelblue", "Gel/Hybrid": "firebrick", "Unknown": "lightgray"}
+        # Stacked bar: frac type by vintage
+        frac_by_year = df.groupby(["Vintage", "FracType"]).size().unstack(fill_value=0)
+        frac_cols = [c for c in ["Slickwater", "Gel/Hybrid", "Unknown"] if c in frac_by_year.columns]
+        stacked_data = None
+        if frac_cols:
+            stacked_data = {
+                "vintages": frac_by_year.index.tolist(),
+                "series": [],
+            }
+            for fc in frac_cols:
+                stacked_data["series"].append({
+                    "name": fc,
+                    "values": frac_by_year[fc].tolist(),
+                    "color": frac_colors_map.get(fc, "gray"),
+                })
+        tab4_charts.append({"type": "stacked_bar", "title": "Frac Type by Vintage Year",
+                             "data": stacked_data,
+                             "xlabel": "First Production Year", "ylabel": "Well Count"})
+
+        # Box plot: Cum12M BOE by frac type
+        months_on_ft = pd.to_numeric(df["LastReportedMonthsOnProduction"], errors="coerce")
+        df_ft = df[months_on_ft >= 12]
+        frac_types_present = [ft for ft in ["Slickwater", "Gel/Hybrid"] if ft in df_ft["FracType"].values]
+        frac_box = None
+        if len(frac_types_present) >= 1:
+            frac_box = {"labels": [], "values": [], "colors": []}
+            for ft in frac_types_present:
+                vals = pd.to_numeric(df_ft[df_ft["FracType"] == ft]["Cum12MBOE"], errors="coerce").dropna()
+                frac_box["labels"].append(f"{ft} (n={len(vals)})")
+                frac_box["values"].append(vals.tolist())
+                frac_box["colors"].append(frac_colors_map.get(ft, "gray"))
+        tab4_charts.append({"type": "box", "title": "Cum 12M BOE by Frac Type",
+                             "data": frac_box, "ylabel": "Cum 12M BOE"})
+
+    # ================================================================
+    # TAB 5 & 6: Peer Comparison
+    # ================================================================
+    tab5_charts = []
+    tab6_charts = []
+    has_peer = False
+    if peerData is not None and not peerData.empty:
+        peer = peerData.copy()
+        peer["Vintage"] = pd.to_numeric(peer["FirstProductionYear"], errors="coerce")
+        peer = peer[peer["Vintage"].notna() & (peer["Vintage"] >= 2020)].copy()
+        peer["Vintage"] = peer["Vintage"].astype(int)
+        op_counts = peer["CurrentOperator"].value_counts()
+        valid_ops = op_counts[op_counts >= 20].index.tolist()
+        peer = peer[peer["CurrentOperator"].isin(valid_ops)].copy()
+
+        if len(valid_ops) >= 2:
+            has_peer = True
+            afe_operator_upper = operator.upper()
+
+            # Tab 5: EUR & Production
+            hb = _peer_hbar(peer, "EUR50YRBOEPerFt", afe_operator_upper)
+            tab5_charts.append({"type": "hbar", "title": "EUR 50yr BOE / Lateral Foot",
+                                 "data": hb, "xlabel": "BOE/ft"})
+
+            months_on_peer = pd.to_numeric(peer["LastReportedMonthsOnProduction"], errors="coerce")
+            peer_12m = peer[months_on_peer >= 12]
+            hb = _peer_hbar(peer_12m, "Cum12MBOEPerFt", afe_operator_upper)
+            tab5_charts.append({"type": "hbar", "title": "Cum 12M BOE / Lateral Foot",
+                                 "data": hb, "xlabel": "BOE/ft"})
+
+            hb = _peer_hbar(peer, "PeakMonthBOERate", afe_operator_upper)
+            tab5_charts.append({"type": "hbar", "title": "Avg Peak Month BOE Rate",
+                                 "data": hb, "xlabel": "BOE/month"})
+
+            hb = _peer_hbar(peer, "CumLifeGOR", afe_operator_upper)
+            tab5_charts.append({"type": "hbar", "title": "Avg Cum Life GOR",
+                                 "data": hb, "xlabel": "GOR (scf/bbl)"})
+
+            # Tab 6: Peer Completion Design
+            hb = _peer_hbar(peer, "LateralLength", afe_operator_upper)
+            tab6_charts.append({"type": "hbar", "title": "Avg Lateral Length (ft)",
+                                 "data": hb, "xlabel": "Lateral Length (ft)"})
+
+            hb = _peer_hbar(peer, "ProppantLbsPerFt", afe_operator_upper)
+            tab6_charts.append({"type": "hbar", "title": "Avg Proppant (lbs/ft)",
+                                 "data": hb, "xlabel": "lbs/ft"})
+
+            hb = _peer_hbar(peer, "FluidBblPerFt", afe_operator_upper)
+            tab6_charts.append({"type": "hbar", "title": "Avg Fluid (bbl/ft)",
+                                 "data": hb, "xlabel": "bbl/ft"})
+
+            # Proppant/Fluid ratio by operator
+            prop_raw = pd.to_numeric(peer["FirstCompletionProppantMass"], errors="coerce")
+            fluid_raw = pd.to_numeric(peer["FirstCompletionFluidVolume"], errors="coerce") / 42.0
+            peer_pf = prop_raw / fluid_raw.replace(0, float("nan"))
+            peer_tmp = peer.assign(PropFluidRatio=peer_pf)
+            hb = _peer_hbar(peer_tmp.rename(columns={"PropFluidRatio": "_PFR"}), "_PFR", afe_operator_upper) if peer_pf.notna().sum() > 0 else None
+            # Manual build since column name is derived
+            if peer_pf.notna().any():
+                grouped = peer.assign(_val=peer_pf).groupby("CurrentOperator")["_val"]
+                means = grouped.mean().dropna().sort_values(ascending=True)
+                counts = grouped.count()
+                if not means.empty:
+                    labels = []
+                    colors = []
+                    anns = []
+                    for op in means.index:
+                        short = op if len(op) <= 20 else op[:19] + "\u2026"
+                        labels.append(short)
+                        colors.append("steelblue" if op.upper() == afe_operator_upper else "lightgray")
+                        anns.append(f"n={int(counts[op])}")
+                    hb = {"y": labels, "x": [round(v, 4) for v in means.values],
+                          "colors": colors, "annotations": anns}
+                else:
+                    hb = None
+            else:
+                hb = None
+            tab6_charts.append({"type": "hbar", "title": "Avg Proppant/Fluid Ratio (lbs/bbl)",
+                                 "data": hb, "xlabel": "lbs/bbl"})
+
+    # ================================================================
+    # Build the tabs list
+    # ================================================================
+    tabs = [
+        {"name": "Completion Trends", "charts": tab1_charts},
+        {"name": "Production", "charts": tab2_charts},
+        {"name": "Spacing Impact", "charts": tab3_charts},
+    ]
+    if has_frac and tab4_charts:
+        tabs.append({"name": "Frac Type", "charts": tab4_charts})
+    if has_peer and tab5_charts:
+        tabs.append({"name": "Peer EUR & Production", "charts": tab5_charts})
+    if has_peer and tab6_charts:
+        tabs.append({"name": "Peer Completion Design", "charts": tab6_charts})
+
+    tabs_json = _json.dumps(tabs, separators=(",", ":"))
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Operator Analysis — {dsuName}</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+         background: #f5f5f5; color: #333; }}
+  .header {{ background: #0a2a5e; color: white; padding: 18px 28px; }}
+  .header h1 {{ font-size: 22px; font-weight: 600; }}
+  .header .sub {{ font-size: 13px; opacity: 0.8; margin-top: 4px; }}
+  .tabs {{ display: flex; flex-wrap: wrap; gap: 6px; padding: 12px 28px;
+           background: #fff; border-bottom: 1px solid #ddd; position: sticky; top: 0; z-index: 10; }}
+  .tabs button {{ padding: 6px 14px; border: 1px solid #ccc; background: #fff; border-radius: 4px;
+                  cursor: pointer; font-size: 12px; white-space: nowrap; }}
+  .tabs button.active {{ background: #0a2a5e; color: #fff; border-color: #0a2a5e; }}
+  .tabs button:hover:not(.active) {{ background: #eee; }}
+  .page {{ display: none; padding: 16px 28px; }}
+  .page.active {{ display: block; }}
+  .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }}
+  .plot-cell {{ height: 400px; background: #fff; border: 1px solid #ddd; border-radius: 4px; }}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>Operator Analysis &mdash; {dsuName}</h1>
+  <div class="sub">{operator} &middot; {fm_label} &middot; Interactive viewer &middot; Generated by Shalehaven</div>
+</div>
+<div class="tabs" id="tabs"></div>
+<div id="pages"></div>
+<script>
+const TABS = {tabs_json};
+const tabsEl = document.getElementById('tabs');
+const pagesEl = document.getElementById('pages');
+const plotted = new Set();
+
+// Build tab buttons and page containers
+TABS.forEach((tab, i) => {{
+  const btn = document.createElement('button');
+  btn.textContent = tab.name;
+  btn.dataset.idx = i;
+  if (i === 0) btn.classList.add('active');
+  tabsEl.appendChild(btn);
+
+  const page = document.createElement('div');
+  page.className = 'page' + (i === 0 ? ' active' : '');
+  page.id = 'page-' + i;
+  let gridHTML = '<div class="grid">';
+  tab.charts.forEach((c, ci) => {{
+    gridHTML += '<div class="plot-cell" id="plot-' + i + '-' + ci + '"></div>';
+  }});
+  gridHTML += '</div>';
+  page.innerHTML = gridHTML;
+  pagesEl.appendChild(page);
+}});
+
+// Tab switching with lazy render
+tabsEl.addEventListener('click', e => {{
+  if (e.target.tagName !== 'BUTTON') return;
+  tabsEl.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+  e.target.classList.add('active');
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  const idx = e.target.dataset.idx;
+  document.getElementById('page-' + idx).classList.add('active');
+  if (!plotted.has(idx)) {{
+    renderTab(parseInt(idx));
+    plotted.add(idx);
+  }}
+}});
+
+function renderTab(tabIdx) {{
+  const tab = TABS[tabIdx];
+  tab.charts.forEach((chart, ci) => {{
+    const divId = 'plot-' + tabIdx + '-' + ci;
+    if (!chart.data) {{
+      document.getElementById(divId).innerHTML =
+        '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#999;">Insufficient data</div>';
+      return;
+    }}
+    const traces = [];
+    const layout = {{
+      title: {{ text: chart.title, font: {{ size: 14 }} }},
+      margin: {{ l: 60, r: 20, t: 45, b: 50 }},
+      hovermode: 'closest',
+    }};
+
+    if (chart.type === 'bar') {{
+      traces.push({{
+        type: 'bar',
+        x: chart.data.x,
+        y: chart.data.y,
+        marker: {{ color: chart.data.color, opacity: 0.8,
+                   line: {{ color: 'black', width: 0.3 }} }},
+        text: chart.data.annotations,
+        textposition: 'outside',
+        textfont: {{ size: 9, color: '#444' }},
+        hoverinfo: 'x+y',
+      }});
+      layout.xaxis = {{ title: chart.xlabel }};
+      layout.yaxis = {{ title: chart.ylabel }};
+      layout.showlegend = false;
+    }}
+
+    else if (chart.type === 'scatter') {{
+      traces.push({{
+        type: 'scatter',
+        mode: 'markers',
+        x: chart.data.x,
+        y: chart.data.y,
+        marker: {{
+          size: 6,
+          color: chart.data.color,
+          colorscale: 'Plasma',
+          showscale: true,
+          colorbar: {{ title: 'Vintage', thickness: 12 }},
+          opacity: 0.7,
+          line: {{ color: 'black', width: 0.2 }},
+        }},
+        hoverinfo: 'x+y',
+      }});
+      layout.xaxis = {{ title: chart.xlabel }};
+      layout.yaxis = {{ title: chart.ylabel }};
+      layout.showlegend = false;
+    }}
+
+    else if (chart.type === 'scatter_single') {{
+      traces.push({{
+        type: 'scatter',
+        mode: 'markers',
+        x: chart.data.x,
+        y: chart.data.y,
+        marker: {{
+          size: 6,
+          color: chart.data.color_single,
+          opacity: 0.6,
+          line: {{ color: 'black', width: 0.2 }},
+        }},
+        hoverinfo: 'x+y',
+      }});
+      layout.xaxis = {{ title: chart.xlabel }};
+      layout.yaxis = {{ title: chart.ylabel }};
+      layout.showlegend = false;
+    }}
+
+    else if (chart.type === 'box') {{
+      chart.data.values.forEach((vals, bi) => {{
+        traces.push({{
+          type: 'box',
+          y: vals,
+          name: chart.data.labels[bi],
+          marker: {{ color: chart.data.colors[bi] }},
+          boxpoints: 'outliers',
+        }});
+      }});
+      layout.yaxis = {{ title: chart.ylabel || '' }};
+      layout.showlegend = false;
+    }}
+
+    else if (chart.type === 'stacked_bar') {{
+      chart.data.series.forEach(s => {{
+        traces.push({{
+          type: 'bar',
+          x: chart.data.vintages,
+          y: s.values,
+          name: s.name,
+          marker: {{ color: s.color, line: {{ color: 'black', width: 0.3 }} }},
+        }});
+      }});
+      layout.barmode = 'stack';
+      layout.xaxis = {{ title: chart.xlabel }};
+      layout.yaxis = {{ title: chart.ylabel }};
+    }}
+
+    else if (chart.type === 'hbar') {{
+      traces.push({{
+        type: 'bar',
+        orientation: 'h',
+        y: chart.data.y,
+        x: chart.data.x,
+        marker: {{ color: chart.data.colors,
+                   line: {{ color: 'black', width: 0.3 }} }},
+        text: chart.data.annotations,
+        textposition: 'outside',
+        textfont: {{ size: 9, color: '#444' }},
+        hoverinfo: 'x+y',
+      }});
+      layout.xaxis = {{ title: chart.xlabel || '' }};
+      layout.yaxis = {{ automargin: true }};
+      layout.margin.l = 140;
+      layout.showlegend = false;
+    }}
+
+    Plotly.newPlot(divId, traces, layout, {{ responsive: true }});
+  }});
+}}
+
+// Render first tab
+renderTab(0);
+plotted.add('0');
+</script>
+</body>
+</html>"""
+
+    with open(htmlPath, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    print(f"Done. Saved interactive operator analysis to {htmlPath}")
+    webbrowser.open(htmlPath)
