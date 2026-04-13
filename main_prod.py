@@ -5,6 +5,7 @@
 import shalehavenscripts.production as production
 import shalehavenscripts.combocurve as combocurve
 import shalehavenscripts.dealsheet as dealsheet
+import shalehavenscripts.novi as novi
 
 # Imports - General
 import pandas as pd
@@ -41,6 +42,8 @@ pathToBallardData = os.getenv("SHALEHAVEN_BALLARD_PATH")
 pathToMonthlyPDSData = os.getenv("SHALEHAVEN_MONTHLY_PDS_PATH")
 pathToDatabase = os.getenv("SHALEHAVEN_DATABASE_PATH")
 pathToDealSheet = os.getenv("SHALEHAVEN_DEAL_SHEET_PATH")
+
+novi.checkNoviDbStatus()
 
 runDealSheet = True # Set to False to skip deal sheet processing and just run production data ETL
 

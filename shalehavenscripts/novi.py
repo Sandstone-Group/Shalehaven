@@ -592,6 +592,55 @@ def getNoviBulkPaths(outputDir=None):
     }
 
 
+## Check if the Novi bulk export needs refreshing
+## Hits the bulk endpoint for metadata, compares ExportDate against local manifest
+## Only downloads if a newer export is available on the server
+def checkNoviDbStatus(envPath=r"C:\Users\Michael Tanner\code\.env", outputDir=None):
+    import json
+
+    if outputDir is None:
+        outputDir = os.environ.get("NOVI_BULK_DATA_PATH", r"D:\novi")
+
+    # Load env vars for auth
+    if os.path.exists(envPath):
+        with open(envPath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+    # Auth and fetch remote export metadata
+    print("Checking Novi bulk export status...")
+    token = authNovi()
+    params = {"authentication_token": token, "scope": "us-horizontals"}
+    response = requests.get(BASE_URL + "v3/bulk.json", params=params, timeout=60)
+    response.raise_for_status()
+    meta = response.json()
+    entry = meta[0] if isinstance(meta, list) else meta
+    remoteExportDate = str(entry.get("ExportDate", ""))
+
+    print(f"  Remote ExportDate: {remoteExportDate}")
+
+    # Compare against local manifest
+    manifestPath = os.path.join(outputDir, "manifest.json")
+    localExportDate = None
+    if os.path.exists(manifestPath):
+        with open(manifestPath, "r") as f:
+            noviMeta = json.load(f)
+        localExportDate = str(noviMeta.get("raw_export_date", ""))
+        print(f"  Local  ExportDate: {localExportDate}")
+
+    if localExportDate == remoteExportDate:
+        print("Novi bulk export is up to date, skipping re-download.")
+        return
+
+    print(f"New Novi export available ({localExportDate or 'none'} → {remoteExportDate}) — downloading...")
+    extractDir = noviBulk(token, outputDir=outputDir)
+    print(f"\nDone. Updated bulk export at: {extractDir}")
+
+
 ## Standalone entrypoint for downloading + extracting the Novi bulk export
 ## Loads NOVI_USERNAME / NOVI_PASSWORD from C:\Users\Michael Tanner\code\.env (no dotenv dependency)
 ## Then authenticates and runs noviBulk() to pull everything to D:\novi
