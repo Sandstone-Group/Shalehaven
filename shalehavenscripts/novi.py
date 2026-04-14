@@ -608,6 +608,12 @@ def getNoviBulkPaths(outputDir=None):
 ## Only downloads if a newer export is available on the server
 def checkNoviDbStatus(envPath=r"C:\Users\Michael Tanner\code\.env", outputDir=None):
     import json
+    from datetime import datetime
+
+    # Only check/download on Mondays — Novi publishes weekly
+    if datetime.today().weekday() != 0:
+        print(f"Skipping Novi bulk status check (today is {datetime.today().strftime('%A')}, only runs Monday).")
+        return
 
     if outputDir is None:
         outputDir = os.environ.get("NOVI_BULK_DATA_PATH", r"D:\novi")
@@ -2346,7 +2352,8 @@ def plotOperatorAnalysis(analysisData, pathToAfeSummary, peerData=None):
     os.makedirs(outputDir, exist_ok=True)
     pdfPath = os.path.join(outputDir, f"operator_analysis_{dsuName}.pdf")
 
-    operator = analysisData["CurrentOperator"].mode().iloc[0] if not analysisData["CurrentOperator"].empty else "Unknown"
+    operatorMode = analysisData["CurrentOperator"].dropna().mode()
+    operator = operatorMode.iloc[0] if not operatorMode.empty else "Unknown"
     formations = sorted(analysisData["Formation"].dropna().str.upper().unique().tolist())
     fm_label = " / ".join(formations) if formations else "ALL"
 
@@ -2887,7 +2894,8 @@ def plotOperatorAnalysisHTML(analysisData, pathToAfeSummary, peerData=None):
     os.makedirs(outputDir, exist_ok=True)
     htmlPath = os.path.join(outputDir, f"operator_analysis_{dsuName}.html")
 
-    operator = analysisData["CurrentOperator"].mode().iloc[0] if not analysisData["CurrentOperator"].empty else "Unknown"
+    operatorMode = analysisData["CurrentOperator"].dropna().mode()
+    operator = operatorMode.iloc[0] if not operatorMode.empty else "Unknown"
     formations = sorted(analysisData["Formation"].dropna().str.upper().unique().tolist())
     fm_label = " / ".join(formations) if formations else "ALL"
 
