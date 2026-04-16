@@ -46,13 +46,7 @@ pathToDealSheet = os.getenv("SHALEHAVEN_DEAL_SHEET_PATH")
 
 novi.checkNoviDbStatus() # checks Novi API bulk download, then replaces data if new DB as dropped
 
-runDealSheet = True # Set to False to skip deal sheet processing and just run production data ETL
-
-# Deal Evaluation Review Sheet (SHLP25 + SHLP26 tabs) for Power BI - if runDealSheet is True, will read the xlsm, flatten it, and write to an xlsx for Power BI. Also returns the combined DataFrame.
-if runDealSheet:
-    dealsheet.buildDealPipeline(pathToDealSheet)
-else:
-        print("Skipping Deal Sheet")
+dealsheet.buildDealPipeline(pathToDealSheet) # runs updating the deal sheet
 
 # Build a single ComboCurve client (pooled session, retries, env-driven auth)
 ccClient = combocurve.ComboCurveClient.from_env()

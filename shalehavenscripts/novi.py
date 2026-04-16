@@ -17,8 +17,95 @@ STATE_ABBR_MAP = {
     "south dakota": "SD", "oklahoma": "OK", "kansas": "KS", "louisiana": "LA",
     "california": "CA", "utah": "UT", "alaska": "AK",
 }
+# Reverse: "TX" -> "Texas" (Novi WellPermits/WellDetails store full state names)
+STATE_FULL_MAP = {abbr: name.title() for name, abbr in STATE_ABBR_MAP.items()}
 # Also accept abbreviations directly (AFE files sometimes use "OH" instead of "Ohio")
 STATE_ABBR_MAP.update({v.lower(): v for v in STATE_ABBR_MAP.values()})
+
+
+## Normalize an AFE state value ("TX" or "Texas") to Novi's full-name form ("Texas").
+def _normalizeStateFull(state):
+    s = str(state).strip()
+    if not s:
+        return s
+    if s in STATE_FULL_MAP.values():
+        return s
+    return STATE_FULL_MAP.get(s.upper(), s.title())
+
+
+## Strip a trailing " County" / " Parish" suffix — Novi stores bare county names ("Martin", not "Martin County").
+def _normalizeCounty(county):
+    s = str(county).strip()
+    for suffix in (" County", " Parish"):
+        if s.lower().endswith(suffix.lower()):
+            s = s[: -len(suffix)].strip()
+    return s
+
+
+# Alias -> canonical so downstream fetch + plot treat geologically-equivalent zones as one.
+FORMATION_ALIASES = {
+    "JO MILL": "LOWER SPRABERRY SAND",
+}
+_FORMATION_GROUPS = {}
+for _alias, _canon in FORMATION_ALIASES.items():
+    _FORMATION_GROUPS.setdefault(_canon, {_canon}).add(_alias)
+
+
+def _canonicalFormation(name):
+    if pd.isna(name):
+        return name
+    s = str(name).strip().upper()
+    return FORMATION_ALIASES.get(s, s)
+
+
+def _expandFormations(names):
+    result = set()
+    for n in names:
+        canon = _canonicalFormation(n)
+        if canon is None:
+            continue
+        result.update(_FORMATION_GROUPS.get(canon, {canon}))
+    return sorted(result)
+
+
+## Linear regression with R²; returns (slope, intercept, r2, label) ready for plot legends.
+def _linearFitWithR2(x, y):
+    import numpy as np
+    slope, intercept = np.polyfit(x, y, 1)
+    ss_res = ((y - (slope * x + intercept)) ** 2).sum()
+    ss_tot = ((y - y.mean()) ** 2).sum()
+    r2 = 1 - ss_res / ss_tot if ss_tot else float("nan")
+    label = f"y={slope:,.2f}x+{intercept:,.0f}  R²={r2:.2f}"
+    return slope, intercept, r2, label
+
+
+## One-row DataFrame matching the synthetic-permit schema used by getWellPermits fallbacks.
+def _syntheticPermitRow(lat, lon, well_name, county, state, api10):
+    return pd.DataFrame([{
+        "Latitude": float(lat),
+        "Longitude": float(lon),
+        "WellName": str(well_name),
+        "County": county,
+        "State": state,
+        "API10": api10 if api10 else None,
+    }])
+
+
+# Midland + Delaware (Permian) zones — gas is uneconomic here, so EUR analysis should track oil.
+PERMIAN_FORMATION_PATTERNS = (
+    "WOLFCAMP", "SPRABERRY", "JO MILL", "BONE SPRING",
+    "AVALON", "DEAN", "CLEAR FORK", "LEONARD",
+)
+
+
+def _isPermianOilBasin(formations):
+    if not formations:
+        return False
+    for fm in formations:
+        s = str(fm).upper()
+        if any(p in s for p in PERMIAN_FORMATION_PATTERNS):
+            return True
+    return False
 
 
 ## Parse township/range string like "18S", "T18S", "18 South", "T-18-S" into (number, direction)
@@ -194,8 +281,10 @@ def getWells(token, permitData, afeData, scope="us-horizontals"):
     min_lon = permitData["Longitude"].min() - lon_offset
     max_lon = permitData["Longitude"].max() + lon_offset
 
-    # Pull all unique formations from AFE Summary and uppercase to match Novi format
-    formations = afeData["Landing Zone"].dropna().str.upper().unique().tolist()
+    # Pull all unique formations from AFE Summary and uppercase to match Novi format.
+    # Expand aliases so geologically-equivalent zones (e.g. JO MILL <-> LOWER SPRABERRY SAND)
+    # are pulled from Novi together regardless of which name the AFE used.
+    formations = _expandFormations(afeData["Landing Zone"].dropna().str.upper().unique().tolist())
 
     # Point Pleasant and Utica are treated as separate formations
 
@@ -230,8 +319,9 @@ def getWells(token, permitData, afeData, scope="us-horizontals"):
 
 ## Retrieve well permits from Novi for each AFE row
 ## Looks up permits from the local bulk export (D:\novi). Texas wells matched by API10,
-## non-Texas matched by ID. If no local match exists (e.g. unpermitted well), falls back
-## to resolving the well's Township/Range/Section via BLM PLSS to get a section centroid.
+## non-Texas matched by ID. If no permit row exists (well already spudded and dropped from
+## WellPermits), falls back to WellDetails surface-hole coords. If WellDetails also misses
+## (truly unpermitted), resolves the well's Township/Range/Section via BLM PLSS centroid.
 def getWellPermits(token, afeData, scope="us-horizontals"):
 
     # Load local permits TSV once (~130 MB) — single read for the whole AFE list
@@ -245,15 +335,21 @@ def getWellPermits(token, afeData, scope="us-horizontals"):
     )
     print(f"  Loaded {len(localPermits):,} local permits")
 
+    # WellDetails is lazy-loaded only if we hit a spud-fallback case (~130 MB).
+    # Indexed by (API10, State) so per-AFE-row lookup is O(1) instead of O(N) scan.
+    wellDetails = None
+
     all_permits = []
+    spud_fallback_count = 0
     trs_fallback_count = 0
 
     # Loop through each well in the AFE Summary
     for index, row in afeData.iterrows():
         api_number = str(row["API Number"])
-        county = row["County"]
-        state = row["State"]
-        is_texas = str(state).strip().lower() == "texas"
+        # Normalize to Novi's storage form: full state name ("Texas") and bare county ("Martin")
+        state = _normalizeStateFull(row["State"])
+        county = _normalizeCounty(row["County"])
+        is_texas = state.lower() == "texas"
 
         # Try local bulk export first — Texas matches on API10, others match on ID
         if is_texas:
@@ -277,7 +373,41 @@ def getWellPermits(token, afeData, scope="us-horizontals"):
             all_permits.append(local_match)
             continue
 
-        # No local match — resolve location from AFE Township/Range/Section via BLM PLSS
+        # Permit miss — well may already be spudded (Novi drops spud wells from WellPermits).
+        # Look up WellDetails by API10 and use the surface-hole location if present.
+        if wellDetails is None:
+            raw = pd.read_csv(
+                paths["tsv"]["WellDetails"],
+                sep="\t",
+                low_memory=False,
+                dtype={"API10": "string"},
+                usecols=["API10", "WellName", "State", "County",
+                         "SHLLatitude", "SHLLongitude",
+                         "BHLLatitude", "BHLLongitude", "SpudDate"],
+            )
+            wellDetails = raw.drop_duplicates(subset=["API10", "State"]).set_index(["API10", "State"])
+            print(f"  Loaded {len(raw):,} WellDetails rows for spud fallback")
+
+        wd_row = None
+        try:
+            wd_row = wellDetails.loc[(api_number, state)]
+        except KeyError:
+            pass
+        if wd_row is not None:
+            shl_lat, shl_lon = wd_row.get("SHLLatitude"), wd_row.get("SHLLongitude")
+            if pd.isna(shl_lat) or pd.isna(shl_lon):
+                shl_lat, shl_lon = wd_row.get("BHLLatitude"), wd_row.get("BHLLongitude")
+            if pd.notna(shl_lat) and pd.notna(shl_lon):
+                all_permits.append(_syntheticPermitRow(
+                    shl_lat, shl_lon,
+                    wd_row.get("WellName") or f"Well {index + 1}",
+                    county, state, api_number,
+                ))
+                spud_fallback_count += 1
+                print(f"  Spud well found in WellDetails (SpudDate={wd_row.get('SpudDate')}), placed at SHL: ({float(shl_lat):.6f}, {float(shl_lon):.6f})")
+                continue
+
+        # No permit and no WellDetails row — resolve from AFE Township/Range/Section via BLM PLSS
         print(f"  No local match — resolving location from T/R/S")
         twp_str = str(row.get("Township", "")).strip()
         rng_str = str(row.get("Range", "")).strip()
@@ -288,16 +418,11 @@ def getWellPermits(token, afeData, scope="us-horizontals"):
             centroid = _fetchSectionCentroid(state_abbr, twp_str, rng_str, sec_str)
             if centroid:
                 lat, lon = centroid
-                well_name = str(row.get("Well Name", f"Well {index + 1}")).strip()
-                synthetic = pd.DataFrame([{
-                    "Latitude": lat,
-                    "Longitude": lon,
-                    "WellName": well_name,
-                    "County": county,
-                    "State": state,
-                    "API10": api_number if api_number else None,
-                }])
-                all_permits.append(synthetic)
+                all_permits.append(_syntheticPermitRow(
+                    lat, lon,
+                    str(row.get("Well Name", f"Well {index + 1}")).strip(),
+                    county, state, api_number,
+                ))
                 trs_fallback_count += 1
                 print(f"  Placed at PLSS section centroid: ({lat:.6f}, {lon:.6f})")
             else:
@@ -311,7 +436,7 @@ def getWellPermits(token, afeData, scope="us-horizontals"):
     else:
         permitDf = pd.DataFrame()
 
-    print(f"\nDone. Retrieved {len(permitDf)} well permits total ({trs_fallback_count} wells resolved via T/R/S).")
+    print(f"\nDone. Retrieved {len(permitDf)} well permits total ({spud_fallback_count} spud wells via WellDetails, {trs_fallback_count} unpermitted wells via T/R/S).")
 
     # Texas permits often have null Lat/Lon but BHL coordinates are populated - use those as fallback
     if "Latitude" in permitDf.columns and "BHLLatitude" in permitDf.columns:
@@ -606,12 +731,12 @@ def getNoviBulkPaths(outputDir=None):
 ## Check if the Novi bulk export needs refreshing
 ## Hits the bulk endpoint for metadata, compares ExportDate against local manifest
 ## Only downloads if a newer export is available on the server
-def checkNoviDbStatus(envPath=r"C:\Users\Michael Tanner\code\.env", outputDir=None):
+def checkNoviDbStatus(envPath=r"C:\Users\Michael Tanner\code\.env", outputDir=None, force=False):
     import json
     from datetime import datetime
 
-    # Only check/download on Mondays — Novi publishes weekly
-    if datetime.today().weekday() != 0:
+    # Only check/download on Mondays — Novi publishes weekly (unless forced)
+    if not force and datetime.today().weekday() != 0:
         print(f"Skipping Novi bulk status check (today is {datetime.today().strftime('%A')}, only runs Monday).")
         return
 
@@ -1021,6 +1146,11 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
         print("No subsurface rows with valid Lat/Lon — skipping heat map export.")
         return
 
+    # Collapse formation aliases so geologically-equivalent zones (e.g. JO MILL <-> LOWER SPRABERRY SAND) share one page
+    if "Formation" in df.columns:
+        upper = df["Formation"].astype("string").str.strip().str.upper()
+        df["Formation"] = upper.map(FORMATION_ALIASES).fillna(upper)
+
     # Build interpolation grid covering the data extent (with small margin)
     margin = 0.05
     lon_min, lon_max = df["Longitude"].min() - margin, df["Longitude"].max() + margin
@@ -1142,7 +1272,7 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
         for i, (_idx, row) in enumerate(afeData.iterrows()):
             letter = _afe_letter(i)
             well_name = str(row.get("Well Name", f"Well {i + 1}")).strip()
-            lz_upper = str(row.get("Landing Zone", "")).strip().upper()
+            lz_upper = _canonicalFormation(str(row.get("Landing Zone", "")).strip().upper())
             numbered_permits.append((letter, well_name, lz_upper))
 
             state_full = str(row.get("State", "")).strip().lower()
@@ -1636,6 +1766,11 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
         print("No subsurface rows with valid Lat/Lon — skipping HTML heat map export.")
         return
 
+    # Collapse formation aliases so geologically-equivalent zones (e.g. JO MILL <-> LOWER SPRABERRY SAND) share one page
+    if "Formation" in df.columns:
+        upper = df["Formation"].astype("string").str.strip().str.upper()
+        df["Formation"] = upper.map(FORMATION_ALIASES).fillna(upper)
+
     # Interpolation grid
     margin = 0.05
     lon_min, lon_max = df["Longitude"].min() - margin, df["Longitude"].max() + margin
@@ -1720,7 +1855,7 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
             afe_permits.append({
                 "letter": letter,
                 "name": str(row.get("Well Name", f"Well {i+1}")).strip(),
-                "lz": str(row.get("Landing Zone", "")).strip().upper(),
+                "lz": _canonicalFormation(str(row.get("Landing Zone", "")).strip().upper()),
             })
 
     # Permit locations for star markers
@@ -2444,18 +2579,28 @@ def plotOperatorAnalysis(analysisData, pathToAfeSummary, peerData=None):
         ax.set_ylabel("BOE/ft")
         ax.grid(axis="y", alpha=0.3)
 
-        # 2b: EUR50yr BOE vs lateral length scatter
+        # 2b: EUR50yr vs lateral length scatter — Permian wells use Oil EUR (gas is uneconomic)
         ax = axes[0, 1]
-        eur = pd.to_numeric(df["EUR50YRBOE"], errors="coerce")
+        is_permian = _isPermianOilBasin(formations)
+        eur_col = "EUR50YROil" if is_permian else "EUR50YRBOE"
+        eur_label = "EUR 50yr Oil (BO)" if is_permian else "EUR 50yr BOE"
+        eur = pd.to_numeric(df[eur_col], errors="coerce")
         ll = pd.to_numeric(df["LateralLength"], errors="coerce")
         scatter_mask = eur.notna() & ll.notna()
         if scatter_mask.sum() >= 3:
             sc = ax.scatter(ll[scatter_mask], eur[scatter_mask], c=df.loc[scatter_mask, "Vintage"],
                            cmap="plasma", s=20, alpha=0.7, edgecolor="black", linewidth=0.2)
             plt.colorbar(sc, ax=ax, label="Vintage", shrink=0.8)
-        ax.set_title("EUR 50yr BOE vs Lateral Length")
+            x_fit = ll[scatter_mask].values
+            y_fit = eur[scatter_mask].values
+            slope, intercept, _r2, fit_label = _linearFitWithR2(x_fit, y_fit)
+            x_line = np.array([x_fit.min(), x_fit.max()])
+            ax.plot(x_line, slope * x_line + intercept, color="black", linewidth=1.2,
+                    linestyle="--", label=fit_label)
+            ax.legend(loc="upper left", fontsize=8, framealpha=0.85)
+        ax.set_title(f"{eur_label} vs Lateral Length")
         ax.set_xlabel("Lateral Length (ft)")
-        ax.set_ylabel("EUR 50yr BOE")
+        ax.set_ylabel(eur_label)
         ax.grid(alpha=0.3)
 
         # 2c: Peak month BOE rate by vintage
@@ -2992,20 +3137,32 @@ def plotOperatorAnalysisHTML(analysisData, pathToAfeSummary, peerData=None):
     tab2_charts.append({"type": "bar", "title": "Cum 12M BOE / Lateral Foot", "data": bd,
                          "xlabel": "First Production Year", "ylabel": "BOE/ft"})
 
-    # EUR50yr BOE vs Lateral Length scatter
-    eur = pd.to_numeric(df["EUR50YRBOE"], errors="coerce")
+    # EUR50yr vs Lateral Length scatter — Permian wells use Oil EUR (gas is uneconomic)
+    is_permian = _isPermianOilBasin(formations)
+    eur_col = "EUR50YROil" if is_permian else "EUR50YRBOE"
+    eur_label = "EUR 50yr Oil (BO)" if is_permian else "EUR 50yr BOE"
+    eur = pd.to_numeric(df[eur_col], errors="coerce")
     ll = pd.to_numeric(df["LateralLength"], errors="coerce")
     scatter_mask = eur.notna() & ll.notna()
     scatter_data = None
     if scatter_mask.sum() >= 3:
+        x_fit = ll[scatter_mask].values
+        y_fit = eur[scatter_mask].values
+        slope, intercept, _r2, fit_label = _linearFitWithR2(x_fit, y_fit)
+        x_min, x_max = float(x_fit.min()), float(x_fit.max())
         scatter_data = {
-            "x": [round(v, 4) for v in ll[scatter_mask].values],
-            "y": [round(v, 4) for v in eur[scatter_mask].values],
+            "x": [round(v, 4) for v in x_fit],
+            "y": [round(v, 4) for v in y_fit],
             "color": df.loc[scatter_mask, "Vintage"].tolist(),
+            "fit": {
+                "x": [x_min, x_max],
+                "y": [round(slope * x_min + intercept, 4), round(slope * x_max + intercept, 4)],
+                "label": fit_label,
+            },
         }
-    tab2_charts.append({"type": "scatter", "title": "EUR 50yr BOE vs Lateral Length",
+    tab2_charts.append({"type": "scatter", "title": f"{eur_label} vs Lateral Length",
                          "data": scatter_data,
-                         "xlabel": "Lateral Length (ft)", "ylabel": "EUR 50yr BOE"})
+                         "xlabel": "Lateral Length (ft)", "ylabel": eur_label})
 
     # Peak Month BOE Rate by vintage
     bd = _vintage_bar(df, "PeakMonthBOERate", "darkorange")
@@ -3323,10 +3480,25 @@ function renderTab(tabIdx) {{
           line: {{ color: 'black', width: 0.2 }},
         }},
         hoverinfo: 'x+y',
+        showlegend: false,
       }});
+      if (chart.data.fit) {{
+        traces.push({{
+          type: 'scatter',
+          mode: 'lines',
+          x: chart.data.fit.x,
+          y: chart.data.fit.y,
+          line: {{ color: 'black', width: 1.6, dash: 'dash' }},
+          name: chart.data.fit.label,
+          hoverinfo: 'name',
+        }});
+        layout.showlegend = true;
+        layout.legend = {{ x: 0.02, y: 0.98, bgcolor: 'rgba(255,255,255,0.85)' }};
+      }} else {{
+        layout.showlegend = false;
+      }}
       layout.xaxis = {{ title: chart.xlabel }};
       layout.yaxis = {{ title: chart.ylabel }};
-      layout.showlegend = false;
     }}
 
     else if (chart.type === 'scatter_single') {{
