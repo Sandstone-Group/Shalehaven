@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(awk -F'\\\\t' 'NR>1 {print $1}' \"/d/novi/extracted_2026-04-15_16-56-59/Database/Subsurface.tsv\")",
+      "Bash(awk '{print $1}')",
+      "Bash(awk '-F\\\\t' 'NR==1 {for\\(i=1;i<=NF;i++\\) h[i]=$i} NR>1 && NR<4 {print \"--- row \" NR \" ---\"; for\\(i=1;i<=NF;i++\\) if\\($i!=\"\"\\) print h[i]\": \"$i}' /d/novi/extracted_2026-04-15_16-56-59/Database/WellDetails.tsv)",
+      "Bash(awk -F'\\\\t' 'NR==1 {next} $1!=\"\" && NR<=5 {print}' \"/d/novi/extracted_2026-04-15_16-56-59/Database/Subsurface.tsv\"2222)",
+      "Bash(python -m pytest tests/ -x --tb=short)",
+      "Bash(python -m pytest tests/ --tb=short)"
+    ]
+  }
+}

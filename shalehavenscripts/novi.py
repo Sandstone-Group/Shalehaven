@@ -850,6 +850,7 @@ def getNoviMonthlyProduction(token, offsetData, scope="us-horizontals"):
 ## Retrieve subsurface petrophysical data for offset wells from local bulk export
 ## Inner-merges on (API10, Formation) so each well gets exactly one row matching its reported formation.
 ## Wells whose Formation doesn't match any Subsurface row for that API10 are dropped (logged).
+## Also joins Cum12MBOE / Cum24MBOE from WellDetails.tsv so production heatmaps render alongside the petrophysical ones.
 ## token and scope are kept for backward compat / consistency with the other novi functions but unused.
 def getNoviSubsurface(token, offsetData, scope="us-horizontals"):
 
@@ -872,6 +873,26 @@ def getNoviSubsurface(token, offsetData, scope="us-horizontals"):
     keys["API10"] = keys["API10"].astype("string")
     merged = subsurface.merge(keys, on=["API10", "Formation"], how="inner")
     merged = merged.drop_duplicates(subset=["API10"], keep="first")  # safety if duplicate zone rows exist
+
+    # Join 12-month and 24-month cumulative BOE from WellDetails for production heatmaps.
+    # Left-join: wells without 12/24M production (recent vintage) keep petrophysical rows but get NaN
+    # on the production columns — the heatmap loop already skips parameters with too few valid points.
+    wellDetailsPath = paths["tsv"].get("WellDetails")
+    if wellDetailsPath and os.path.exists(wellDetailsPath):
+        wd = pd.read_csv(
+            wellDetailsPath,
+            sep="\t",
+            low_memory=False,
+            usecols=["API10", "Cum12MBOE", "Cum24MBOE"],
+            dtype={"API10": "string"},
+        )
+        wd = wd[wd["API10"].isin(api10_set)]
+        merged = merged.merge(wd, on="API10", how="left")
+        n12 = int(merged["Cum12MBOE"].notna().sum())
+        n24 = int(merged["Cum24MBOE"].notna().sum())
+        print(f"  Joined Cum12MBOE ({n12:,} wells) and Cum24MBOE ({n24:,} wells) from WellDetails")
+    else:
+        print("  WellDetails.tsv not found — Cum12MBOE / Cum24MBOE heatmaps will be skipped")
 
     matched = merged["API10"].nunique()
     total = len(api10_set)
@@ -1126,6 +1147,8 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
             "Thickness_Avg",
             "VClay_Avg",
             "Brittleness_Avg",
+            "Cum12MBOE",
+            "Cum24MBOE",
         ]
 
     # Resolve output path (same Data/ folder as printData)
@@ -1748,6 +1771,7 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
         parameters = [
             "TVD", "TOC_Avg", "SW_Avg", "Porosity_Avg",
             "Permeability_Avg", "Thickness_Avg", "VClay_Avg", "Brittleness_Avg",
+            "Cum12MBOE", "Cum24MBOE",
         ]
 
     afeDir = os.path.dirname(pathToAfeSummary)
