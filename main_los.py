@@ -26,11 +26,14 @@ pathToAfe2024 = os.getenv("SHALEHAVEN_AFE_2024_PATH")
 pathToJib = os.getenv("SHALEHAVEN_JIB_PATH")
 pathToRevenue = os.getenv("SHALEHAVEN_REVENUE_PATH")
 pathToDatabase = os.getenv("SHALEHAVEN_DATABASE_PATH")
+pathToAfeMaster = os.getenv("SHALEHAVEN_AFE_MASTER_PATH")
+pathToJibMaster = os.getenv("SHALEHAVEN_JIB_MASTER_PATH")
 
 
 runAfe = True # set to true to run the AFE ETL process, set to false to skip the AFE ETL process
 runJib = True # set to true to run the JIB ETL process, set to false to skip the JIB ETL process
 runRevenue = True # set to true to run the Revenue ETL process, set to false to skip the Revenue ETL process
+runAfeActual = True # set to true to run the AFE vs Actual reconciliation, set to false to skip
 print("Begin Shalehaven LOS ETL Process")
 
 # if runAFE is true, run the AFE ETL process
@@ -64,11 +67,11 @@ afeData = pd.read_excel(os.path.join(pathToDatabase, r"afe_data.xlsx"))
 jibData = pd.read_excel(os.path.join(pathToDatabase, r"jib_data.xlsx"))
 revenueData = pd.read_excel(os.path.join(pathToDatabase, r"revenue_data.xlsx"))
 
-losData = los.formatLosData(jibData, revenueData)
-
-# generate P&L data for Power BI
-pnlData = los.generatePnlData(jibData, revenueData)
-pnlData.to_excel(os.path.join(pathToDatabase, r"pnl_data.xlsx"), index=False)
-print("P&L data exported to pnl_data.xlsx")
+# reconcile AFE vs JIB actuals and export Power BI-ready workbook
+if runAfeActual:
+    print("Running AFE vs Actual Reconciliation")
+    los.generateAfeActualReport(pathToAfeMaster, pathToJibMaster, pathToDatabase)
+else:
+    print("Skipping AFE vs Actual Reconciliation")
 
 print("Shalehaven LOS ETL Process Complete")
