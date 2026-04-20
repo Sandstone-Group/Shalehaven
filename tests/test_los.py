@@ -421,6 +421,104 @@ class TestCanonicalNamingInvariant:
         assert len(dims[dims["Project"] == "Ballard Petroleum"]) == 1
 
 
+class TestParseJibMajorDescription:
+    """Parser splits 'Major Description' into (Tax, Category) pairs."""
+
+    def test_intangible_drilling(self):
+        assert los.parseJibMajorDescription("Intangible Drilling") == ("Intangible", "Drilling")
+
+    def test_tangible_facility(self):
+        assert los.parseJibMajorDescription("Tangible Facility") == ("Tangible", "Facility")
+
+    def test_upper_case_with_suffix(self):
+        assert los.parseJibMajorDescription("INTANGIBLE DRILLING COSTS") == ("Intangible", "Drilling")
+        assert los.parseJibMajorDescription("TANGIBLE CONSTRUCTION COSTS") == ("Tangible", "Facility")
+
+    def test_abbreviated_forms(self):
+        assert los.parseJibMajorDescription("INTANGIBLE COMPL COST") == ("Intangible", "Completion")
+        assert los.parseJibMajorDescription("Intangible Completio") == ("Intangible", "Completion")
+
+    def test_capital_well_work_wins_over_facility(self):
+        # 'Facilty CWW' contains both FACIL and CWW — CWW must win
+        assert los.parseJibMajorDescription("Intangible Facilty CWW") == ("Intangible", "Capital Well Work")
+        assert los.parseJibMajorDescription("Tangible Capital Well Work") == ("Tangible", "Capital Well Work")
+
+    def test_tax_fallback_for_opex_rows(self):
+        # LOE / OPEX variants default to (Intangible, Overhead) — the user
+        # prefers one non-CAPEX bucket rather than splitting into OPEX.
+        for src in ("Lease Operating Expenses", "Lease Operating Expe",
+                    "LEASE OP EXPENSES (JIB850)", "LEASE OPERATING EXPENSE",
+                    "Operating Expense", "Lease Operations"):
+            tax, cat = los.parseJibMajorDescription(src)
+            assert tax == "Intangible", f"{src!r} -> {tax!r}"
+            assert cat == "Overhead", f"{src!r} -> {cat!r}"
+
+    def test_tax_fallback_for_exploratory(self):
+        assert los.parseJibMajorDescription("EXPLORATORY/APPRAISAL DRILL") == ("Intangible", "Drilling")
+        assert los.parseJibMajorDescription("EXPLORATORY/APPRAISAL COMPLETE") == ("Intangible", "Completion")
+
+    def test_tax_fallback_for_equipment_and_facilities(self):
+        assert los.parseJibMajorDescription("Equipment Costs") == ("Tangible", "Equipment")
+        assert los.parseJibMajorDescription("EXPLORE/APPRAISAL PRODUCTION FACILITIES") == ("Tangible", "Facility")
+        # Other Current Assets: tax-tagged but no category pin -> Overhead via catch-all
+        assert los.parseJibMajorDescription("Other Current Assets") == ("Tangible", "Overhead")
+
+    def test_tax_fallback_for_overhead(self):
+        assert los.parseJibMajorDescription("Comp Generated Copas Overhead") == ("Intangible", "Overhead")
+
+    def test_tax_fallback_for_afe_expenditures(self):
+        # No Minor passed -> catch-all kicks in and Category defaults to Overhead.
+        assert los.parseJibMajorDescription("AFE Expenditures") == ("Intangible", "Overhead")
+
+    def test_non_expense_rows_stay_none(self):
+        # Cash Call / Revenue aren't expense categories — no inference
+        assert los.parseJibMajorDescription("Cash Call") == (None, None)
+        assert los.parseJibMajorDescription("Revenue") == (None, None)
+
+    def test_safe_is_environmental_expense(self):
+        # SAFE in operator JIBs = safety/environmental expense (OPEX), not acronym.
+        # Single-row example: Friesian 3 Federal Com 1H, $118 environmental charge.
+        # Tax-tagged rows with no category pin default to Overhead via catch-all.
+        assert los.parseJibMajorDescription("SAFE") == ("Intangible", "Overhead")
+
+    def test_blank_inputs(self):
+        assert los.parseJibMajorDescription(None) == (None, None)
+        assert los.parseJibMajorDescription("") == (None, None)
+        assert los.parseJibMajorDescription("   ") == (None, None)
+
+    def test_minor_description_fills_category_when_major_is_generic(self):
+        # Hunt Oil "AFE Expenditures" has no category keyword; real signal
+        # is in Minor Description.
+        assert los.parseJibMajorDescription("AFE Expenditures", "Drllng Fluids-Prod&S") == ("Intangible", "Drilling")
+        assert los.parseJibMajorDescription("AFE Expenditures", "Eqpmnt-Facility Equ")  == ("Intangible", "Facility")
+        assert los.parseJibMajorDescription("AFE Expenditures", "Csd Hole Wirelne Ser") == ("Intangible", "Completion")
+        assert los.parseJibMajorDescription("AFE Expenditures", "Administrative OH")    == ("Intangible", "Overhead")
+        assert los.parseJibMajorDescription("AFE Expenditures", "ENVIRONMENTAL EXPENSE") == ("Intangible", "Overhead")
+        assert los.parseJibMajorDescription("AFE Expenditures", "Lease Brokerage Comm") == ("Intangible", "Land")
+        assert los.parseJibMajorDescription("AFE Expenditures", "Equipment - Wellhead") == ("Intangible", "Facility")
+        assert los.parseJibMajorDescription("AFE Expenditures", "Equipment - Casing")   == ("Intangible", "Completion")
+
+    def test_major_category_wins_over_minor(self):
+        # If Major Description already pins a category, Minor is ignored.
+        assert los.parseJibMajorDescription("Intangible Drilling", "Eqpmnt-Facility Equ") == ("Intangible", "Drilling")
+
+    def test_minor_without_tax_still_returns_category(self):
+        assert los.parseJibMajorDescription("SAFE", "ENVIRONMENTAL EXPENSE") == ("Intangible", "Overhead")
+
+    def test_unclassifiable_tax_tagged_rows_fall_back_to_overhead(self):
+        # Ambiguous Minor Descriptions on tax-tagged rows default to Overhead.
+        assert los.parseJibMajorDescription("AFE Expenditures", "Contract Labor")      == ("Intangible", "Overhead")
+        assert los.parseJibMajorDescription("AFE Expenditures", "Miscellaneous expens") == ("Intangible", "Overhead")
+        assert los.parseJibMajorDescription("AFE Expenditures", "Inspection Services")  == ("Intangible", "Overhead")
+        assert los.parseJibMajorDescription("AFE Expenditures", "Airfare")              == ("Intangible", "Overhead")
+        assert los.parseJibMajorDescription("AFE Expenditures", "Some Unknown Thing")   == ("Intangible", "Overhead")
+
+    def test_cash_call_and_revenue_stay_uncategorized(self):
+        # Non-expense rows don't get force-bucketed to Overhead.
+        assert los.parseJibMajorDescription("Cash Call", "Anything")    == (None, None)
+        assert los.parseJibMajorDescription("Revenue",   "Anything")    == (None, None)
+
+
 class TestOwnerInheritance:
     """AFE rows inherit Owner Name from JIB rows sharing the same Property
     Key. When multiple owners exist for a single well, the owner with the

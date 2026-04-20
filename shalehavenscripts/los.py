@@ -431,6 +431,185 @@ def normalizeOwnerName(val):
     return s or None
 
 
+_JIB_TAX_RE = re.compile(r"\b(INTANGIBLE|TANGIBLE)\b", re.IGNORECASE)
+
+# Tax fallback when neither INTANGIBLE nor TANGIBLE appears in the Major
+# Description. Applied in order; first match wins. Rationale per O&G
+# convention: expensed items (LOE, overhead, exploration) = Intangible;
+# capitalized items with salvage value (facilities, equipment, current
+# assets) = Tangible.
+_JIB_TAX_FALLBACKS = (
+    ("EQUIPMENT",            "Tangible"),
+    ("FACILITIES",           "Tangible"),
+    ("FACILITY",             "Tangible"),
+    ("OTHER CURRENT ASSETS", "Tangible"),
+    ("LEASE OPERATING",      "Intangible"),
+    ("LEASE OP EXPENSES",    "Intangible"),
+    ("LEASE OP",             "Intangible"),
+    ("LEASE OPERATIONS",     "Intangible"),
+    ("OPERATING EXPENSE",    "Intangible"),
+    ("OVERHEAD",             "Intangible"),
+    ("EXPLORATORY",          "Intangible"),
+    ("EXPLORE",              "Intangible"),
+    ("AFE EXPENDITURES",     "Intangible"),
+    # "SAFE" in operator JIB files = safety/environmental expense (not
+    # acronym), always OPEX -> Intangible. Exact-match only so we don't
+    # accidentally catch future codes that happen to contain the substring.
+    ("SAFE",                 "Intangible"),
+)
+
+# Order matters: more specific categories first (CWW before FACIL so
+# "Facilty CWW" resolves to Capital Well Work, not Facility). Operating
+# Expense variants fold into Overhead — the user prefers one bucket for
+# all non-CAPEX cost, not two.
+_JIB_CATEGORY_MAP = (
+    ("CWW",                  "Capital Well Work"),
+    ("CAPITAL WELL",         "Capital Well Work"),
+    ("DRILL",                "Drilling"),
+    ("COMPL",                "Completion"),
+    ("FACIL",                "Facility"),
+    ("CONSTRUCT",            "Facility"),
+    ("OVERHEAD",             "Overhead"),
+    ("LEASE OPERATING",      "Overhead"),
+    ("LEASE OP",             "Overhead"),
+    ("LEASE OPERATIONS",     "Overhead"),
+    ("OPERATING EXPENSE",    "Overhead"),
+    ("PRODUCTION",           "Production"),
+    ("EQUIPMENT",            "Equipment"),
+)
+
+# When Major Description doesn't pin down a Category (e.g. Hunt Oil's generic
+# "AFE Expenditures"), fall back to Minor Description — it carries the real
+# cost classification. Matched substring -> Category. Order matters: more
+# specific patterns first.
+_JIB_MINOR_CATEGORY_MAP = (
+    # Capital Well Work first (so "workover rig" doesn't match the Drilling block)
+    ("WORKOVER",             "Capital Well Work"),
+    ("WRKOVR",               "Capital Well Work"),
+    # Drilling
+    ("DOWNHOLE",             "Drilling"),
+    ("DWNHOLE",              "Drilling"),
+    ("DOWN HOLE",            "Drilling"),
+    ("RIG MOB",              "Drilling"),
+    ("RIG DEMOB",            "Drilling"),
+    ("MUD ",                 "Drilling"),
+    ("DRILL",                "Drilling"),
+    ("DRLLNG",               "Drilling"),
+    ("CHEMICAL",             "Drilling"),
+    # Completion (COMPL catches truncations like "Compltn")
+    ("WIRELINE",             "Completion"),
+    ("WIRELNE",              "Completion"),
+    ("CASING",               "Completion"),
+    ("CEMENT",               "Completion"),
+    ("PERFORAT",             "Completion"),
+    ("COMPLET",              "Completion"),
+    ("COMPL",                "Completion"),
+    ("FRAC",                 "Completion"),
+    ("STIMULAT",             "Completion"),
+    ("TUBING",               "Completion"),
+    # Facility (more specific before less specific)
+    ("WELLHEAD",             "Facility"),
+    ("WLLHD",                "Facility"),
+    ("WELL CNSTR",           "Facility"),
+    ("FACILITY",             "Facility"),
+    ("FACILT",               "Facility"),
+    ("FACIL",                "Facility"),
+    ("CONSTRUCT",            "Facility"),
+    ("CNSTR",                "Facility"),
+    ("ROAD",                 "Facility"),
+    ("VALVE",                "Facility"),
+    ("FITTING",              "Facility"),
+    ("FITTNG",               "Facility"),
+    ("INSTRUMENT",           "Facility"),
+    ("TANK BATTERY",         "Facility"),
+    ("TANK",                 "Facility"),
+    ("BATTERY",              "Facility"),
+    ("WELDING",              "Facility"),
+    ("PIPELINE",             "Facility"),
+    ("ELECTRIC",             "Facility"),
+    # Land
+    ("RIGHTS OF WAY",        "Land"),
+    ("EASEMENT",             "Land"),
+    ("PERMIT",               "Land"),
+    ("BROKERAGE",            "Land"),
+    ("SURVEY",               "Land"),
+    ("TITLE",                "Land"),
+    ("LAND",                 "Land"),
+    ("LEASE",                "Land"),
+    # Overhead — includes everything that used to be "Operating Expense"
+    # plus travel, generic labor/services/fees, and anything else ambiguous.
+    ("OVERHEAD",             "Overhead"),
+    ("ADMIN",                "Overhead"),
+    ("CONSULTANT",           "Overhead"),
+    ("CONSULTING",           "Overhead"),
+    ("SUBSCRIPT",            "Overhead"),
+    ("EMPLOYEE",             "Overhead"),
+    ("CLIENT",               "Overhead"),
+    ("PRINTED",              "Overhead"),
+    ("ENVIRONMENT",          "Overhead"),
+    ("TRANSPORT",            "Overhead"),
+    ("WASTE",                "Overhead"),
+    ("WATER",                "Overhead"),
+    ("FUEL",                 "Overhead"),
+    ("SAFETY",               "Overhead"),
+    ("EHS",                  "Overhead"),
+    ("AIRFARE",              "Overhead"),
+    ("HOTEL",                "Overhead"),
+    ("LODGING",              "Overhead"),
+    ("TRAVEL",               "Overhead"),
+    ("AUTO ",                "Overhead"),
+    ("MEETING",              "Overhead"),
+    ("BOOKS",                "Overhead"),
+    ("CONTRACT LABOR",       "Overhead"),
+    ("CO LABR",              "Overhead"),
+    ("INSPECTION",           "Overhead"),
+    ("FEES",                 "Overhead"),
+    ("MISCELLANEOUS",        "Overhead"),
+    ("MISC ",                "Overhead"),
+)
+
+
+def parseJibMajorDescription(major, minor=None):
+    """Derive (Tax, Category) from JIB Major Description, using Minor
+    Description as Category fallback. Handles casings, spellings, OPEX
+    variants, and Hunt Oil's generic `AFE Expenditures` label whose real
+    category signal lives in Minor Description:
+      ('Intangible Drilling', any)          -> ('Intangible', 'Drilling')
+      ('TANGIBLE CONSTRUCTION', any)        -> ('Tangible',   'Facility')
+      ('Intangible Facilty CWW', any)       -> ('Intangible', 'Capital Well Work')
+      ('Lease Operating Expenses', any)     -> ('Intangible', 'Operating Expense')
+      ('AFE Expenditures', 'Drllng Fluids') -> ('Intangible', 'Drilling')
+      ('AFE Expenditures', 'Administrative OH') -> ('Intangible', 'Overhead')
+      ('Cash Call' / 'Revenue', any)        -> (None, None)  # not an expense
+    """
+    if _isBlank(major):
+        return (None, None)
+    s = str(major).upper()
+    taxMatch = _JIB_TAX_RE.search(s)
+    tax = taxMatch.group(1).title() if taxMatch else None
+    if tax is None:
+        for needle, fallbackTax in _JIB_TAX_FALLBACKS:
+            if needle in s:
+                tax = fallbackTax
+                break
+    category = None
+    for needle, label in _JIB_CATEGORY_MAP:
+        if needle in s:
+            category = label
+            break
+    if category is None and not _isBlank(minor):
+        minorUpper = str(minor).upper()
+        for needle, label in _JIB_MINOR_CATEGORY_MAP:
+            if needle in minorUpper:
+                category = label
+                break
+    # Anything tax-tagged but still unclassified is Overhead per operator
+    # convention. Cash Call / Revenue (tax=None) legitimately stay None.
+    if category is None and tax is not None:
+        category = "Overhead"
+    return (tax, category)
+
+
 def _normalizeOperatorKey(val):
     """Normalize an operator legal name for OPERATOR_TO_PROJECT lookup.
     Uppercase; commas -> spaces (so 'ENERGY, LLC' stays two tokens);
@@ -1014,6 +1193,19 @@ def generateAfeActualReport(afeMasterPath=None, jibMasterPath=None, outputDir=No
             )
             ownerByKey = dict(zip(ranked["Property Key"], ranked["Owner Name"]))
 
+    # JIB Major Description encodes Tax + Category as one string; split it
+    # so both sides have the same three-column structure. Minor Description
+    # is passed as Category fallback (Hunt Oil's generic "AFE Expenditures"
+    # Major Description has no Category keyword, but the Minor does).
+    jibMajor = jib.get("Major Description", pd.Series([None] * len(jib)))
+    jibMinor = jib.get("Minor Description", pd.Series([None] * len(jib)))
+    jibParsed = pd.Series(
+        [parseJibMajorDescription(m, n) for m, n in zip(jibMajor, jibMinor)],
+        index=jib.index,
+    )
+    jibTax = jibParsed.apply(lambda t: t[0])
+    jibCategory = jibParsed.apply(lambda t: t[1])
+
     afeFacts = pd.DataFrame({
         "Source": "AFE",
         "AFE Number": afe["AFE Key"],
@@ -1023,8 +1215,9 @@ def generateAfeActualReport(afeMasterPath=None, jibMasterPath=None, outputDir=No
         "Property Name": afe["Well Name"],
         "Property Name (Normalized)": afe["Property Name (Normalized)"],
         "Owner Name": afe["Property Key"].map(ownerByKey),
+        "Tax": afe.get("Tax"),
         "Category": afe.get("Bucketing"),
-        "Sub Category": afe.get("Tax"),
+        "Sub Category": afe.get("Description"),
         "Description": afe.get("Description"),
         "Gross Amount": afe.get("Gross Cost"),
         "Working Interest": afe.get("Working Interest"),
@@ -1043,7 +1236,8 @@ def generateAfeActualReport(afeMasterPath=None, jibMasterPath=None, outputDir=No
         "Property Name": jib["Property Name"],
         "Property Name (Normalized)": jib["Property Name (Normalized)"],
         "Owner Name": jib.get("Owner Name"),
-        "Category": jib.get("Major Description"),
+        "Tax": jibTax,
+        "Category": jibCategory,
         "Sub Category": jib.get("Minor Description"),
         "Description": jib.get("AFE Description"),
         "Gross Amount": jib.get("Gross Invoiced"),
@@ -1067,11 +1261,10 @@ def generateAfeActualReport(afeMasterPath=None, jibMasterPath=None, outputDir=No
     facts["Has Both AFE and JIB"] = facts["_Property Key"].isin(bothKeys)
     facts = facts.drop(columns=["_Property Key"])
 
-    # put the split amounts directly after Net Amount, before Invoice Date
     colOrder = [
         "Source", "AFE Number", "AFE Number (Raw)", "Project", "Operator (Legal)",
         "Property Name", "Property Name (Normalized)", "Owner Name",
-        "Category", "Sub Category", "Description",
+        "Tax", "Category", "Sub Category", "Description",
         "Gross Amount", "Working Interest", "Net Amount",
         "AFE Gross Amount", "AFE Net Amount",
         "Actual Gross Amount", "Actual Net Amount",
