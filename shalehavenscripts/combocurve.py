@@ -1,13 +1,14 @@
 import pandas as pd
-import numpy as np
-import requests as requests
+import requests
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from dotenv import load_dotenv
 from combocurve_api_v1 import ComboCurveAuth, ServiceAccount
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import os
+
+MISSING_CHOSEN_ID = "123456789"
 
 
 """
@@ -99,28 +100,14 @@ class ComboCurveClient:
 
 def putDataComboCurveDaily(client, data):
 
-    cleanComboCurveData = data
-
-    # drop all rows with chosenId = 123456789
-    cleanComboCurveData = cleanComboCurveData[cleanComboCurveData["chosenID"] != "123456789"]
-    ##drop index column
+    cleanComboCurveData = data.copy()
+    cleanComboCurveData = cleanComboCurveData[cleanComboCurveData["chosenID"] != MISSING_CHOSEN_ID]
     cleanComboCurveData = cleanComboCurveData.reset_index(drop=True)
 
-    ## conver date to YYYY-MM-DD
-    cleanComboCurveData["date"] = pd.to_datetime(cleanComboCurveData["date"])
-    cleanComboCurveData["date"] = cleanComboCurveData["date"].dt.strftime("%Y-%m-%d")
-    ## convert date to string
-    cleanComboCurveData["date"] = cleanComboCurveData["date"].astype(str)
-    ## convert API to string
+    cleanComboCurveData["date"] = pd.to_datetime(cleanComboCurveData["date"]).dt.strftime("%Y-%m-%d")
     cleanComboCurveData["chosenID"] = cleanComboCurveData["chosenID"].astype(str)
 
-
-    totalAssetProductionJson = cleanComboCurveData.to_json(
-        orient="records"
-    )  # converts to internal json format
-
-    # loads json into format that can be sent to ComboCurve
-    cleanTotalAssetProduction = json.loads(totalAssetProductionJson)
+    cleanTotalAssetProduction = json.loads(cleanComboCurveData.to_json(orient="records"))
 
     response = client.put("/v1/daily-productions", json=cleanTotalAssetProduction)
 
@@ -132,11 +119,7 @@ def putDataComboCurveDaily(client, data):
     if failedCount > 0:
         print("Errors: " + str(responseJson.get("results", []))[:500])
 
-    print(
-        "Finished PUT "
-        + str(len(cleanTotalAssetProduction))
-        + " Rows of New Production Data to ComboCurve from JOYN"
-    )
+    print(f"Finished PUT {len(cleanTotalAssetProduction)} Rows of New Production Data to ComboCurve")
 
     return text
 
@@ -148,12 +131,7 @@ def putDataComboCurveDaily(client, data):
 
 def putDataComboCurveMonthly(client, data):
 
-    totalAssetProductionJson = data.to_json(
-        orient="records"
-    )  # converts to internal json format
-
-    # loads json into format that can be sent to ComboCurve
-    cleanTotalAssetProduction = json.loads(totalAssetProductionJson)
+    cleanTotalAssetProduction = json.loads(data.to_json(orient="records"))
 
     response = client.put("/v1/monthly-productions", json=cleanTotalAssetProduction)
 
@@ -165,11 +143,7 @@ def putDataComboCurveMonthly(client, data):
     if failedCount > 0:
         print("Errors: " + str(responseJson.get("results", []))[:500])
 
-    print(
-        "Finished PUT "
-        + str(len(cleanTotalAssetProduction))
-        + " Rows of New Production Data to ComboCurve from JOYN"
-    )
+    print(f"Finished PUT {len(cleanTotalAssetProduction)} Rows of New Production Data to ComboCurve")
 
     return text
 
@@ -211,18 +185,15 @@ def getDailyProductionFromComboCurve(client, wellList, pathToDatabase):
 
     dailyProductionsDf = pd.DataFrame(all_daily_productions)
 
-    # filter dailyProductionsDf by wellList chosenID
     dailyProductionsDf = dailyProductionsDf[dailyProductionsDf["well"].isin(wellList["id"])]
 
-    # add wellName and API column to dailyProductionsDf by matching well in dailyProductionsDf with id in wellList not using merge
-    dailyProductionsDf["wellName"] = dailyProductionsDf["well"].map(wellList.set_index("id")["wellName"])
-    dailyProductionsDf["API"] = dailyProductionsDf["well"].map(wellList.set_index("id")["chosenID"])
+    wellIdx = wellList.set_index("id")
+    dailyProductionsDf["wellName"] = dailyProductionsDf["well"].map(wellIdx["wellName"])
+    dailyProductionsDf["API"] = dailyProductionsDf["well"].map(wellIdx["chosenID"])
 
-    # drop createdAt, updatedAt columns
     dailyProductionsDf = dailyProductionsDf.drop(columns=["createdAt", "updatedAt"])
 
     dailyProductionsDf.to_excel(os.path.join(pathToDatabase, r"daily_production.xlsx"))
-
 
     print("Finished Getting Daily Productions from ComboCurve")
 
@@ -246,64 +217,45 @@ def getDailyForecastFromComboCurve(client, projectId, forecastId, wellList):
 
     print(f"Successfully fetched {len(all_daily_forecasts)} daily forecasts from ComboCurve")
 
-    # Initialize lists to store DataFrame data
-    wells = []
-    dates = []
-    phases = []
-    volumes = []
+    wells, dates, phases, volumes = [], [], [], []
 
     for entry in all_daily_forecasts:
         wellId = entry["well"]
         for phaseData in entry["phases"]:
             phase = phaseData["phase"]
-            series = phaseData["series"][0] # Assuming best series
+            series = phaseData["series"][0]  # best series
             startDate = datetime.strptime(series["startDate"], "%Y-%m-%dT%H:%M:%S.%fZ")
             endDate = datetime.strptime(series["endDate"], "%Y-%m-%dT%H:%M:%S.%fZ")
             volumeList = series["volumes"]
 
-            # generate dates from startDate to endDate
-            currentDate = startDate
-            dayIndex = 0
-            while currentDate <= endDate:
-                wells.append(wellId)
-                dates.append(currentDate)
-                phases.append(phase)
-                # assigned volume if avaiable, else 0
-                volume = volumeList[dayIndex] if dayIndex < len(volumeList) else 0
-                volumes.append(volume)
+            dateRange = pd.date_range(startDate, endDate, freq="D")
+            n = len(dateRange)
+            paddedVolumes = list(volumeList[:n]) + [0] * max(0, n - len(volumeList))
 
-                currentDate += timedelta(days=1)
-                dayIndex += 1
+            wells.extend([wellId] * n)
+            dates.extend(dateRange)
+            phases.extend([phase] * n)
+            volumes.extend(paddedVolumes)
 
-    # Create DataFrame from lists
     dailyForecastDf = pd.DataFrame({
         "well": wells,
         "date": dates,
         "phase": phases,
-        "volume": volumes
+        "volume": volumes,
     })
 
-    # add wellName and API column by matching wellId with wellList
-    dailyForecastDf["wellName"] = dailyForecastDf["well"].map(wellList.set_index("id")["wellName"])
-    dailyForecastDf["API"] = dailyForecastDf["well"].map(wellList.set_index("id")["chosenID"])
+    wellIdx = wellList.set_index("id")
+    dailyForecastDf["wellName"] = dailyForecastDf["well"].map(wellIdx["wellName"])
+    dailyForecastDf["API"] = dailyForecastDf["well"].map(wellIdx["chosenID"])
 
-    # Pivot the DataFrame to have separate columns for oil, gas, and water, well, date, wellName, API
     pivotDailyForecast = dailyForecastDf.pivot_table(
         index=["date", "well", "wellName", "API"],
         columns=["phase"],
         values="volume",
-        fill_value=0
+        fill_value=0,
     ).reset_index()
 
-    # Rename columns to match requested format
-    pivotDailyForecast.columns.name = None  # Remove the pivot_table column name
-    pivotDailyForecast = pivotDailyForecast.rename(columns={
-        "oil": "oil",
-        "gas": "gas",
-        "water": "water"
-    })
-
-    # Reorder columns to match requested order
+    pivotDailyForecast.columns.name = None
     pivotDailyForecast = pivotDailyForecast[["date", "well", "oil", "gas", "water", "wellName", "API"]]
 
     print("Finished Getting Daily Forecast from ComboCurve")

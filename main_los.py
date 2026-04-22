@@ -21,6 +21,7 @@ warnings.simplefilter(action='ignore', category=UserWarning)
 load_dotenv()  # load enviroment variables
 
 # path to AFE data
+pathToAfe2026 = os.getenv("SHALEHAVEN_AFE_2026_PATH")
 pathToAfe2025 = os.getenv("SHALEHAVEN_AFE_2025_PATH")
 pathToAfe2024 = os.getenv("SHALEHAVEN_AFE_2024_PATH")
 pathToJib = os.getenv("SHALEHAVEN_JIB_PATH")
@@ -39,10 +40,11 @@ print("Begin Shalehaven LOS ETL Process")
 # if runAFE is true, run the AFE ETL process
 if runAfe:
     print("Running AFE ETL Process")
+    afeData2026 = los.combineAfeData(pathToAfe2026)
     afeData2025 = los.combineAfeData(pathToAfe2025)
     afeData2024 = los.combineAfeData(pathToAfe2024)
-    # combine afeData2025 and afeData2024 into a single dataframe called afeData
-    afeData = pd.concat([afeData2025, afeData2024], ignore_index=True)
+    # combine afeData2026, afeData2025, and afeData2024 into a single dataframe called afeData
+    afeData = pd.concat([afeData2026, afeData2025, afeData2024], ignore_index=True)
     # save afeData to database
     afeData.to_excel(os.path.join(pathToDatabase, r"afe_data.xlsx"), index=False)
 else:

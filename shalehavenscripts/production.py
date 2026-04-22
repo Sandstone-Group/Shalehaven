@@ -4,92 +4,60 @@ from dotenv import load_dotenv
 import os
 import re
 
-pathToDatabase = os.getenv("SANDSTONE_DATABASE_PATH")
+load_dotenv()
+
+COMBOCURVE_COLUMNS = ["date", "chosenID", "oil", "gas", "water", "dataSource"]
+
+_WELL_NUM_RE = re.compile(r'#?0*(\d+)[Hh]\s*$')
+
+
+def _latest_file_in_dir(path):
+    return max(
+        (os.path.join(path, f) for f in os.listdir(path)),
+        key=os.path.getmtime,
+    )
+
 
 """
-    
-Script to import production data and format for ComboCurve upload. For Admiral Permian wells in 2024 LP portfolio.    
-    
+
+Script to import production data and format for ComboCurve upload. For Admiral Permian wells in 2024 LP portfolio.
+
 """
 
 def admiralPermianProductionData(pathToData):
 
     print("Getting Admiral Permian Production Data")
 
-    load_dotenv()  # load enviroment variables
-    
-    # Update path to include the last file in the directory based on time modified
-    pathToData = max([os.path.join(pathToData, f) for f in os.listdir(pathToData)], key=os.path.getmtime)
-    
-    data = pd.read_excel(pathToData)    
-    
-    # remove dashes in API, add 4 trailing zeros at the end to make 14 characters and convert to string
-    data['API'] = data['API'].str.replace('-','') + '0000'
+    pathToData = _latest_file_in_dir(pathToData)
+
+    data = pd.read_excel(pathToData)
+
+    # API comes in with dashes; strip them and pad to 14 chars
+    data['API'] = data['API'].str.replace('-', '') + '0000'
     data['API'] = data['API'].astype(str)
-    
-    # drop all rows with "nan" API
     data = data[data['API'] != "nan"]
-    
-    
-    # keep only columns: Date, API, Oil, Gas, Water
+
     data = data[['Date', 'API', 'Oil Prod', 'Gas Prod', 'Water Prod']]
-    
-    # add new column to data called 'dataSource' and set all values to "other" 
     data['dataSource'] = "other"
-    
-    columnsComboCurve = [
-        "date",
-        "chosenID",
-        "oil",
-        "gas",
-        "water",
-        "dataSource",
-    ]
-    
-    data.columns = columnsComboCurve
-    
+    data.columns = COMBOCURVE_COLUMNS
+
     return data
 
 def huntOilProductionData(pathToData, huntWells):
-    
+
     print("Getting Hunt Oil Production Data")
-    
-    load_dotenv()  # load enviroment variables
-    
-    #drop all columns from huntWells except for 'wellName' and 'chosenID'
-    huntWells = huntWells[['wellName','chosenID']]
-    
-    # Update path to include the last file in the directory based on time modified
-    pathToData = max([os.path.join(pathToData, f) for f in os.listdir(pathToData)], key=os.path.getmtime)
-    
-    # read in excel data
+
+    pathToData = _latest_file_in_dir(pathToData)
+
     data = pd.read_excel(pathToData)
-    
-    # put chosenID from huntWells into data based on wellName
-    for i in range(len(huntWells)):
-        wellName = huntWells.iloc[i]['wellName']
-        chosenId = huntWells.iloc[i]['chosenID']
-        for j in range(len(data)):
-            dataWellName = data.iloc[j]['LEASE']
-            if dataWellName == wellName:
-                data["API"] = data["API"].astype(str)
-                data.loc[j, 'API'] = chosenId
-    
+
+    nameToChosenId = dict(zip(huntWells['wellName'], huntWells['chosenID']))
+    data['API'] = data['API'].astype(str)
+    data['API'] = data['LEASE'].map(nameToChosenId).fillna(data['API'])
+
     data = data[['D_DATE', 'API', 'OIL_BBLS', 'GAS_MCF', 'WATER_BBLS']]
-    
-    # add new column to data called 'dataSource' and set all values to "other" 
     data['dataSource'] = "other"
-    
-    columnsComboCurve = [
-        "date",
-        "chosenID",
-        "oil",
-        "gas",
-        "water",
-        "dataSource",
-    ]
-    
-    data.columns = columnsComboCurve
+    data.columns = COMBOCURVE_COLUMNS
 
     return data
 
@@ -100,37 +68,19 @@ Get Aethon Production Data
 """
 
 def aethonProductionData(pathToData):
-    
+
     print("Getting Aethon Production Data")
 
-    load_dotenv()  # load enviroment variables
-    
-    # Update path to include the last file in the directory based on time modified
-    pathToData = max([os.path.join(pathToData, f) for f in os.listdir(pathToData)], key=os.path.getmtime)
-    
-    data = pd.read_csv(pathToData) 
-    
+    pathToData = _latest_file_in_dir(pathToData)
+
+    data = pd.read_csv(pathToData)
     data['API'] = data['API'].astype(str)
-    
-    # drop operatorID rows that are not 9724
     data = data[data['OperatorID'] == 9724]
-    
+
     data = data[['Production Date', 'API', 'Oil Production', 'Gas Production', 'Water Production']]
-    
-    # add new column to data called 'dataSource' and set all values to "other"
     data['dataSource'] = "other"
-    
-    columnsComboCurve = [
-        "date",
-        "chosenID",
-        "oil",
-        "gas",
-        "water",
-        "dataSource",
-    ]
-    
-    data.columns = columnsComboCurve
-    
+    data.columns = COMBOCURVE_COLUMNS
+
     return data
 
 """
@@ -140,69 +90,26 @@ Get Devon Production Data - PDS
 """
 
 def devonProductionData(pathToData):
-    
+
     print("Getting Devon Production Data")
 
-    load_dotenv()  # load enviroment variables
-    
-    # Update path to include the last file in the directory based on time modified
-    pathToData = max([os.path.join(pathToData, f) for f in os.listdir(pathToData)], key=os.path.getmtime)
-    
-    ### get file name
+    pathToData = _latest_file_in_dir(pathToData)
     name = os.path.basename(pathToData)
-    # if starts with "PDSWDX"
-    if name.startswith("PDSWDX"):
-        data = pd.read_csv(pathToData) 
-        
-        # drop last row
-        data = data[:-1]
-        
-        data['API'] = data['API'].astype(str)
-        #drop last two characters from API
-        data['API'] = data['API'].str[:-2]
-        # add two more trailing zeros to API
-        data['API'] = data['API'] + '00'
 
+    if name.startswith("PDSWDX"):
+        data = pd.read_csv(pathToData)
+        data = data[:-1]
+        data['API'] = data['API'].astype(str).str[:-2] + '00'
         data = data[['Prod Date', 'API', 'Oil Prod', 'Gas Prod', 'Water Prod']]
-        
-        # add new column to data called 'dataSource' and set all values to "other"
-        data['dataSource'] = "other"
-        
-        columnsComboCurve = [
-            "date",
-            "chosenID",
-            "oil",
-            "gas",
-            "water",
-            "dataSource",
-        ]
-        
-        data.columns = columnsComboCurve
     else:
-        
-        data = pd.read_csv(pathToData) 
-    
+        data = pd.read_csv(pathToData)
         data['API'] = data['API'].astype(str)
-        
-        # drop operatorID rows that are not 9724
         data = data[data['OperatorID'] == 1014]
-        
         data = data[['Production Date', 'API', 'Oil Production', 'Gas Production', 'Water Production']]
-        
-        # add new column to data called 'dataSource' and set all values to "other"
-        data['dataSource'] = "other"
-        
-        columnsComboCurve = [
-            "date",
-            "chosenID",
-            "oil",
-            "gas",
-            "water",
-            "dataSource",
-        ]
-        
-        data.columns = columnsComboCurve
-    
+
+    data['dataSource'] = "other"
+    data.columns = COMBOCURVE_COLUMNS
+
     return data
 
 """
@@ -214,66 +121,25 @@ Get COP Production Data - PDS
 def copProductionData(pathToData):
     print("Getting ConocoPhillips Production Data")
 
-    load_dotenv()  # load enviroment variables
-    
-    # Update path to include the last file in the directory based on time modified
-    pathToData = max([os.path.join(pathToData, f) for f in os.listdir(pathToData)], key=os.path.getmtime)
-    
-    ### get file name
+    pathToData = _latest_file_in_dir(pathToData)
     name = os.path.basename(pathToData)
-    # if starts with "PDSWDX"
-    if name.startswith("PDSWDX"):
-        data = pd.read_csv(pathToData) 
-        
-        # drop last row
-        data = data[:-1]
-        
-        data['API'] = data['API'].astype(str)
-        #drop last two characters from API
-        data['API'] = data['API'].str[:-2]
-        # add two more trailing zeros to API
-        data['API'] = data['API'] + '00'
 
+    if name.startswith("PDSWDX"):
+        data = pd.read_csv(pathToData)
+        data = data[:-1]
+        data['API'] = data['API'].astype(str).str[:-2] + '00'
         data = data[['PRODDATE', 'API', 'OIL PROD', 'GAS PROD', 'WATER PROD']]
-        
-        # add new column to data called 'dataSource' and set all values to "other"
-        data['dataSource'] = "other"
-        
-        columnsComboCurve = [
-            "date",
-            "chosenID",
-            "oil",
-            "gas",
-            "water",
-            "dataSource",
-        ]
-        
-        data.columns = columnsComboCurve
     else:
-        
-        data = pd.read_csv(pathToData) 
-    
+        data = pd.read_csv(pathToData)
         data['API'] = data['API'].astype(str)
-        
-        # drop operatorID rows that are not 9724
+        # NOTE: both devonProductionData and copProductionData filter OperatorID==1014;
+        # one of these is likely wrong — verify against the PDS operator ID for COP.
         data = data[data['OperatorID'] == 1014]
-        
         data = data[['Production Date', 'API', 'Oil Production', 'Gas Production', 'Water Production']]
-        
-        # add new column to data called 'dataSource' and set all values to "other"
-        data['dataSource'] = "other"
-        
-        columnsComboCurve = [
-            "date",
-            "chosenID",
-            "oil",
-            "gas",
-            "water",
-            "dataSource",
-        ]
-        
-        data.columns = columnsComboCurve
-    
+
+    data['dataSource'] = "other"
+    data.columns = COMBOCURVE_COLUMNS
+
     return data
 
 """
@@ -286,17 +152,20 @@ def spurProductionData(pathToData, wellMapping):
 
     print("Getting Spur Energy Production Data")
 
-    load_dotenv()  # load enviroment variables
-
-    # Update path to include the last file in the directory based on time modified
-    pathToData = max([os.path.join(pathToData, f) for f in os.listdir(pathToData)], key=os.path.getmtime)
+    pathToData = _latest_file_in_dir(pathToData)
 
     data = pd.read_excel(pathToData, header=1)
 
+    # Pre-index well mapping by trailing well-number (e.g. "01H" → 1) so header
+    # rows with different zero-padding still match.
+    keyByWellNum = {}
+    for key in wellMapping:
+        m = _WELL_NUM_RE.search(key)
+        if m:
+            keyByWellNum[int(m.group(1))] = key
+
     rows = []
     current_chosen_id = None
-
-    mapping_keys = list(wellMapping.keys())
 
     for _, row in data.iterrows():
         cell = row['Unit Name/Date']
@@ -305,19 +174,12 @@ def spurProductionData(pathToData, wellMapping):
             if well_name in wellMapping:
                 current_chosen_id = wellMapping[well_name]
             else:
-                # extract trailing well number (e.g. "01H" -> 1, "#001H" -> 1)
-                excel_num = re.search(r'#?0*(\d+)[Hh]\s*$', well_name)
-                matched = False
-                if excel_num:
-                    target = int(excel_num.group(1))
-                    for key in mapping_keys:
-                        key_num = re.search(r'#?0*(\d+)[Hh]\s*$', key)
-                        if key_num and int(key_num.group(1)) == target:
-                            print(f"  Matched '{well_name}' -> '{key}'")
-                            current_chosen_id = wellMapping[key]
-                            matched = True
-                            break
-                if not matched:
+                excel_num = _WELL_NUM_RE.search(well_name)
+                matched_key = keyByWellNum.get(int(excel_num.group(1))) if excel_num else None
+                if matched_key:
+                    print(f"  Matched '{well_name}' -> '{matched_key}'")
+                    current_chosen_id = wellMapping[matched_key]
+                else:
                     print(f"  Warning: No match found for '{well_name}' in wellMapping")
                     current_chosen_id = None
         elif current_chosen_id is not None:
@@ -330,9 +192,7 @@ def spurProductionData(pathToData, wellMapping):
                 'dataSource': 'other',
             })
 
-    data = pd.DataFrame(rows, columns=['date', 'chosenID', 'oil', 'gas', 'water', 'dataSource'])
-    
-    return data
+    return pd.DataFrame(rows, columns=COMBOCURVE_COLUMNS)
 
 """
 
@@ -341,38 +201,22 @@ Convert Ballard Petroleum Production Data from ProdView excel to ComboCurve Mont
 """
 
 def ballardProductionData(pathToData):
-    
+
     print("Getting Ballard Petroleum Production Data")
-    
-    load_dotenv()  # load enviroment variables
-    
-    # Update path to include the last file in the directory based on time modified
-    pathToData = max([os.path.join(pathToData, f) for f in os.listdir(pathToData)], key=os.path.getmtime)
-    
-    data = pd.read_excel(pathToData) # read in excel data
-    
-    data = data[['RecordDate', 'API10', 'EstimatedOilProductionBBLS', 'EstimatedGasProductionMCF', 'EstimatedWaterProductionBBLS']] 
-    
-    # format API to be 14 characters by dropping leading zeros and adding trailing zeros if necessary, then convert to string
+
+    pathToData = _latest_file_in_dir(pathToData)
+
+    data = pd.read_excel(pathToData)
+
+    data = data[['RecordDate', 'API10', 'EstimatedOilProductionBBLS', 'EstimatedGasProductionMCF', 'EstimatedWaterProductionBBLS']]
+
+    # API10 arrives as float (trailing .0); strip leading zeros and '.0', then pad to 14 chars
     data['API'] = data['API10'].astype(str).str.lstrip('0').str.replace('.0', '', regex=False) + '0000'
-    data['API'] = data['API'].astype(str)
-    # add new column to data called 'dataSource' and set all values to "other"
     data['dataSource'] = "other"
 
-    # reorder columns to match ComboCurve format
     data = data[['RecordDate', 'API', 'EstimatedOilProductionBBLS', 'EstimatedGasProductionMCF', 'EstimatedWaterProductionBBLS', 'dataSource']]
+    data.columns = COMBOCURVE_COLUMNS
 
-    columnsComboCurve = [
-        "date",
-        "chosenID",
-        "oil",
-        "gas",
-        "water",
-        "dataSource",
-    ]
-
-    data.columns = columnsComboCurve
-    
     return data
 
 """
@@ -381,14 +225,15 @@ Gets Kraken Resources Production Data from  excel and converts to ComboCurve Mon
 
 """
 
+def _normalizeWellName(s):
+    return s.strip().upper().replace("#", "")
+
+
 def krakenProductionData(pathToData, wellMapping):
 
     print("Getting Kraken Resources Production Data")
 
-    load_dotenv()
-
-    # Update path to include the last file in the directory based on time modified
-    pathToData = max([os.path.join(pathToData, f) for f in os.listdir(pathToData)], key=os.path.getmtime)
+    pathToData = _latest_file_in_dir(pathToData)
 
     raw = pd.read_excel(pathToData, sheet_name="actual-size", header=None)
 
@@ -397,31 +242,18 @@ def krakenProductionData(pathToData, wellMapping):
     well_row = raw.iloc[2]
     data_rows = raw.iloc[4:].reset_index(drop=True)
 
-    rows = []
-    # Walk the well name row in steps of 3 starting at col 1
+    wellMappingNorm = {_normalizeWellName(k): v for k, v in wellMapping.items()}
+
     well_cols = [(i, str(well_row.iloc[i])) for i in range(1, len(well_row), 3)
                  if pd.notna(well_row.iloc[i]) and "Total" not in str(well_row.iloc[i])]
 
+    rows = []
     for col_idx, well_name in well_cols:
-        well_name_upper = well_name.strip().upper()
-
-        # Skip Delores — not our well
-        if "DELORES" in well_name_upper:
+        if "DELORES" in well_name.upper():
             print(f"  Skipping {well_name} (not our well)")
             continue
 
-        # Match to ComboCurve chosenID via wellMapping
-        # Normalize: strip whitespace, remove '#', case-insensitive
-        def _normalize(s):
-            return s.strip().upper().replace("#", "")
-
-        chosen_id = wellMapping.get(well_name.strip())
-        if chosen_id is None:
-            norm = _normalize(well_name)
-            for k, v in wellMapping.items():
-                if _normalize(k) == norm:
-                    chosen_id = v
-                    break
+        chosen_id = wellMapping.get(well_name.strip()) or wellMappingNorm.get(_normalizeWellName(well_name))
         if chosen_id is None:
             print(f"  Warning: No match found for '{well_name}' in wellMapping, skipping")
             continue
@@ -434,19 +266,16 @@ def krakenProductionData(pathToData, wellMapping):
                 parsed_date = pd.to_datetime(date_val)
             except (ValueError, TypeError):
                 continue
-            oil = row.iloc[col_idx]
-            gas = row.iloc[col_idx + 1]
-            water = row.iloc[col_idx + 2]
             rows.append({
                 'date': parsed_date,
                 'chosenID': chosen_id,
-                'oil': oil,
-                'gas': gas,
-                'water': water,
+                'oil': row.iloc[col_idx],
+                'gas': row.iloc[col_idx + 1],
+                'water': row.iloc[col_idx + 2],
                 'dataSource': 'other',
             })
 
-    data = pd.DataFrame(rows, columns=['date', 'chosenID', 'oil', 'gas', 'water', 'dataSource'])
+    data = pd.DataFrame(rows, columns=COMBOCURVE_COLUMNS)
     cutoff = pd.Timestamp.now() - pd.Timedelta(days=15)
     data = data[data['date'] >= cutoff]
     print(f"  Parsed {len(data)} production rows (last 15 days) for {len(well_cols) - 1} wells")
@@ -462,47 +291,35 @@ def krakenProductionData(pathToData, wellMapping):
 """
 
 def mergeProductionWithTypeCurves(dailyprod, updated, original, wellList, pathToDatabase):
-    
-    print("Begin Merging dailyprod with Orginal and Updated Type Curves")
-    
-    # ensure date columns are datetime64[ns]
-    dailyprod['date'] = pd.to_datetime(dailyprod['date'], format="%Y-%m-%dT%H:%M:%S.%fZ", utc=True).dt.tz_localize(None)
-    updated['date'] = pd.to_datetime(updated['date'], format="%Y-%m-%dT%H:%M:%S.%fZ", utc=True).dt.tz_localize(None)
-    original['date'] = pd.to_datetime(original['date'], format="%Y-%m-%dT%H:%M:%S.%fZ", utc=True).dt.tz_localize(None)
 
-    # Merge dailyprod with updated and original type curves on date and well but keep all rows from updated type curve - if no daily production data, fill with NaN
+    print("Begin Merging dailyprod with Orginal and Updated Type Curves")
+
+    for df in (dailyprod, updated, original):
+        df['date'] = pd.to_datetime(df['date'], format="%Y-%m-%dT%H:%M:%S.%fZ", utc=True).dt.tz_localize(None)
+
     mergedData = pd.merge(updated, dailyprod, how='left', on=['date', 'well'], suffixes=('', '_dailyprod'))
     mergedData = pd.merge(mergedData, original, how='left', on=['date', 'well'], suffixes=('', '_original'))
 
-    # change columns names from oil, gas, water to oil_updated, gas_updated, water_updated
     mergedData = mergedData.rename(columns={
         'oil': 'oil_updated',
         'gas': 'gas_updated',
-        'water': 'water_updated'
+        'water': 'water_updated',
     })
 
-    # any _original columns that are NaN should be filled with ""
-    mergedData['oil_original'] = mergedData['oil_original'].fillna("")
-    mergedData['gas_original'] = mergedData['gas_original'].fillna("")
-    mergedData['water_original'] = mergedData['water_original'].fillna("")
-    # any _updated columns that are NaN should be filled with ""
-    mergedData['oil_dailyprod'] = mergedData['oil_dailyprod'].fillna("")
-    mergedData['gas_dailyprod'] = mergedData['gas_dailyprod'].fillna("")
-    mergedData['water_dailyprod'] = mergedData['water_dailyprod'].fillna("")
+    for col in ['oil_original', 'gas_original', 'water_original',
+                'oil_dailyprod', 'gas_dailyprod', 'water_dailyprod']:
+        mergedData[col] = mergedData[col].fillna("")
 
-    # sort by well and date
-    mergedData = mergedData.sort_values(by=['wellName', 'date'])
-    
-    # drop wellName_original and API_original columns
-    mergedData = mergedData.drop(columns=['wellName_original', 'API_original', 'wellName_dailyprod', 'API_dailyprod'])
-    
-    # drop index
-    mergedData = mergedData.reset_index(drop=True)
+    mergedData = (
+        mergedData
+        .sort_values(by=['wellName', 'date'])
+        .drop(columns=['wellName_original', 'API_original', 'wellName_dailyprod', 'API_dailyprod'])
+        .reset_index(drop=True)
+    )
 
     mergedData.to_excel(os.path.join(pathToDatabase, r"daily_merge.xlsx"))
 
     print("Finished Merging Original and Updated Type Curves")
-
 
     return mergedData
 
@@ -513,89 +330,50 @@ def mergeProductionWithTypeCurves(dailyprod, updated, original, wellList, pathTo
 """
 
 def cumulativeProduction(data, pathToDatabase):
-    
+
     print("Begin Creating Cumulative Production Data")
-    
-    # create new dataframe to hold cumulative production data
-    cumulativeData = pd.DataFrame(columns=["day", "well", "wellName", "API", "oil_dailyprod_cum", "gas_dailyprod_cum", "water_dailyprod_cum", "oil_updated_cum", "gas_updated_cum", "water_updated_cum", "oil_original_cum", "gas_original_cum", "water_original_cum"])
 
-    # get unique wells from data
-    uniqueWells = data['well'].unique()
-    
-    # split dataframe into each well
-    for well in uniqueWells:
-        wellData = data[data['well'] == well]
-        
-        ## count the number of rows in wellData[wellData['oil_dailyprod'] != ""]
+    sourceCols = [
+        'oil_dailyprod', 'gas_dailyprod', 'water_dailyprod',
+        'oil_updated', 'gas_updated', 'water_updated',
+        'oil_original', 'gas_original', 'water_original',
+    ]
+    cumCols = [f"{c}_cum" for c in sourceCols]
+    outputCols = (
+        ["day", "well", "wellName", "API"]
+        + [f"{c}_dailyprod_cum" for c in ("oil", "gas", "water")]
+        + [f"{c}_updated_cum" for c in ("oil", "gas", "water")]
+        + [f"{c}_original_cum" for c in ("oil", "gas", "water")]
+    )
+
+    frames = []
+    for well in data['well'].unique():
+        wellData = data[data['well'] == well].copy()
+
         numProductionDays = len(wellData[wellData['oil_dailyprod'] != ""])
-    
-        # if oil_dailyprod, gas_dailyprod, water_dailyprod are "", replace with 0
-        wellData['oil_dailyprod'] = wellData['oil_dailyprod'].replace("", 0).astype(float)
-        wellData['gas_dailyprod'] = wellData['gas_dailyprod'].replace("", 0).astype(float)
-        wellData['water_dailyprod'] = wellData['water_dailyprod'].replace("", 0).astype(float)
-        # if oil_updated, gas_updated, water_updated are "", replace with 0
-        wellData['oil_updated'] = wellData['oil_updated'].replace("", 0).astype(float)
-        wellData['gas_updated'] = wellData['gas_updated'].replace("", 0).astype(float)
-        wellData['water_updated'] = wellData['water_updated'].replace("", 0).astype(float)
-        # if oil_original, gas_original, water_original are "", replace with 0
-        wellData['oil_original'] = wellData['oil_original'].replace("", 0).astype(float)
-        wellData['gas_original'] = wellData['gas_original'].replace("", 0).astype(float)
-        wellData['water_original'] = wellData['water_original'].replace("", 0).astype(float)
 
-        # create cumulative sum for oil_dailyprod, gas_dailyprod, water_dailyprod
-        wellData['oil_dailyprod_cum'] = wellData['oil_dailyprod'].cumsum()
-        wellData['gas_dailyprod_cum'] = wellData['gas_dailyprod'].cumsum()
-        wellData['water_dailyprod_cum'] = wellData['water_dailyprod'].cumsum()
-        
-        # create cumulative sum for oil_updated, gas_updated, water_updated
-        wellData['oil_updated_cum'] = wellData['oil_updated'].cumsum()
-        wellData['gas_updated_cum'] = wellData['gas_updated'].cumsum()
-        wellData['water_updated_cum'] = wellData['water_updated'].cumsum()
-        
-        # create cumulative sum for oil_original, gas_original, water_original
-        wellData['oil_original_cum'] = wellData['oil_original'].cumsum()
-        wellData['gas_original_cum'] = wellData['gas_original'].cumsum()
-        wellData['water_original_cum'] = wellData['water_original'].cumsum()
-        
-        # if a list starts with 0's, delete zeros and shift the list so that the first non-zero value is at day 1
-        wellData['oil_dailyprod_cum'] = wellData['oil_dailyprod_cum'].where(wellData['oil_dailyprod_cum'] != 0).ffill().fillna(0)
-        wellData['gas_dailyprod_cum'] = wellData['gas_dailyprod_cum'].where(wellData['gas_dailyprod_cum'] != 0).ffill().fillna(0)
-        wellData['water_dailyprod_cum'] = wellData['water_dailyprod_cum'].where(wellData['water_dailyprod_cum'] != 0).ffill().fillna(0)
-        wellData['oil_updated_cum'] = wellData['oil_updated_cum'].where(wellData['oil_updated_cum'] != 0).ffill().fillna(0)
-        wellData['gas_updated_cum'] = wellData['gas_updated_cum'].where(wellData['gas_updated_cum'] != 0).ffill().fillna(0)
-        wellData['water_updated_cum'] = wellData['water_updated_cum'].where(wellData['water_updated_cum'] != 0).ffill().fillna(0)
-        wellData['oil_original_cum'] = wellData['oil_original_cum'].where(wellData['oil_original_cum'] != 0).ffill().fillna(0)
-        wellData['gas_original_cum'] = wellData['gas_original_cum'].where(wellData['gas_original_cum'] != 0).ffill().fillna(0).fillna(0)
-        wellData['water_original_cum'] = wellData['water_original_cum'].where(wellData['water_original_cum'] != 0).ffill().fillna(0)
-        
-        # shift list so that if there are 0's to begin with, the production is shifted so the first day of production is day 1
-        wellData['oil_dailyprod_cum'] = wellData['oil_dailyprod_cum'].shift(fill_value=0)
-        wellData['gas_dailyprod_cum'] = wellData['gas_dailyprod_cum'].shift(fill_value=0)
-        wellData['water_dailyprod_cum'] = wellData['water_dailyprod_cum'].shift(fill_value=0)
-        wellData['oil_updated_cum'] = wellData['oil_updated_cum'].shift(fill_value=0)
-        wellData['gas_updated_cum'] = wellData['gas_updated_cum'].shift(fill_value=0)
-        wellData['water_updated_cum'] = wellData['water_updated_cum'].shift(fill_value=0)
-        wellData['oil_original_cum'] = wellData['oil_original_cum'].shift(fill_value=0)
-        wellData['gas_original_cum'] = wellData['gas_original_cum'].shift(fill_value=0)
-        wellData['water_original_cum'] = wellData['water_original_cum'].shift(fill_value=0)
+        for col in sourceCols:
+            wellData[col] = wellData[col].replace("", 0).astype(float)
 
-        # create a list for day number starting at 0 to n
+        for src, cum in zip(sourceCols, cumCols):
+            series = wellData[src].cumsum()
+            # Trailing zero-runs inherit the last non-zero cum; leading zeros stay 0.
+            series = series.where(series != 0).ffill().fillna(0)
+            wellData[cum] = series.shift(fill_value=0)
+
         wellData['day'] = np.arange(len(wellData))
-        
-        # for oil_dailyprod_cum, gas_dailyprod_cum, water_dailyprod_cum, if day number is greater than numProductionDays, set cumulative production to ""
-        wellData.loc[wellData['day'] >= numProductionDays, 'oil_dailyprod_cum'] = ""
-        wellData.loc[wellData['day'] >= numProductionDays, 'gas_dailyprod_cum'] = ""
-        wellData.loc[wellData['day'] >= numProductionDays, 'water_dailyprod cum'] = ""
-        
-        # select only necessary columns
-        wellCumulativeData = wellData[["day", "well", "wellName", "API", "oil_dailyprod_cum", "gas_dailyprod_cum", "water_dailyprod_cum", "oil_updated_cum", "gas_updated_cum", "water_updated_cum", "oil_original_cum", "gas_original_cum", "water_original_cum"]]
-        
-        # append to cumulativeData dataframe
-        cumulativeData = pd.concat([cumulativeData, wellCumulativeData], ignore_index=True)
- 
-    # print cumulativeData to excel for review
+
+        # Beyond the last day with actual production, blank out dailyprod cum columns.
+        pastProduction = wellData['day'] >= numProductionDays
+        for cum in ('oil_dailyprod_cum', 'gas_dailyprod_cum', 'water_dailyprod_cum'):
+            wellData.loc[pastProduction, cum] = ""
+
+        frames.append(wellData[outputCols])
+
+    cumulativeData = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=outputCols)
+
     cumulativeData.to_excel(os.path.join(pathToDatabase, r"cumulative_production.xlsx"))
-     
+
     print("Finished Creating Cumulative Production Data")
 
     return cumulativeData
@@ -610,38 +388,18 @@ Convert Monthly PDS to ComboCurve Monthly Format
 """
 
 def pdsMonthlyData(pathToData):
-    
-    print("Getting Devon Production Data")
 
-    load_dotenv()  # load enviroment variables
-    
-    # Update path to include the last file in the directory based on time modified
-    pathToData = max([os.path.join(pathToData, f) for f in os.listdir(pathToData)], key=os.path.getmtime)
-    
+    print("Getting PDS Monthly Production Data")
+
+    pathToData = _latest_file_in_dir(pathToData)
+
     data = pd.read_csv(pathToData)
-    
-    data['API'] = data['API'].astype(str)
-    #drop last two characters from API
-    data['API'] = data['API'].str[:-2]
-    # add two more trailing zeros to API
-    data['API'] = data['API'] + '00'
-    # convert 'Production Date' to datetime format YYYY-MM-DD
+
+    data['API'] = data['API'].astype(str).str[:-2] + '00'
     data['Production Date'] = pd.to_datetime(data['Production Date'], format="%m/%d/%Y").dt.strftime("%Y-%m-%d")
 
     data = data[['Production Date', 'API', 'Oil Production', 'Gas Production', 'Water Production']]
-    
-    # add new column to data called 'dataSource' and set all values to "other"
     data['dataSource'] = "other"
-    
-    columnsComboCurve = [
-        "date",
-        "chosenID",
-        "oil",
-        "gas",
-        "water",
-        "dataSource",
-    ]
-    
-    data.columns = columnsComboCurve
-    
+    data.columns = COMBOCURVE_COLUMNS
+
     return data
