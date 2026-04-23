@@ -29,6 +29,10 @@ def combineAfeData(pathToAfe):
                     df = pd.read_excel(filePath) # read the excel file into a dataframe
                     df['Folder'] = folder  # add a column with the folder name
                     df['Fund'] = year  # add a column with the year
+                    # Project Number: trailing token of the filename (e.g. afe_<well>_01.xlsx -> "01", _12a -> "12a")
+                    baseName = os.path.splitext(file)[0]
+                    parts = baseName.split('_')
+                    df['Project Number'] = parts[-1] if len(parts) > 1 else None
                     operatorList = companyCodes['Operator Name'].tolist() # get the list of operators from the company codes dataframe
                     # find the name that matches the folder name in column "Owner JIB Code" and add that code to a new column called "Company Code"
                     for operator in operatorList:
@@ -1104,7 +1108,7 @@ def generateAfeActualReport(afeMasterPath=None, jibMasterPath=None, outputDir=No
 
     afe = _cleanStringColumns(afe, [
         "AFE Number", "Well Name", "Bucketing", "Tax", "Description",
-        "Folder", "Fund", "Company Code",
+        "Folder", "Fund", "Company Code", "Project Number",
     ])
     jib = _cleanStringColumns(jib, [
         "Operator", "Owner Name", "Op AFE", "Property Name",
@@ -1193,6 +1197,56 @@ def generateAfeActualReport(afeMasterPath=None, jibMasterPath=None, outputDir=No
             )
             ownerByKey = dict(zip(ranked["Property Key"], ranked["Owner Name"]))
 
+    # Fund resolution:
+    #   AFE rows  -> AFE's own Fund column (per-row, authoritative).
+    #   JIB rows  -> year parsed from Owner Name (e.g. "SHALEHAVEN ENERGY
+    #                FUND 2025 LLC"), which tells us exactly which fund
+    #                entity paid. Fallback only when Owner Name carries no
+    #                year AND the well has a single AFE fund (unambiguous).
+    # fundsByKey unions AFE Funds + JIB Owner-Name years so the Dimensions
+    # sheet reflects the complete fund footprint for each well.
+    _OWNER_YEAR_RE = re.compile(r"\b(20[2-3]\d)\b")
+
+    def _extractOwnerYear(ownerName):
+        if _isBlank(ownerName):
+            return None
+        m = _OWNER_YEAR_RE.search(str(ownerName))
+        return m.group(1) if m else None
+
+    fundsByKey = {}
+    if "Fund" in afe.columns:
+        for pk, group in afe.dropna(subset=["Property Key", "Fund"]).groupby("Property Key")["Fund"]:
+            vals = {str(f).strip() for f in group if not _isBlank(f)}
+            if vals:
+                fundsByKey.setdefault(pk, set()).update(vals)
+    if "Owner Name" in jib.columns:
+        for pk, owner in zip(jib["Property Key"], jib["Owner Name"]):
+            if _isBlank(pk):
+                continue
+            yr = _extractOwnerYear(owner)
+            if yr:
+                fundsByKey.setdefault(pk, set()).add(yr)
+
+    def _resolveJibFund(propertyKey, ownerName):
+        """Owner Name year first (authoritative). If absent, fall back to
+        the well's AFE fund only when unambiguous (single fund)."""
+        yr = _extractOwnerYear(ownerName)
+        if yr:
+            return yr
+        funds = fundsByKey.get(propertyKey)
+        if funds and len(funds) == 1:
+            return next(iter(funds))
+        return None
+
+    _ownerSeries = (
+        jib["Owner Name"] if "Owner Name" in jib.columns
+        else pd.Series([None] * len(jib), index=jib.index)
+    )
+    jibFund = [
+        _resolveJibFund(pk, owner)
+        for pk, owner in zip(jib["Property Key"], _ownerSeries)
+    ]
+
     # JIB Major Description encodes Tax + Category as one string; split it
     # so both sides have the same three-column structure. Minor Description
     # is passed as Category fallback (Hunt Oil's generic "AFE Expenditures"
@@ -1210,11 +1264,13 @@ def generateAfeActualReport(afeMasterPath=None, jibMasterPath=None, outputDir=No
         "Source": "AFE",
         "AFE Number": afe["AFE Key"],
         "AFE Number (Raw)": afe["AFE Key Raw"],
+        "Project Number": afe.get("Project Number"),
         "Project": afe["Project"],
         "Operator (Legal)": pd.Series([pd.NA] * len(afe)),
         "Property Name": afe["Well Name"],
         "Property Name (Normalized)": afe["Property Name (Normalized)"],
         "Owner Name": afe["Property Key"].map(ownerByKey),
+        "Fund": afe.get("Fund"),
         "Tax": afe.get("Tax"),
         "Category": afe.get("Bucketing"),
         "Sub Category": afe.get("Description"),
@@ -1227,15 +1283,83 @@ def generateAfeActualReport(afeMasterPath=None, jibMasterPath=None, outputDir=No
         "_Property Key": afe["Property Key"],
     })
 
+    # Project Number lookup: Project Number comes from the AFE filename tail
+    # (e.g. afe_<well>_10.xlsx -> "10"). JIB inherits via a 4-tier fallback
+    # that always prefers the JIB row's OWN fund when it's resolvable:
+    #   1. (Fund, AFE Key)       - exact AFE within the row's fund. Needed
+    #                              because operator AFE numbers can be reused
+    #                              across fund years; a 2025-fund JIB row
+    #                              must pull from the 2025 AFE file, not the
+    #                              2026 one that happened to load first.
+    #   2. (Fund, Property Key)  - any AFE for the well within the fund
+    #   3. AFE Key (any fund)    - used only when fund can't be resolved
+    #   4. Property Key (any)    - last resort
+    projectByFundAfeKey = {}
+    projectByFundKey = {}
+    projectByAfeKey = {}
+    projectByPropertyKey = {}
+    if "Project Number" in afe.columns:
+        afeProj = afe.dropna(subset=["Project Number"]).copy()
+        afeProj["Project Number"] = afeProj["Project Number"].astype(str)
+        if "Fund" in afeProj.columns:
+            afeProj["_Fund"] = afeProj["Fund"].astype(str)
+            byFundAfe = (
+                afeProj.dropna(subset=["AFE Key"])
+                       .drop_duplicates(["_Fund", "AFE Key"], keep="first")
+            )
+            projectByFundAfeKey = {
+                (f, k): v for f, k, v in zip(
+                    byFundAfe["_Fund"], byFundAfe["AFE Key"], byFundAfe["Project Number"]
+                )
+            }
+            byFundKey = afeProj.dropna(subset=["Property Key"])
+            projectByFundKey = (
+                byFundKey.groupby(["Property Key", "_Fund"])["Project Number"]
+                         .agg(lambda s: ", ".join(sorted({v for v in s if not _isBlank(v)})))
+                         .to_dict()
+            )
+        byAfe = afeProj.dropna(subset=["AFE Key"]).drop_duplicates("AFE Key", keep="first")
+        projectByAfeKey = dict(zip(byAfe["AFE Key"], byAfe["Project Number"]))
+        byKey = afeProj.dropna(subset=["Property Key"])
+        projectByPropertyKey = (
+            byKey.groupby("Property Key")["Project Number"]
+                 .agg(lambda s: ", ".join(sorted({v for v in s if not _isBlank(v)})))
+                 .to_dict()
+        )
+
+    def _jibProjectLookup(afeKey, propKey, fund):
+        if not _isBlank(fund):
+            f = str(fund)
+            p = projectByFundAfeKey.get((f, afeKey))
+            if not _isBlank(p):
+                return p
+            p = projectByFundKey.get((propKey, f))
+            if not _isBlank(p):
+                return p
+        p = projectByAfeKey.get(afeKey)
+        if not _isBlank(p):
+            return p
+        return projectByPropertyKey.get(propKey)
+
+    jibProjectNumber = pd.Series(
+        [
+            _jibProjectLookup(a, k, f)
+            for a, k, f in zip(jib["AFE Key"], jib["Property Key"], jibFund)
+        ],
+        index=jib.index,
+    )
+
     jibFacts = pd.DataFrame({
         "Source": "JIB",
         "AFE Number": jib["AFE Key"],
         "AFE Number (Raw)": jib["AFE Key Raw"],
+        "Project Number": jibProjectNumber,
         "Project": jib["Project"],
         "Operator (Legal)": jib.get("Operator"),
         "Property Name": jib["Property Name"],
         "Property Name (Normalized)": jib["Property Name (Normalized)"],
         "Owner Name": jib.get("Owner Name"),
+        "Fund": jibFund,
         "Tax": jibTax,
         "Category": jibCategory,
         "Sub Category": jib.get("Minor Description"),
@@ -1262,8 +1386,9 @@ def generateAfeActualReport(afeMasterPath=None, jibMasterPath=None, outputDir=No
     facts = facts.drop(columns=["_Property Key"])
 
     colOrder = [
-        "Source", "AFE Number", "AFE Number (Raw)", "Project", "Operator (Legal)",
-        "Property Name", "Property Name (Normalized)", "Owner Name",
+        "Source", "AFE Number", "AFE Number (Raw)", "Project Number",
+        "Project", "Operator (Legal)",
+        "Property Name", "Property Name (Normalized)", "Owner Name", "Fund",
         "Tax", "Category", "Sub Category", "Description",
         "Gross Amount", "Working Interest", "Net Amount",
         "AFE Gross Amount", "AFE Net Amount",
@@ -1299,6 +1424,8 @@ def generateAfeActualReport(afeMasterPath=None, jibMasterPath=None, outputDir=No
             a["AFE Key"].dropna().unique().tolist()
             + j["AFE Key"].dropna().unique().tolist()
         ))
+        fundSet = fundsByKey.get(key, set())
+        fund = ", ".join(sorted(fundSet)) if fundSet else None
         dimRows.append({
             "Property Key": key,
             "Project": project,
@@ -1306,6 +1433,7 @@ def generateAfeActualReport(afeMasterPath=None, jibMasterPath=None, outputDir=No
             "Property Name": propName,
             "Property Name (Normalized)": propNorm,
             "Owner Name": owners,
+            "Fund": fund,
             "AFE Numbers": ", ".join(afeKeysSeen),
         })
     dimensions = (
