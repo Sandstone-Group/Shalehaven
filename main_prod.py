@@ -11,6 +11,7 @@ import shalehavenscripts.novi as novi
 import pandas as pd
 import numpy as np
 import os
+import sys
 from dotenv import load_dotenv
 import warnings
 
@@ -21,15 +22,19 @@ pd.options.mode.chained_assignment = None  # default='warn'
 warnings.simplefilter(action='ignore', category=FutureWarning)
 warnings.simplefilter(action='ignore', category=UserWarning)
 
+print("Begin Shalehaven ETL Process")
+
+load_dotenv()  # load enviroment variables
+
+runMode = input("Run deal pipeline only or full script? Enter D for deal pipeline only, F for full script: ").strip().upper()
+while runMode not in ("D", "F"):
+    runMode = input("Please enter D for deal pipeline only or F for full script: ").strip().upper()
+
 sandstoneComboCurveServiceAccount = os.getenv("SANDSTONE_COMBOCURVE_API_SEC_CODE")
 sandstoneComboCurveApiKey = os.getenv("SANDSTONE_COMBOCURVE_API_KEY_PASS")
 shalehavenProjectId = os.getenv("SHALEHAVEN_PROJECT_ID")
 shalehavenForcastIdUpdatedTypeCurve = os.getenv("SHALEHAVEN_FORCAST_ID_UPDATED_TYPE_CURVE")
 shalehavenForcastIdOriginalTypeCurve = os.getenv("SHALEHAVEN_FORCAST_ID_ORIGINAL_TYPE_CURVE")
-
-print("Begin Shalehaven ETL Process")
-
-load_dotenv()  # load enviroment variables
 
 # Paths to data
 pathToAdmiralData = os.getenv("SHALEHAVEN_ADMIRAL_PATH")
@@ -43,6 +48,11 @@ pathToKrakenData = os.getenv("SHALEHAVEN_KRAKEN_PATH")
 pathToMonthlyPDSData = os.getenv("SHALEHAVEN_MONTHLY_PDS_PATH")
 pathToDatabase = os.getenv("SHALEHAVEN_DATABASE_PATH")
 pathToDealSheet = os.getenv("SHALEHAVEN_DEAL_SHEET_PATH")
+
+if runMode == "D":
+    dealsheet.buildDealPipeline(pathToDealSheet) # runs updating the deal sheet
+    print("End Shalehaven Deal Pipeline Process")
+    sys.exit(0)
 
 novi.checkNoviDbStatus() # checks Novi API bulk download, then replaces data if new DB as dropped
 
