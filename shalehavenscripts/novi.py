@@ -7,6 +7,7 @@ import math
 import difflib
 import re
 import pandas as pd
+import numpy as np
 
 
 BASE_URL = "https://insight.novilabs.com/api/"
@@ -106,6 +107,164 @@ def _isPermianOilBasin(formations):
         if any(p in s for p in PERMIAN_FORMATION_PATTERNS):
             return True
     return False
+
+
+PERMIAN_BASIN_PATTERNS = (
+    "PERMIAN",
+    "MIDLAND",
+    "DELAWARE",
+    "CENTRAL BASIN PLATFORM",
+)
+
+
+def _isPermianBasin(data):
+    if data is None:
+        return False
+
+    values = []
+    if isinstance(data, pd.DataFrame):
+        for col in ("Basin", "Subbasin"):
+            if col in data.columns:
+                values.extend(data[col].dropna().astype(str).tolist())
+    else:
+        values = [str(v) for v in data if pd.notna(v)]
+
+    for value in values:
+        s = value.upper()
+        if any(p in s for p in PERMIAN_BASIN_PATTERNS):
+            return True
+    return False
+
+
+def _productionHeatMapParamsForAfe(afeData=None):
+    return ["Cum12MOil", "Cum12MGas", "Cum24MOil", "Cum24MGas"]
+
+
+def _primaryProductionStream(afeData=None):
+    if afeData is None or afeData.empty:
+        return "oil"
+    target_cols = [
+        c for c in afeData.columns
+        if str(c).strip().lower().replace("_", " ") in {
+            "primary target",
+            "primarytarget",
+            "target",
+            "primary commodity",
+            "commodity",
+        }
+    ]
+    if not target_cols:
+        return "oil"
+
+    targets = afeData[target_cols[0]].dropna().astype(str).str.upper()
+    oil_count = targets.str.contains("OIL").sum()
+    gas_count = targets.str.contains("GAS").sum()
+    if gas_count > oil_count:
+        return "gas"
+    return "oil"
+
+
+def _subsurfaceParamLabel(param):
+    labels = {
+        "TOC_Avg": "TOC Avg",
+        "SW_Avg": "Water Saturation Avg",
+        "Porosity_Avg": "Porosity Avg",
+        "Permeability_Avg": "Permeability Avg",
+        "Thickness_Avg": "Thickness Avg",
+        "VClay_Avg": "VClay Avg",
+        "Brittleness_Avg": "Brittleness Avg",
+        "Cum12MOil": "Cum 12 MBO",
+        "Cum24MOil": "Cum 24 MBO",
+        "Cum12MGas": "Cum 12 Gas",
+        "Cum24MGas": "Cum 24 Gas",
+        "EUR50YROil": "EUR 50yr Oil",
+        "EUR50YRGas": "EUR 50yr Gas",
+    }
+    return labels.get(param, param)
+
+
+GEO_DRIVER_PARAMS = [
+    "TOC_Avg",
+    "SW_Avg",
+    "Porosity_Avg",
+    "Permeability_Avg",
+    "Thickness_Avg",
+    "VClay_Avg",
+    "Brittleness_Avg",
+]
+
+
+def _geoDriverProductionParam(afeData=None, basinData=None):
+    if _isPermianBasin(basinData):
+        return "Cum24MOil"
+    return "Cum24MGas" if _primaryProductionStream(afeData) == "gas" else "Cum24MOil"
+
+
+def _geoDriverEstimateTargets(afeData=None):
+    primary = _primaryProductionStream(afeData)
+    eur_col = "EUR50YRGas" if primary == "gas" else "EUR50YROil"
+    return ["Cum24MOil", "Cum24MGas", eur_col]
+
+
+def _resolveAfeLateralLength(afeData=None):
+    candidates = []
+    if afeData is None or afeData.empty:
+        return None
+    for col in afeData.columns:
+        col_norm = str(col).strip().lower().replace("_", " ")
+        if col_norm == "lateral length" or ("lateral" in col_norm and "length" in col_norm):
+            vals = pd.to_numeric(afeData[col], errors="coerce")
+            vals = vals[vals > 0]
+            if not vals.empty:
+                candidates.extend(vals.tolist())
+    if not candidates:
+        return None
+    adjusted = float(pd.Series(candidates).mean()) - 500.0
+    return adjusted if adjusted > 0 else None
+
+
+def _geoDriverResponseSeries(df, response_param, afeData=None):
+    response = pd.to_numeric(df[response_param], errors="coerce")
+    afe_lateral_length = _resolveAfeLateralLength(afeData)
+    if "LateralLength" not in df.columns:
+        return response, _subsurfaceParamLabel(response_param), _subsurfaceParamLabel(response_param), None
+
+    offset_lateral_length = pd.to_numeric(df["LateralLength"], errors="coerce").replace(0, float("nan"))
+    response_per_ft = response / offset_lateral_length
+    response_label = f"{_subsurfaceParamLabel(response_param)} / ft"
+    estimate_label = _subsurfaceParamLabel(response_param) if afe_lateral_length else response_label
+    return response_per_ft, response_label, estimate_label, afe_lateral_length
+
+
+def _geoDriverEstimateForTarget(df, driver, target_param, afe_lateral_length):
+    if target_param not in df.columns or "LateralLength" not in df.columns:
+        return None
+    x = pd.to_numeric(df[driver], errors="coerce")
+    target = pd.to_numeric(df[target_param], errors="coerce")
+    lateral = pd.to_numeric(df["LateralLength"], errors="coerce").replace(0, float("nan"))
+    y = target / lateral
+    valid = x.notna() & y.notna()
+    if valid.sum() < 4:
+        return None
+    x_valid = x[valid]
+    y_valid = y[valid]
+    if x_valid.nunique() <= 1:
+        return None
+    slope, intercept = np.polyfit(x_valid, y_valid, 1)
+    x10, x50, x90 = np.percentile(x_valid, [10, 50, 90])
+    est10 = slope * x10 + intercept
+    est50 = slope * x50 + intercept
+    est90 = slope * x90 + intercept
+    if afe_lateral_length:
+        est10 *= afe_lateral_length
+        est50 *= afe_lateral_length
+        est90 *= afe_lateral_length
+    return {
+        "label": _subsurfaceParamLabel(target_param),
+        "p10": max(est10, est90),
+        "p50": est50,
+        "p90": min(est10, est90),
+    }
 
 
 ## Parse township/range string like "18S", "T18S", "18 South", "T-18-S" into (number, direction)
@@ -850,7 +1009,7 @@ def getNoviMonthlyProduction(token, offsetData, scope="us-horizontals"):
 ## Retrieve subsurface petrophysical data for offset wells from local bulk export
 ## Inner-merges on (API10, Formation) so each well gets exactly one row matching its reported formation.
 ## Wells whose Formation doesn't match any Subsurface row for that API10 are dropped (logged).
-## Also joins Cum12MBOE / Cum24MBOE from WellDetails.tsv so production heatmaps render alongside the petrophysical ones.
+## Also joins 12-month and 24-month cumulative production from WellDetails.tsv so production heatmaps render alongside the petrophysical ones.
 ## token and scope are kept for backward compat / consistency with the other novi functions but unused.
 def getNoviSubsurface(token, offsetData, scope="us-horizontals"):
 
@@ -879,20 +1038,25 @@ def getNoviSubsurface(token, offsetData, scope="us-horizontals"):
     # on the production columns — the heatmap loop already skips parameters with too few valid points.
     wellDetailsPath = paths["tsv"].get("WellDetails")
     if wellDetailsPath and os.path.exists(wellDetailsPath):
+        production_cols = [
+            "Cum12MOil", "Cum24MOil",
+            "Cum12MGas", "Cum24MGas",
+            "EUR50YROil", "EUR50YRGas",
+            "LateralLength",
+        ]
         wd = pd.read_csv(
             wellDetailsPath,
             sep="\t",
             low_memory=False,
-            usecols=["API10", "Cum12MBOE", "Cum24MBOE"],
+            usecols=["API10"] + production_cols,
             dtype={"API10": "string"},
         )
         wd = wd[wd["API10"].isin(api10_set)]
         merged = merged.merge(wd, on="API10", how="left")
-        n12 = int(merged["Cum12MBOE"].notna().sum())
-        n24 = int(merged["Cum24MBOE"].notna().sum())
-        print(f"  Joined Cum12MBOE ({n12:,} wells) and Cum24MBOE ({n24:,} wells) from WellDetails")
+        counts = ", ".join(f"{c} ({int(merged[c].notna().sum()):,} wells)" for c in production_cols)
+        print(f"  Joined production heatmap columns from WellDetails: {counts}")
     else:
-        print("  WellDetails.tsv not found — Cum12MBOE / Cum24MBOE heatmaps will be skipped")
+        print("  WellDetails.tsv not found — production heatmaps will be skipped")
 
     matched = merged["API10"].nunique()
     total = len(api10_set)
@@ -1132,6 +1296,7 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    plt.rcParams["font.family"] = "Arial"
     from matplotlib.backends.backend_pdf import PdfPages
     from scipy.interpolate import griddata
     import geopandas as gpd
@@ -1147,9 +1312,7 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
             "Thickness_Avg",
             "VClay_Avg",
             "Brittleness_Avg",
-            "Cum12MBOE",
-            "Cum24MBOE",
-        ]
+        ] + _productionHeatMapParamsForAfe(afeData)
 
     # Resolve output path (same Data/ folder as printData)
     afeDir = os.path.dirname(pathToAfeSummary)
@@ -1636,12 +1799,13 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
                 ax.set_ylim(lat_min, lat_max)
                 ax.set_xlabel("Longitude")
                 ax.set_ylabel("Latitude")
+                param_label = _subsurfaceParamLabel(param)
                 title_suffix = f" [{fm_label}]" if fm_label else ""
-                ax.set_title(f"{param}{title_suffix} — {mask.sum():,} wells")
+                ax.set_title(f"{param_label}{title_suffix} — {mask.sum():,} wells")
                 ax.legend(loc="upper right", fontsize=8)
                 ax.set_aspect("equal", adjustable="box")
                 cbar = plt.colorbar(cf, ax=ax, shrink=0.8)
-                cbar.set_label(param)
+                cbar.set_label(param_label)
 
                 # Side legend: AFE permits + offset wells, both filtered to this formation
                 MAX_NAME_LEN = 38
@@ -1692,6 +1856,129 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
                 pdf.savefig(fig, bbox_inches="tight")
                 plt.close(fig)
                 print(f"  Plotted {param} [{fm_label or 'ALL'}] ({mask.sum():,} wells)")
+
+        # === Geo driver diagnostic ===
+        response_param = _geoDriverProductionParam(afeData, df)
+        driver_params = [p for p in GEO_DRIVER_PARAMS if p in df.columns]
+        if response_param in df.columns and driver_params:
+            y_all, response_label, estimate_label, afe_lateral_length = _geoDriverResponseSeries(
+                df, response_param, afeData
+            )
+            estimate_targets = _geoDriverEstimateTargets(afeData)
+            rows = []
+            for driver in driver_params:
+                x = pd.to_numeric(df[driver], errors="coerce")
+                y = y_all
+                valid = x.notna() & y.notna()
+                if valid.sum() < 4:
+                    continue
+                r = x[valid].corr(y[valid])
+                if pd.isna(r):
+                    continue
+                x_valid = x[valid]
+                y_valid = y[valid]
+                slope, intercept = np.polyfit(x_valid, y_valid, 1)
+                x10, x50, x90 = np.percentile(x_valid, [10, 50, 90])
+                est10 = slope * x10 + intercept
+                est50 = slope * x50 + intercept
+                est90 = slope * x90 + intercept
+                if afe_lateral_length:
+                    est10 *= afe_lateral_length
+                    est50 *= afe_lateral_length
+                    est90 *= afe_lateral_length
+                high_est = max(est10, est90)
+                low_est = min(est10, est90)
+                rows.append({
+                    "param": driver,
+                    "label": _subsurfaceParamLabel(driver),
+                    "x": x_valid,
+                    "y": y_valid,
+                    "r": r,
+                    "n": int(valid.sum()),
+                    "abs_r": abs(r),
+                    "slope": slope,
+                    "intercept": intercept,
+                    "x10": x10,
+                    "x50": x50,
+                    "x90": x90,
+                    "est_p10": high_est,
+                    "est_p50": est50,
+                    "est_p90": low_est,
+                    "estimates": {
+                        target: _geoDriverEstimateForTarget(df, driver, target, afe_lateral_length)
+                        for target in estimate_targets
+                    },
+                })
+
+            if rows:
+                rows_sorted = sorted(rows, key=lambda r: r["r"], reverse=True)
+                rank_lookup = {r["param"]: i + 1 for i, r in enumerate(rows_sorted)}
+
+                fig, axes = plt.subplots(2, 4, figsize=(14, 8.5))
+                axes = axes.flatten()
+                fig.suptitle(
+                    f"Geo Property Drivers vs {response_label} — {dsuName}",
+                    fontsize=13,
+                    fontweight="bold",
+                )
+
+                for ax, row in zip(axes, rows_sorted):
+                    x = row["x"]
+                    y = row["y"]
+                    ax.scatter(x, y, s=14, alpha=0.65, color="#1f77b4", edgecolor="black", linewidth=0.2)
+                    if len(x) >= 4 and x.nunique() > 1:
+                        slope = row["slope"]
+                        intercept = row["intercept"]
+                        x_line = np.linspace(x.min(), x.max(), 100)
+                        ax.plot(x_line, slope * x_line + intercept, color="firebrick", linewidth=1.2)
+                    rank = rank_lookup[row["param"]]
+                    ax.set_title(f"#{rank} {row['label']}  r={row['r']:.2f}", fontsize=9)
+                    ax.set_xlabel(row["label"], fontsize=8)
+                    ax.set_ylabel(response_label, fontsize=8)
+                    ax.tick_params(labelsize=7)
+                    ax.grid(True, alpha=0.25)
+
+                for ax in axes[len(rows):]:
+                    ax.axis("off")
+
+                def _fmt_est(v):
+                    return f"{v:,.0f}" if pd.notna(v) else ""
+
+                note_lines = ["Estimated production from linear fit:"]
+                if afe_lateral_length:
+                    note_lines.append(f"Normalized to AFE lateral length less 500 ft: {afe_lateral_length:,.0f} ft")
+                target_headers = [(_subsurfaceParamLabel(t)[:16]).ljust(16) for t in estimate_targets]
+                note_lines.append("Rank  Driver              " + "  ".join(target_headers))
+                note_lines.append("                         " + "  ".join(["P10/P50/P90".ljust(16) for _ in estimate_targets]))
+                for i, row in enumerate(rows_sorted, start=1):
+                    label = row["label"][:18].ljust(18)
+                    estimate_cells = []
+                    for target in estimate_targets:
+                        est = row["estimates"].get(target)
+                        if est is None:
+                            estimate_cells.append("".ljust(16))
+                        else:
+                            estimate_cells.append(
+                                f"{_fmt_est(est['p10'])}/{_fmt_est(est['p50'])}/{_fmt_est(est['p90'])}"[:16].ljust(16)
+                            )
+                    note_lines.append(
+                        f"{str(i).rjust(4)}  {label}  " + "  ".join(estimate_cells)
+                    )
+                fig.text(
+                    0.77,
+                    0.18,
+                    "\n".join(note_lines),
+                    fontsize=8,
+                    family="monospace",
+                    verticalalignment="top",
+                    bbox=dict(facecolor="white", edgecolor="#777777", linewidth=0.6, pad=6),
+                )
+                fig.tight_layout(rect=[0.03, 0.03, 0.98, 0.93])
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close(fig)
+                print(f"  Appended geo driver diagnostic vs {response_label}")
+        else:
+            print(f"  Skipping geo driver diagnostic: {response_param} or driver columns missing")
 
         # === Appendix pages ===
         # Full offset well index (number → name → API10 → distance → first prod year),
@@ -1744,7 +2031,7 @@ def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, pe
                 # Style header row
                 for col_i in range(len(COL_HEADERS)):
                     cell = table[(0, col_i)]
-                    cell.set_facecolor("#0a2a5e")
+                    cell.set_facecolor("#f28c28")
                     cell.set_text_props(color="white", fontweight="bold")
 
                 pdf.savefig(fig, bbox_inches="tight")
@@ -1771,8 +2058,7 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
         parameters = [
             "TVD", "TOC_Avg", "SW_Avg", "Porosity_Avg",
             "Permeability_Avg", "Thickness_Avg", "VClay_Avg", "Brittleness_Avg",
-            "Cum12MBOE", "Cum24MBOE",
-        ]
+        ] + _productionHeatMapParamsForAfe(afeData)
 
     afeDir = os.path.dirname(pathToAfeSummary)
     afeFilename = os.path.splitext(os.path.basename(pathToAfeSummary))[0]
@@ -1970,10 +2256,11 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
                     "first_prod": w["first_prod"],
                 })
 
+            param_label = _subsurfaceParamLabel(param)
             title_suffix = f" [{fm_label}]" if fm_label else ""
             figures.append({
-                "title": f"{param}{title_suffix} — {mask.sum()} wells",
-                "param": param,
+                "title": f"{param_label}{title_suffix} — {mask.sum()} wells",
+                "param": param_label,
                 "z": z_data,
                 "lon": lon_list,
                 "lat": lat_list,
@@ -1982,6 +2269,71 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
                 "permit_markers": permit_markers,
             })
             print(f"  Prepared {param} [{fm_label or 'ALL'}] ({mask.sum()} wells)")
+
+    # Build geo-driver diagnostic data for a tab inserted before Well Index
+    response_param = _geoDriverProductionParam(afeData, df)
+    geo_driver_analysis = []
+    if response_param in df.columns:
+        y_all, response_label, estimate_label, afe_lateral_length = _geoDriverResponseSeries(
+            df, response_param, afeData
+        )
+        estimate_targets = _geoDriverEstimateTargets(afeData)
+        for driver in [p for p in GEO_DRIVER_PARAMS if p in df.columns]:
+            x = pd.to_numeric(df[driver], errors="coerce")
+            y = y_all
+            valid = x.notna() & y.notna()
+            if valid.sum() < 4:
+                continue
+            x_valid = x[valid]
+            y_valid = y[valid]
+            r = x_valid.corr(y_valid)
+            if pd.isna(r):
+                continue
+            line_x = []
+            line_y = []
+            x10, x50, x90 = np.percentile(x_valid, [10, 50, 90])
+            slope = None
+            intercept = None
+            est10 = None
+            est50 = None
+            est90 = None
+            if x_valid.nunique() > 1:
+                slope, intercept = np.polyfit(x_valid, y_valid, 1)
+                line_x = [float(x_valid.min()), float(x_valid.max())]
+                line_y = [float(slope * line_x[0] + intercept), float(slope * line_x[1] + intercept)]
+                est10 = float(slope * x10 + intercept)
+                est50 = float(slope * x50 + intercept)
+                est90 = float(slope * x90 + intercept)
+                if afe_lateral_length:
+                    est10 *= afe_lateral_length
+                    est50 *= afe_lateral_length
+                    est90 *= afe_lateral_length
+            geo_driver_analysis.append({
+                "param": driver,
+                "label": _subsurfaceParamLabel(driver),
+                "response": response_label,
+                "estimate_label": estimate_label,
+                "afe_lateral_length": afe_lateral_length,
+                "x": [float(v) for v in x_valid.tolist()],
+                "y": [float(v) for v in y_valid.tolist()],
+                "line_x": line_x,
+                "line_y": line_y,
+                "r": float(r),
+                "n": int(valid.sum()),
+                "x10": float(x10),
+                "x50": float(x50),
+                "x90": float(x90),
+                "est_p10": None if est10 is None or est90 is None else max(est10, est90),
+                "est_p50": est50,
+                "est_p90": None if est10 is None or est90 is None else min(est10, est90),
+                "estimates": {
+                    target: _geoDriverEstimateForTarget(df, driver, target, afe_lateral_length)
+                    for target in estimate_targets
+                },
+            })
+        geo_driver_analysis.sort(key=lambda row: row["r"], reverse=True)
+        for i, row in enumerate(geo_driver_analysis, start=1):
+            row["rank"] = i
 
     # Build well index table data
     well_index = numbered_wells
@@ -1996,7 +2348,7 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  body {{ font-family: Arial, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
          background: #f5f5f5; color: #333; }}
   .header {{ background: #0a2a5e; color: white; padding: 18px 28px; }}
   .header h1 {{ font-size: 22px; font-weight: 600; }}
@@ -2019,8 +2371,12 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
   .sidebar .panel .row .n {{ min-width: 24px; text-align: right; color: #0a2a5e; font-weight: bold; }}
   .table-page {{ display: none; padding: 16px 28px; }}
   .table-page.active {{ display: block; }}
+  .driver-grid {{ display: grid; grid-template-columns: repeat(2, minmax(360px, 1fr)); gap: 14px; }}
+  .driver-plot {{ height: 300px; background: #fff; border: 1px solid #ddd; }}
+  .driver-rank {{ margin-bottom: 14px; max-width: 720px; }}
+  .estimate-note {{ background: #fff; border: 1px solid #ddd; padding: 10px 12px; margin-bottom: 14px; max-width: 720px; font-size: 12px; }}
   table {{ border-collapse: collapse; width: 100%; background: #fff; }}
-  th {{ background: #0a2a5e; color: #fff; text-align: left; padding: 6px 10px; font-size: 12px; }}
+  th {{ background: #f28c28; color: #fff; text-align: left; padding: 6px 10px; font-size: 12px; }}
   td {{ padding: 5px 10px; font-size: 11px; border-bottom: 1px solid #eee; font-family: monospace; }}
   tr:hover td {{ background: #f0f4ff; }}
 </style>
@@ -2036,6 +2392,7 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
 const FIGURES = {_json.dumps(figures, separators=(',', ':'))};
 const WELL_INDEX = {_json.dumps(well_index, separators=(',', ':'))};
 const AFE_PERMITS = {_json.dumps(afe_permits, separators=(',', ':'))};
+const GEO_DRIVER = {_json.dumps(geo_driver_analysis, separators=(',', ':'))};
 
 const tabsEl = document.getElementById('tabs');
 const pagesEl = document.getElementById('pages');
@@ -2116,6 +2473,38 @@ function buildPlot(fig, divId) {{
   Plotly.newPlot(divId, traces, layout, {{ responsive: true }});
 }}
 
+function renderGeoDrivers() {{
+  GEO_DRIVER.forEach((row, i) => {{
+    const traces = [{{
+      type: 'scatter',
+      mode: 'markers',
+      x: row.x,
+      y: row.y,
+      marker: {{ size: 6, color: '#1f77b4', opacity: 0.65, line: {{ color: 'black', width: 0.4 }} }},
+      hovertemplate: row.label + ': %{{x:.3f}}<br>' + row.response + ': %{{y:.3f}}<extra></extra>',
+      showlegend: false,
+    }}];
+    if (row.line_x.length > 0) {{
+      traces.push({{
+        type: 'scatter',
+        mode: 'lines',
+        x: row.line_x,
+        y: row.line_y,
+        line: {{ color: 'firebrick', width: 2 }},
+        hoverinfo: 'skip',
+        showlegend: false,
+      }});
+    }}
+    Plotly.newPlot('driver-plot-' + i, traces, {{
+      title: {{ text: '#' + row.rank + ' ' + row.label + '  r=' + row.r.toFixed(2), font: {{ size: 13 }} }},
+      xaxis: {{ title: row.label }},
+      yaxis: {{ title: row.response }},
+      margin: {{ l: 65, r: 16, t: 42, b: 52 }},
+      hovermode: 'closest',
+    }}, {{ responsive: true }});
+  }});
+}}
+
 // Build tabs + pages
 FIGURES.forEach((fig, i) => {{
   const btn = document.createElement('button');
@@ -2141,6 +2530,44 @@ FIGURES.forEach((fig, i) => {{
     </div>`;
   pagesEl.appendChild(page);
 }});
+
+// Geo driver diagnostic tab
+if (GEO_DRIVER.length > 0) {{
+  const geoBtn = document.createElement('button');
+  geoBtn.textContent = 'Geo Drivers';
+  geoBtn.dataset.idx = 'geo';
+  tabsEl.appendChild(geoBtn);
+
+  const geoPage = document.createElement('div');
+  geoPage.className = 'table-page';
+  geoPage.id = 'page-geo';
+  const fmtEst = v => (v === null || Number.isNaN(v)) ? '' : Math.round(v).toLocaleString();
+  let rankHTML = '<table class="driver-rank"><tr><th>Rank</th><th>Property</th><th>Correlation</th></tr>';
+  GEO_DRIVER.forEach(row => {{
+    rankHTML += '<tr><td>' + row.rank + '</td><td>' + row.label + '</td><td>' + row.r.toFixed(2) + '</td></tr>';
+  }});
+  rankHTML += '</table>';
+  const estimateTargets = Object.keys(GEO_DRIVER[0].estimates || {{}}).filter(k => GEO_DRIVER[0].estimates[k]);
+  const targetLabel = key => GEO_DRIVER[0].estimates[key].label;
+  let estimateHTML = '<table class="driver-rank"><tr><th>Rank</th><th>Property</th>' +
+    estimateTargets.map(key => '<th>' + targetLabel(key) + '<br>P10/P50/P90</th>').join('') + '</tr>';
+  GEO_DRIVER.forEach(row => {{
+    estimateHTML += '<tr><td>' + row.rank + '</td><td>' + row.label + '</td>' +
+      estimateTargets.map(key => {{
+        const est = row.estimates[key];
+        return '<td>' + (est ? (fmtEst(est.p10) + ' / ' + fmtEst(est.p50) + ' / ' + fmtEst(est.p90)) : '') + '</td>';
+      }}).join('') + '</tr>';
+  }});
+  estimateHTML += '</table>';
+  const afeLength = GEO_DRIVER[0].afe_lateral_length;
+  const estimateNote = '<div class="estimate-note">Estimated production from linear fit' +
+    ' from linear fit' + (afeLength ? ' normalized to AFE lateral length less 500 ft: ' + Math.round(afeLength).toLocaleString() + ' ft' : '') +
+    '</div>';
+  geoPage.innerHTML = rankHTML + estimateNote + estimateHTML + '<div class="driver-grid">' +
+    GEO_DRIVER.map((row, i) => '<div class="driver-plot" id="driver-plot-' + i + '"></div>').join('') +
+    '</div>';
+  pagesEl.appendChild(geoPage);
+}}
 
 // Well index tab
 const idxBtn = document.createElement('button');
@@ -2170,7 +2597,10 @@ tabsEl.addEventListener('click', e => {{
   const idx = e.target.dataset.idx;
   const el = document.getElementById('page-' + idx);
   if (el) el.classList.add('active');
-  if (idx !== 'idx' && !plotted.has(idx)) {{
+  if (idx === 'geo' && !plotted.has(idx)) {{
+    renderGeoDrivers();
+    plotted.add(idx);
+  }} else if (idx !== 'idx' && !plotted.has(idx)) {{
     buildPlot(FIGURES[parseInt(idx)], 'plot-' + idx);
     plotted.add(idx);
   }}

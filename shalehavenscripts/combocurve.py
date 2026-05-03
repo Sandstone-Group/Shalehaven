@@ -98,7 +98,7 @@ class ComboCurveClient:
 
 """
 
-def putDataComboCurveDaily(client, data):
+def putDataComboCurveDaily(client, data, operator=None):
 
     cleanComboCurveData = data.copy()
     cleanComboCurveData = cleanComboCurveData[cleanComboCurveData["chosenID"] != MISSING_CHOSEN_ID]
@@ -114,12 +114,13 @@ def putDataComboCurveDaily(client, data):
     responseJson = response.json()
     successCount = responseJson.get("successCount", 0)
     failedCount = responseJson.get("failedCount", 0)
-    text = f"Success: {successCount} Failed: {failedCount}"
+    operatorLabel = operator or "Unknown"
+    text = f"[{operatorLabel}] Success: {successCount} Failed: {failedCount}"
     print(text)
     if failedCount > 0:
-        print("Errors: " + str(responseJson.get("results", []))[:500])
+        print(f"[{operatorLabel}] Errors: " + str(responseJson.get("results", []))[:500])
 
-    print(f"Finished PUT {len(cleanTotalAssetProduction)} Rows of New Production Data to ComboCurve")
+    print(f"[{operatorLabel}] Finished PUT {len(cleanTotalAssetProduction)} Rows of New Production Data to ComboCurve")
 
     return text
 

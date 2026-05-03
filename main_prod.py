@@ -91,14 +91,14 @@ krakenProductionData = production.krakenProductionData(pathToKrakenData, krakenW
 monthlyPds = production.pdsMonthlyData(pathToMonthlyPDSData)
 
 # Put Production Data to ComboCurve
-combocurve.putDataComboCurveDaily(ccClient, admiralPermianProductionData)
-combocurve.putDataComboCurveDaily(ccClient, huntOilProductionData)
-combocurve.putDataComboCurveDaily(ccClient, aethonProductionData)
-combocurve.putDataComboCurveDaily(ccClient, devonProductionData)
-combocurve.putDataComboCurveDaily(ccClient, copProductionData)
-combocurve.putDataComboCurveDaily(ccClient, spurProductionData)
-combocurve.putDataComboCurveDaily(ccClient, ballardProductionData)
-combocurve.putDataComboCurveDaily(ccClient, krakenProductionData)
+combocurve.putDataComboCurveDaily(ccClient, admiralPermianProductionData, operator="Admiral Permian")
+combocurve.putDataComboCurveDaily(ccClient, huntOilProductionData, operator="Hunt Oil")
+combocurve.putDataComboCurveDaily(ccClient, aethonProductionData, operator="Aethon")
+combocurve.putDataComboCurveDaily(ccClient, devonProductionData, operator="Devon")
+combocurve.putDataComboCurveDaily(ccClient, copProductionData, operator="ConocoPhillips")
+combocurve.putDataComboCurveDaily(ccClient, spurProductionData, operator="Spur")
+combocurve.putDataComboCurveDaily(ccClient, ballardProductionData, operator="Ballard")
+combocurve.putDataComboCurveDaily(ccClient, krakenProductionData, operator="Kraken")
 combocurve.putDataComboCurveMonthly(ccClient, monthlyPds)
 
 # Get Daily Productions from ComboCurve for Shalehaven
