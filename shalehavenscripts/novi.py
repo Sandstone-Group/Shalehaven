@@ -1286,766 +1286,12 @@ def _fetchPlssLayers(lon_min, lat_min, lon_max, lat_max, outputDir=None):
     return townships, sections
 
 
-## Generate a multi-page PDF of interpolated heat maps for subsurface parameters
-## Uses scipy.interpolate.griddata (linear) to interpolate point values onto a regular grid,
-## overlays All.shp operator acreage + Census state + county outlines as a basemap.
-## Optionally overlays offset well lateral paths (from getNoviWellboreLocations) and AFE
-## permit locations with labels (from getWellPermits).
-## One parameter per page. Output: subsurface_heatmaps_{DSU Name}.pdf in the AFE Data/ folder.
-def plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, permitData=None, wellboreLocationsData=None, offsetData=None, labelNearestN=20, afeData=None):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    plt.rcParams["font.family"] = "Arial"
-    from matplotlib.backends.backend_pdf import PdfPages
-    from scipy.interpolate import griddata
-    import geopandas as gpd
-    import numpy as np
-
-    if parameters is None:
-        parameters = [
-            "TVD",
-            "TOC_Avg",
-            "SW_Avg",
-            "Porosity_Avg",
-            "Permeability_Avg",
-            "Thickness_Avg",
-            "VClay_Avg",
-            "Brittleness_Avg",
-        ] + _productionHeatMapParamsForAfe(afeData)
-
-    # Resolve output path (same Data/ folder as printData)
-    afeDir = os.path.dirname(pathToAfeSummary)
-    afeFilename = os.path.splitext(os.path.basename(pathToAfeSummary))[0]
-    dsuName = afeFilename.split("-", 1)[1].strip() if "-" in afeFilename else afeFilename
-    outputDir = os.path.join(afeDir, "Data")
-    os.makedirs(outputDir, exist_ok=True)
-    pdfPath = os.path.join(outputDir, f"subsurface_heatmaps_{dsuName}.pdf")
-
-    if subsurfaceData is None or subsurfaceData.empty:
-        print("No subsurface data — skipping heat map export.")
-        return
-
-    # Drop rows without lat/lon
-    df = subsurfaceData.dropna(subset=["Latitude", "Longitude"]).copy()
-    if df.empty:
-        print("No subsurface rows with valid Lat/Lon — skipping heat map export.")
-        return
-
-    # Collapse formation aliases so geologically-equivalent zones (e.g. JO MILL <-> LOWER SPRABERRY SAND) share one page
-    if "Formation" in df.columns:
-        upper = df["Formation"].astype("string").str.strip().str.upper()
-        df["Formation"] = upper.map(FORMATION_ALIASES).fillna(upper)
-
-    # Build interpolation grid covering the data extent (with small margin)
-    margin = 0.05
-    lon_min, lon_max = df["Longitude"].min() - margin, df["Longitude"].max() + margin
-    lat_min, lat_max = df["Latitude"].min() - margin, df["Latitude"].max() + margin
-    grid_lon, grid_lat = np.meshgrid(
-        np.linspace(lon_min, lon_max, 200),
-        np.linspace(lat_min, lat_max, 200),
-    )
-    points = df[["Longitude", "Latitude"]].values
-
-    # Load basemap layers once (state + county from Census TIGER, All.shp from Novi extract)
-    print("Loading basemap layers...")
-    basemaps = _ensureBasemaps()
-    states_gdf = gpd.read_file(basemaps["state"])
-    counties_gdf = gpd.read_file(basemaps["county"])
-
-    # Clip Census layers to the data extent for faster rendering
-    from shapely.geometry import box
-    bbox = box(lon_min, lat_min, lon_max, lat_max)
-    states_clip = states_gdf[states_gdf.intersects(bbox)]
-    counties_clip = counties_gdf[counties_gdf.intersects(bbox)]
-
-    # Novi All.shp operator acreage underlay (from the bulk extract)
-    try:
-        paths = getNoviBulkPaths()
-        allShpPath = os.path.join(paths["extract_dir"], "Shapefiles", "All", "All.shp")
-        if os.path.exists(allShpPath):
-            all_gdf = gpd.read_file(allShpPath)
-            all_clip = all_gdf[all_gdf.intersects(bbox)]
-            print(f"  Loaded operator acreage underlay ({len(all_clip)} polygons in extent)")
-        else:
-            all_clip = None
-            print("  No All.shp found, skipping operator acreage underlay")
-    except Exception as e:
-        all_clip = None
-        print(f"  Could not load operator acreage underlay: {e}")
-
-    # BLM PLSS layers (townships + sections) for the bbox — cached on disk after first fetch
-    # Texas has no BLM PLSS coverage (uses Block/Survey/Abstract instead) — log a warning if
-    # offset wells touch Texas so the user knows why those areas have no grid overlay.
-    if "State" in df.columns and df["State"].astype(str).str.lower().str.contains("texas").any():
-        print("  WARNING: offset wells include Texas — BLM PLSS does not cover Texas.")
-        print("           Texas areas will have no township/section grid overlay (planned for v3 via TX GLO).")
-    # Pad the PLSS fetch bbox generously (~35 mi in each direction). The offset wells'
-    # extent doesn't always reach the AFE's actual section — e.g. if the AFE targets
-    # 21S/26E but the offsets cluster in 21S/25E, the section we need to outline sits
-    # just outside the tight bbox and PLSS fetches a layer that doesn't contain it.
-    # PLSS data is small so the extra coverage is essentially free.
-    PLSS_PAD = 0.5
-    plss_townships, plss_sections = _fetchPlssLayers(
-        lon_min - PLSS_PAD, lat_min - PLSS_PAD, lon_max + PLSS_PAD, lat_max + PLSS_PAD
-    )
-
-    # Pre-group wellbore trajectories by API10 (sorted by Path) for fast per-page plotting
-    wb_groups = None
-    wb_midpoints = {}  # api10 -> (lon, lat) midpoint of trajectory (used for distance ranking)
-    wb_heels = {}      # api10 -> (lon, lat) heel of lateral (first path point) for number labels
-    if wellboreLocationsData is not None and not wellboreLocationsData.empty:
-        wb_clean = wellboreLocationsData.dropna(subset=["Latitude", "Longitude"])
-        wb_groups = list(wb_clean.sort_values(["API10", "Path"]).groupby("API10"))
-        for api10, group in wb_groups:
-            mid = len(group) // 2
-            wb_midpoints[api10] = (group["Longitude"].iloc[mid], group["Latitude"].iloc[mid])
-            wb_heels[api10] = (group["Longitude"].iloc[0], group["Latitude"].iloc[0])
-        print(f"  Loaded {len(wb_groups)} offset well trajectories ({len(wb_clean):,} total points)")
-
-    # Build api10 -> WellName / operator / first-prod-year lookup from offsetData
-    # plus a fallback (lon, lat) using MPLatitude/MPLongitude for wells without wellbore trajectory data.
-    api10_to_name = {}
-    api10_to_operator = {}
-    api10_to_first_prod = {}
-    api10_to_fallback_pos = {}
-    if offsetData is not None and not offsetData.empty:
-        optional_cols = ["WellName", "MPLatitude", "MPLongitude", "CurrentOperator", "FirstProductionYear"]
-        cols_needed = ["API10"] + [c for c in optional_cols if c in offsetData.columns]
-        sub = offsetData[cols_needed].copy()
-        for _, r in sub.iterrows():
-            api10 = str(r["API10"]) if pd.notna(r["API10"]) else None
-            if not api10:
-                continue
-            if "WellName" in sub.columns and pd.notna(r.get("WellName")):
-                api10_to_name[api10] = str(r["WellName"])
-            if "CurrentOperator" in sub.columns and pd.notna(r.get("CurrentOperator")):
-                api10_to_operator[api10] = str(r["CurrentOperator"])
-            if "FirstProductionYear" in sub.columns and pd.notna(r.get("FirstProductionYear")):
-                try:
-                    api10_to_first_prod[api10] = int(r["FirstProductionYear"])
-                except (ValueError, TypeError):
-                    pass
-            if "MPLatitude" in sub.columns and "MPLongitude" in sub.columns \
-                    and pd.notna(r.get("MPLatitude")) and pd.notna(r.get("MPLongitude")):
-                api10_to_fallback_pos[api10] = (float(r["MPLongitude"]), float(r["MPLatitude"]))
-
-    # AFE-driven DSU section matching:
-    # For each AFE row, parse Township/Range/Section and find matching BLM PLSS section polygons.
-    # Each AFE row gets a letter (A, B, C, ...) and may span multiple sections (e.g. "9,10").
-    # Wells with no PLSS match (TX, PA, missing T/R/S) fall back to a red star at the permit point.
-    def _afe_letter(i):
-        if i < 26:
-            return chr(ord("A") + i)
-        return chr(ord("A") + (i // 26 - 1)) + chr(ord("A") + (i % 26))
-
-    # Tuples include the AFE row's Landing Zone (uppercased) so we can filter the
-    # legend per-formation at render time without re-iterating afeData. The DSU section
-    # groups stay GLOBAL (no filtering) so the box always renders on every page.
-    numbered_permits = []   # list of (letter, well_name, lz_upper)
-    dsu_section_groups = [] # list of (letter, well_name, sections_gdf) — global, never filtered
-    permit_fallbacks = []   # list of (letter, well_name, lon, lat, lz_upper)
-
-    if afeData is not None and not afeData.empty:
-        print(f"Matching {len(afeData)} AFE rows to PLSS sections...")
-        # Diagnostic: dump the first few township values from the PLSS layer so we
-        # can compare format against what we parse from the AFE Summary.
-        if plss_townships is not None and not plss_townships.empty:
-            sample_cols = [c for c in ["STATEABBR", "TWNSHPNO", "TWNSHPDIR", "RANGENO", "RANGEDIR"] if c in plss_townships.columns]
-            print(f"  PLSS township sample (first 3 rows, cols={sample_cols}):")
-            for _, trow in plss_townships[sample_cols].head(3).iterrows():
-                print(f"    {dict(trow)}")
-        for i, (_idx, row) in enumerate(afeData.iterrows()):
-            letter = _afe_letter(i)
-            well_name = str(row.get("Well Name", f"Well {i + 1}")).strip()
-            lz_upper = _canonicalFormation(str(row.get("Landing Zone", "")).strip().upper())
-            numbered_permits.append((letter, well_name, lz_upper))
-
-            state_full = str(row.get("State", "")).strip().lower()
-            twp_str = str(row.get("Township", "")).strip()
-            rng_str = str(row.get("Range", "")).strip()
-            sec_str = str(row.get("Section", "")).strip()
-            state_abbr = STATE_ABBR_MAP.get(state_full)
-
-            twp_no, twp_dir = _parse_tr(twp_str, "twp")
-            rng_no, rng_dir = _parse_tr(rng_str, "rng")
-            print(
-                f"  {letter}. {well_name}: state={state_abbr or '?'} "
-                f"twp={twp_str!r}->({twp_no},{twp_dir}) "
-                f"rng={rng_str!r}->({rng_no},{rng_dir}) "
-                f"sec={sec_str!r}"
-            )
-
-            matched_sections = None
-            if (
-                state_abbr
-                and twp_str and rng_str and sec_str
-                and plss_townships is not None and not plss_townships.empty
-                and plss_sections is not None and not plss_sections.empty
-            ):
-                if twp_no and twp_dir and rng_no and rng_dir:
-                    twp_match = plss_townships[
-                        (plss_townships["STATEABBR"] == state_abbr)
-                        & (plss_townships["TWNSHPNO"].astype(str) == twp_no)
-                        & (plss_townships["TWNSHPDIR"].astype(str) == twp_dir)
-                        & (plss_townships["RANGENO"].astype(str) == rng_no)
-                        & (plss_townships["RANGEDIR"].astype(str) == rng_dir)
-                    ]
-                    if not twp_match.empty:
-                        plssids = twp_match["PLSSID"].tolist()
-                        try:
-                            sec_nums = [s.strip().zfill(2) for s in sec_str.split(",") if s.strip()]
-                        except Exception:
-                            sec_nums = []
-                        if sec_nums:
-                            sec_match = plss_sections[
-                                plss_sections["PLSSID"].isin(plssids)
-                                & plss_sections["FRSTDIVNO"].astype(str).isin(sec_nums)
-                            ]
-                            if not sec_match.empty:
-                                matched_sections = sec_match
-                                print(f"  {letter}. {well_name}: {len(sec_match)} sections matched ({twp_str} {rng_str} sec {sec_str})")
-
-            if matched_sections is not None and not matched_sections.empty:
-                dsu_section_groups.append((letter, well_name, matched_sections))
-            else:
-                # Fallback: use the permit point (looked up from permitData by WellName)
-                fallback_lon = fallback_lat = None
-                if permitData is not None and not permitData.empty and "WellName" in permitData.columns:
-                    p_match = permitData[permitData["WellName"].astype(str) == well_name]
-                    p_match = p_match.dropna(subset=["Latitude", "Longitude"])
-                    if not p_match.empty:
-                        fallback_lon = p_match["Longitude"].iloc[0]
-                        fallback_lat = p_match["Latitude"].iloc[0]
-                if fallback_lon is not None:
-                    permit_fallbacks.append((letter, well_name, fallback_lon, fallback_lat, lz_upper))
-                    print(f"  {letter}. {well_name}: no PLSS section match — using star fallback at permit point")
-                else:
-                    print(f"  {letter}. {well_name}: no PLSS section match and no permit point — skipping marker")
-
-    # Number EVERY offset well sequentially (1, 2, 3, ...) ordered by distance from the
-    # AFE permit centroid. The on-map number is the lookup key; the full name → operator →
-    # API → distance table is rendered on a dedicated appendix page at the end of the PDF.
-    # `labelNearestN` is preserved for back-compat: 0 (default) means "label all".
-    numbered_wells = []          # list of (number, api10, name, operator, dist_mi, first_prod) sorted by distance
-    api10_to_number = {}
-    api10_to_distance_mi = {}
-
-    permit_pts = None
-    if permitData is not None and not permitData.empty:
-        permit_pts = permitData.dropna(subset=["Latitude", "Longitude"])
-
-    if (
-        permit_pts is not None
-        and not permit_pts.empty
-        and api10_to_name
-    ):
-        permit_centroid_lon = permit_pts["Longitude"].mean()
-        permit_centroid_lat = permit_pts["Latitude"].mean()
-        # Distance in degrees for ranking; converted to miles below using local cos(lat) factor
-        deg_to_mi_lat = 69.0
-        deg_to_mi_lon = 69.0 * abs(math.cos(math.radians(permit_centroid_lat)))
-
-        dists = []
-        for api10 in api10_to_name.keys():
-            # Prefer wellbore midpoint, fall back to MP (surface point) if no trajectory data
-            if api10 in wb_midpoints:
-                lon, lat = wb_midpoints[api10]
-            elif api10 in api10_to_fallback_pos:
-                lon, lat = api10_to_fallback_pos[api10]
-            else:
-                continue
-            d_deg = ((lon - permit_centroid_lon) ** 2 + (lat - permit_centroid_lat) ** 2) ** 0.5
-            d_mi = (((lon - permit_centroid_lon) * deg_to_mi_lon) ** 2
-                    + ((lat - permit_centroid_lat) * deg_to_mi_lat) ** 2) ** 0.5
-            dists.append((d_deg, d_mi, api10))
-        dists.sort()
-
-        # Optional cap for back-compat — 0 / None / negative means "all"
-        cap = labelNearestN if (labelNearestN and labelNearestN > 0) else len(dists)
-        for i, (_d_deg, d_mi, api10) in enumerate(dists[:cap], start=1):
-            name = api10_to_name.get(api10, "")
-            operator = api10_to_operator.get(api10, "")
-            first_prod = api10_to_first_prod.get(api10)
-            numbered_wells.append((i, api10, name, operator, d_mi, first_prod))
-            api10_to_number[api10] = i
-            api10_to_distance_mi[api10] = d_mi
-        print(f"  Numbered {len(numbered_wells)} offset wells by distance from permit centroid")
-
-    # Build API10 -> Formation lookup
-    api10_to_formation = {}
-    if offsetData is not None and "Formation" in offsetData.columns:
-        for _, r in offsetData[["API10", "Formation"]].dropna().iterrows():
-            api10_to_formation[str(r["API10"])] = str(r["Formation"]).upper()
-
-    # Determine landing zones to render. If subsurface has multiple Formation values
-    # (one per AFE landing zone), render one page per (parameter, formation) combo.
-    if "Formation" in df.columns:
-        formations = sorted(df["Formation"].dropna().astype(str).str.upper().unique().tolist())
-    else:
-        formations = []
-
-    # Point Pleasant and Utica each get their own page
-
-    if not formations:
-        formations = [None]
-
-    print(f"Generating heat map PDF: {pdfPath}")
-    with PdfPages(pdfPath) as pdf:
-        for param in parameters:
-            if param not in df.columns:
-                print(f"  Skipping {param}: column not in subsurface data")
-                continue
-
-            for fm_label in formations:
-                # Slice subsurface, wellbores, offset legend, and AFE legend to this
-                # formation. Map extent + DSU box + basemap stay GLOBAL — only the
-                # heatmap data and the side legend change per formation page.
-                if fm_label is None:
-                    df_fm = df
-                    api10_set_fm = None
-                else:
-                    df_fm = df[df["Formation"].astype(str).str.upper() == fm_label]
-                    api10_set_fm = set(df_fm["API10"].astype(str).tolist())
-
-                values = pd.to_numeric(df_fm[param], errors="coerce")
-                mask = values.notna()
-                if mask.sum() < 4:
-                    print(f"  Skipping {param} [{fm_label or 'ALL'}]: only {mask.sum()} valid values (need >= 4 for interpolation)")
-                    continue
-
-                points_fm = df_fm[["Longitude", "Latitude"]].values
-
-                # Filter wellbores and offset numbering to this formation's API10s
-                if api10_set_fm is None:
-                    wb_groups_fm = wb_groups
-                    numbered_wells_fm = numbered_wells
-                else:
-                    wb_groups_fm = (
-                        [(a, g) for a, g in wb_groups if str(a) in api10_set_fm]
-                        if wb_groups is not None else None
-                    )
-                    numbered_wells_fm = [w for w in numbered_wells if str(w[1]) in api10_set_fm]
-
-                # Filter AFE permit legend by Landing Zone (DSU box stays global)
-                if fm_label is None:
-                    numbered_permits_fm = numbered_permits
-                    permit_fallbacks_fm = permit_fallbacks
-                else:
-                    numbered_permits_fm = [p for p in numbered_permits if p[2] == fm_label]
-                    permit_fallbacks_fm = [p for p in permit_fallbacks if p[4] == fm_label]
-
-                # Linear interpolation — NaN outside the convex hull (no dishonest extrapolation)
-                interp = griddata(
-                    points_fm[mask.values],
-                    values[mask].values,
-                    (grid_lon, grid_lat),
-                    method="linear",
-                )
-
-                # Wider figure when we have a numbered-well legend to render on the right
-                if numbered_wells_fm:
-                    fig, ax = plt.subplots(figsize=(14, 8.5))
-                    fig.subplots_adjust(left=0.06, right=0.69, top=0.93, bottom=0.07)
-                else:
-                    fig, ax = plt.subplots(figsize=(11, 8.5))
-                import matplotlib.patheffects as path_effects
-
-                # Layer order (bottom → top):
-                #  1. Operator acreage underlay
-                #  2. County boundaries
-                #  3. PLSS section boundaries (subtle grid)
-                #  4. Heat map contourf
-                #  5. Wellbore lateral paths (uniform black)
-                #  6. PLSS township boundaries (brown)
-                #  7. State boundaries (black)
-                #  8. Offset well markers (small black dots)
-                #  9. AFE DSU section box (black, GLOBAL — same on every page)
-                #  9. AFE permit stars (red, filtered to this formation)
-                # 10. PLSS section number labels
-                # 11. PLSS township T/R labels
-                # 12. AFE permit name labels
-
-                if all_clip is not None and not all_clip.empty:
-                    all_clip.plot(ax=ax, facecolor="#f0f0f0", edgecolor="#cccccc", linewidth=0.2, zorder=1)
-                if not counties_clip.empty:
-                    counties_clip.boundary.plot(ax=ax, color="#999999", linewidth=0.4, zorder=2)
-
-                if plss_sections is not None and not plss_sections.empty:
-                    plss_sections.boundary.plot(ax=ax, color="#bbbbbb", linewidth=0.3, alpha=0.4, zorder=3)
-
-                cf = ax.contourf(grid_lon, grid_lat, interp, levels=20, cmap="viridis", zorder=4, alpha=0.85)
-
-                # Offset well lateral paths
-                if wb_groups_fm is not None:
-                    for _api10, group in wb_groups_fm:
-                        ax.plot(
-                            group["Longitude"].values,
-                            group["Latitude"].values,
-                            color="black",
-                            linewidth=1.0,
-                            alpha=0.85,
-                            zorder=5,
-                        )
-
-                if plss_townships is not None and not plss_townships.empty:
-                    plss_townships.boundary.plot(ax=ax, color="#8b6914", linewidth=0.7, alpha=0.7, zorder=6)
-
-                if not states_clip.empty:
-                    states_clip.boundary.plot(ax=ax, color="black", linewidth=1.0, zorder=7)
-
-                ax.scatter(
-                    df_fm["Longitude"][mask], df_fm["Latitude"][mask],
-                    c="black", s=6, alpha=0.6, zorder=8, label="Offset Wells",
-                )
-
-                # AFE DSU highlight — bold black perimeter around the union of all DSU sections.
-                # GLOBAL: drawn from the unfiltered dsu_section_groups so the box always
-                # appears on every formation page regardless of Landing Zone matching.
-                from shapely.ops import unary_union
-                for _letter, _name, sec_gdf in dsu_section_groups:
-                    union_geom = unary_union(list(sec_gdf.geometry))
-                    gpd.GeoSeries([union_geom], crs=sec_gdf.crs).boundary.plot(
-                        ax=ax, color="black", linewidth=2.2, zorder=9,
-                    )
-                # Star fallback for AFE rows with no PLSS section match (TX, PA, etc.)
-                if permit_fallbacks_fm:
-                    fb_lon = [f[2] for f in permit_fallbacks_fm]
-                    fb_lat = [f[3] for f in permit_fallbacks_fm]
-                    ax.scatter(
-                        fb_lon, fb_lat,
-                        marker="*", c="red", s=180, edgecolor="black", linewidth=0.8,
-                        zorder=9, label="AFE Permit (no PLSS)",
-                    )
-
-                # === Labels (all on top of data layers) ===
-
-                if plss_sections is not None and not plss_sections.empty and "FRSTDIVLAB" in plss_sections.columns:
-                    sec_halo = [path_effects.withStroke(linewidth=1.5, foreground="white")]
-                    for _, sec in plss_sections.iterrows():
-                        c = sec.geometry.centroid
-                        if lon_min <= c.x <= lon_max and lat_min <= c.y <= lat_max:
-                            ax.annotate(
-                                str(sec["FRSTDIVLAB"]),
-                                xy=(c.x, c.y),
-                                ha="center", va="center",
-                                fontsize=5,
-                                color="#555555",
-                                zorder=10,
-                                path_effects=sec_halo,
-                            )
-
-                if plss_townships is not None and not plss_townships.empty and "TWNSHPLAB" in plss_townships.columns:
-                    tr_halo = [path_effects.withStroke(linewidth=2.0, foreground="white")]
-                    for _, twp in plss_townships.iterrows():
-                        c = twp.geometry.centroid
-                        if lon_min <= c.x <= lon_max and lat_min <= c.y <= lat_max:
-                            ax.annotate(
-                                str(twp["TWNSHPLAB"]),
-                                xy=(c.x, c.y),
-                                ha="center", va="center",
-                                fontsize=7,
-                                fontweight="bold",
-                                color="#5a4509",
-                                zorder=11,
-                                path_effects=tr_halo,
-                            )
-
-                # Offset well numbers — small navy boxed badges at each lateral's heel
-                if numbered_wells_fm:
-                    num_box = dict(
-                        boxstyle="round,pad=0.15",
-                        facecolor="white",
-                        edgecolor="#0a2a5e",
-                        linewidth=0.5,
-                    )
-                    for number, api10, _name, _op, _dmi, _fp in numbered_wells_fm:
-                        if api10 in wb_heels:
-                            lon, lat = wb_heels[api10]
-                        elif api10 in api10_to_fallback_pos:
-                            lon, lat = api10_to_fallback_pos[api10]
-                        else:
-                            continue
-                        if not (lon_min <= lon <= lon_max and lat_min <= lat <= lat_max):
-                            continue
-                        ax.annotate(
-                            str(number),
-                            xy=(lon, lat),
-                            xytext=(4, 4),
-                            textcoords="offset points",
-                            fontsize=5,
-                            fontweight="bold",
-                            color="#0a2a5e",
-                            zorder=11,
-                            bbox=num_box,
-                        )
-
-                # AFE letter labels — only rendered for non-PLSS fallback stars (TX, PA)
-                permit_halo = [path_effects.withStroke(linewidth=2.5, foreground="white")]
-                for letter, _name, lon, lat, _lz in permit_fallbacks_fm:
-                    ax.annotate(
-                        letter,
-                        xy=(lon, lat),
-                        xytext=(8, 8),
-                        textcoords="offset points",
-                        fontsize=12,
-                        fontweight="bold",
-                        color="darkred",
-                        zorder=12,
-                        path_effects=permit_halo,
-                    )
-
-                ax.set_xlim(lon_min, lon_max)
-                ax.set_ylim(lat_min, lat_max)
-                ax.set_xlabel("Longitude")
-                ax.set_ylabel("Latitude")
-                param_label = _subsurfaceParamLabel(param)
-                title_suffix = f" [{fm_label}]" if fm_label else ""
-                ax.set_title(f"{param_label}{title_suffix} — {mask.sum():,} wells")
-                ax.legend(loc="upper right", fontsize=8)
-                ax.set_aspect("equal", adjustable="box")
-                cbar = plt.colorbar(cf, ax=ax, shrink=0.8)
-                cbar.set_label(param_label)
-
-                # Side legend: AFE permits + offset wells, both filtered to this formation
-                MAX_NAME_LEN = 38
-                PERMIT_LINE_H = 0.018
-                OFFSET_LINE_H = 0.016
-                STACK_GAP = 0.04
-
-                permit_box_h = ((len(numbered_permits_fm) + 2) * PERMIT_LINE_H) if numbered_permits_fm else 0
-                offset_box_h = ((len(numbered_wells_fm) + 2) * OFFSET_LINE_H) if numbered_wells_fm else 0
-                total_h = permit_box_h + (STACK_GAP if (permit_box_h and offset_box_h) else 0) + offset_box_h
-                stack_top = 0.5 + total_h / 2
-
-                permit_y_top = stack_top
-                if numbered_permits_fm:
-                    header = f"AFE Permits [{fm_label}]" if fm_label else "AFE Permits"
-                    permit_lines = [header, "-" * 32]
-                    for letter, name, _lz in numbered_permits_fm:
-                        display = name if len(name) <= MAX_NAME_LEN else name[: MAX_NAME_LEN - 3] + "..."
-                        permit_lines.append(f"{letter}. {display}")
-                    permit_text = "\n".join(permit_lines)
-                    fig.text(
-                        0.71, permit_y_top, permit_text,
-                        fontsize=7,
-                        family="monospace",
-                        fontweight="bold",
-                        verticalalignment="top",
-                        horizontalalignment="left",
-                        bbox=dict(facecolor="white", edgecolor="black", linewidth=0.6, pad=6),
-                    )
-
-                if numbered_wells_fm:
-                    offset_y_top = stack_top - permit_box_h - (STACK_GAP if permit_box_h else 0)
-                    offset_lines = [f"Offset Wells (by distance, n={len(numbered_wells_fm)})", "-" * 32]
-                    num_width = len(str(len(numbered_wells_fm)))
-                    for number, _api10, name, _op, _dmi, _fp in numbered_wells_fm:
-                        display = name if len(name) <= MAX_NAME_LEN else name[: MAX_NAME_LEN - 3] + "..."
-                        offset_lines.append(f"{str(number).rjust(num_width)}. {display}")
-                    offset_text = "\n".join(offset_lines)
-                    fig.text(
-                        0.71, offset_y_top, offset_text,
-                        fontsize=6.5,
-                        family="monospace",
-                        verticalalignment="top",
-                        horizontalalignment="left",
-                        bbox=dict(facecolor="white", edgecolor="black", linewidth=0.6, pad=6),
-                    )
-
-                pdf.savefig(fig, bbox_inches="tight")
-                plt.close(fig)
-                print(f"  Plotted {param} [{fm_label or 'ALL'}] ({mask.sum():,} wells)")
-
-        # === Geo driver diagnostic ===
-        response_param = _geoDriverProductionParam(afeData, df)
-        driver_params = [p for p in GEO_DRIVER_PARAMS if p in df.columns]
-        if response_param in df.columns and driver_params:
-            y_all, response_label, estimate_label, afe_lateral_length = _geoDriverResponseSeries(
-                df, response_param, afeData
-            )
-            estimate_targets = _geoDriverEstimateTargets(afeData)
-            rows = []
-            for driver in driver_params:
-                x = pd.to_numeric(df[driver], errors="coerce")
-                y = y_all
-                valid = x.notna() & y.notna()
-                if valid.sum() < 4:
-                    continue
-                r = x[valid].corr(y[valid])
-                if pd.isna(r):
-                    continue
-                x_valid = x[valid]
-                y_valid = y[valid]
-                slope, intercept = np.polyfit(x_valid, y_valid, 1)
-                x10, x50, x90 = np.percentile(x_valid, [10, 50, 90])
-                est10 = slope * x10 + intercept
-                est50 = slope * x50 + intercept
-                est90 = slope * x90 + intercept
-                if afe_lateral_length:
-                    est10 *= afe_lateral_length
-                    est50 *= afe_lateral_length
-                    est90 *= afe_lateral_length
-                high_est = max(est10, est90)
-                low_est = min(est10, est90)
-                rows.append({
-                    "param": driver,
-                    "label": _subsurfaceParamLabel(driver),
-                    "x": x_valid,
-                    "y": y_valid,
-                    "r": r,
-                    "n": int(valid.sum()),
-                    "abs_r": abs(r),
-                    "slope": slope,
-                    "intercept": intercept,
-                    "x10": x10,
-                    "x50": x50,
-                    "x90": x90,
-                    "est_p10": high_est,
-                    "est_p50": est50,
-                    "est_p90": low_est,
-                    "estimates": {
-                        target: _geoDriverEstimateForTarget(df, driver, target, afe_lateral_length)
-                        for target in estimate_targets
-                    },
-                })
-
-            if rows:
-                rows_sorted = sorted(rows, key=lambda r: r["r"], reverse=True)
-                rank_lookup = {r["param"]: i + 1 for i, r in enumerate(rows_sorted)}
-
-                fig, axes = plt.subplots(2, 4, figsize=(14, 8.5))
-                axes = axes.flatten()
-                fig.suptitle(
-                    f"Geo Property Drivers vs {response_label} — {dsuName}",
-                    fontsize=13,
-                    fontweight="bold",
-                )
-
-                for ax, row in zip(axes, rows_sorted):
-                    x = row["x"]
-                    y = row["y"]
-                    ax.scatter(x, y, s=14, alpha=0.65, color="#1f77b4", edgecolor="black", linewidth=0.2)
-                    if len(x) >= 4 and x.nunique() > 1:
-                        slope = row["slope"]
-                        intercept = row["intercept"]
-                        x_line = np.linspace(x.min(), x.max(), 100)
-                        ax.plot(x_line, slope * x_line + intercept, color="firebrick", linewidth=1.2)
-                    rank = rank_lookup[row["param"]]
-                    ax.set_title(f"#{rank} {row['label']}  r={row['r']:.2f}", fontsize=9)
-                    ax.set_xlabel(row["label"], fontsize=8)
-                    ax.set_ylabel(response_label, fontsize=8)
-                    ax.tick_params(labelsize=7)
-                    ax.grid(True, alpha=0.25)
-
-                for ax in axes[len(rows):]:
-                    ax.axis("off")
-
-                def _fmt_est(v):
-                    return f"{v:,.0f}" if pd.notna(v) else ""
-
-                note_lines = ["Estimated production from linear fit:"]
-                if afe_lateral_length:
-                    note_lines.append(f"Normalized to AFE lateral length less 500 ft: {afe_lateral_length:,.0f} ft")
-                target_headers = [(_subsurfaceParamLabel(t)[:16]).ljust(16) for t in estimate_targets]
-                note_lines.append("Rank  Driver              " + "  ".join(target_headers))
-                note_lines.append("                         " + "  ".join(["P10/P50/P90".ljust(16) for _ in estimate_targets]))
-                for i, row in enumerate(rows_sorted, start=1):
-                    label = row["label"][:18].ljust(18)
-                    estimate_cells = []
-                    for target in estimate_targets:
-                        est = row["estimates"].get(target)
-                        if est is None:
-                            estimate_cells.append("".ljust(16))
-                        else:
-                            estimate_cells.append(
-                                f"{_fmt_est(est['p10'])}/{_fmt_est(est['p50'])}/{_fmt_est(est['p90'])}"[:16].ljust(16)
-                            )
-                    note_lines.append(
-                        f"{str(i).rjust(4)}  {label}  " + "  ".join(estimate_cells)
-                    )
-                fig.text(
-                    0.77,
-                    0.18,
-                    "\n".join(note_lines),
-                    fontsize=8,
-                    family="monospace",
-                    verticalalignment="top",
-                    bbox=dict(facecolor="white", edgecolor="#777777", linewidth=0.6, pad=6),
-                )
-                fig.tight_layout(rect=[0.03, 0.03, 0.98, 0.93])
-                pdf.savefig(fig, bbox_inches="tight")
-                plt.close(fig)
-                print(f"  Appended geo driver diagnostic vs {response_label}")
-        else:
-            print(f"  Skipping geo driver diagnostic: {response_param} or driver columns missing")
-
-        # === Appendix pages ===
-        # Full offset well index (number → name → API10 → distance → first prod year),
-        # rendered as multi-page tables, ~50 rows per page. Operator column removed.
-        if numbered_wells:
-            ROWS_PER_PAGE = 50
-            COL_HEADERS = ["#", "Well Name", "API10", "Dist (mi)", "1st Prod"]
-            COL_WIDTHS = [0.05, 0.55, 0.18, 0.10, 0.09]
-
-            def _truncate(s, n):
-                s = str(s) if s is not None else ""
-                return s if len(s) <= n else s[: n - 1] + "…"
-
-            total_pages = (len(numbered_wells) + ROWS_PER_PAGE - 1) // ROWS_PER_PAGE
-            for page_i in range(total_pages):
-                start = page_i * ROWS_PER_PAGE
-                end = min(start + ROWS_PER_PAGE, len(numbered_wells))
-                page_rows = numbered_wells[start:end]
-
-                fig = plt.figure(figsize=(11, 8.5))
-                fig.subplots_adjust(left=0.04, right=0.96, top=0.94, bottom=0.05)
-                ax = fig.add_subplot(111)
-                ax.axis("off")
-
-                title = f"Offset Well Index — {dsuName}  (page {page_i + 1}/{total_pages}, wells {start + 1}-{end} of {len(numbered_wells)})"
-                ax.set_title(title, fontsize=11, fontweight="bold", loc="left", pad=14)
-
-                # Build table data
-                table_data = []
-                for number, api10, name, _op, dmi, fp in page_rows:
-                    table_data.append([
-                        str(number),
-                        _truncate(name, 64),
-                        str(api10),
-                        f"{dmi:.2f}" if dmi is not None else "",
-                        str(fp) if fp is not None else "",
-                    ])
-
-                table = ax.table(
-                    cellText=table_data,
-                    colLabels=COL_HEADERS,
-                    colWidths=COL_WIDTHS,
-                    loc="upper left",
-                    cellLoc="left",
-                )
-                table.auto_set_font_size(False)
-                table.set_fontsize(7)
-                table.scale(1.0, 1.15)
-
-                # Style header row
-                for col_i in range(len(COL_HEADERS)):
-                    cell = table[(0, col_i)]
-                    cell.set_facecolor("#f28c28")
-                    cell.set_text_props(color="white", fontweight="bold")
-
-                pdf.savefig(fig, bbox_inches="tight")
-                plt.close(fig)
-
-            print(f"  Appended {total_pages} offset well index page(s)")
-
-    print(f"Done. Saved heat maps to {pdfPath}")
-
-
 ## Generate an interactive HTML page of interpolated heat maps for subsurface parameters
 ## Uses Plotly.js (loaded from CDN) for zoomable, hoverable contour maps with well overlays.
-## Mirrors the data pipeline of plotSubsurfaceHeatMaps but outputs a single self-contained HTML
-## file instead of a static PDF.  Open the resulting file in any browser.
+## scipy.interpolate.griddata (linear) interpolates point values onto a regular grid;
+## All.shp operator acreage + Census state/county outlines render as a basemap.
+## Optionally overlays offset well lateral paths (from getNoviWellboreLocations) and AFE
+## permit locations with labels (from getWellPermits). Open the file in any browser.
 ## Output: subsurface_heatmaps_{DSU Name}.html in the AFE Data/ folder.
 def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None, permitData=None,
                                 wellboreLocationsData=None, offsetData=None, labelNearestN=20, afeData=None):
@@ -2177,6 +1423,37 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
                 "name": str(r.get("WellName", "")) if pd.notna(r.get("WellName")) else "",
             })
 
+    # Match AFE permits to lat/lon by well name so we can interpolate the
+    # subsurface parameter at each AFE location (and fall back to the permit centroid).
+    def _normName(s):
+        return re.sub(r"[^A-Z0-9]", "", str(s).upper())
+    permit_by_name = {_normName(pm["name"]): pm for pm in permit_markers if pm["name"]}
+    permit_centroid = None
+    if permit_pts is not None and not permit_pts.empty:
+        permit_centroid = (float(permit_pts["Longitude"].mean()), float(permit_pts["Latitude"].mean()))
+    afe_with_loc = []
+    for ap in afe_permits:
+        norm = _normName(ap["name"])
+        pm = permit_by_name.get(norm) if norm else None
+        if pm is None and norm:
+            for k, v in permit_by_name.items():
+                if k and (norm in k or k in norm):
+                    pm = v
+                    break
+        if pm is not None:
+            lon, lat = pm["lon"], pm["lat"]
+        elif permit_centroid is not None:
+            lon, lat = permit_centroid
+        else:
+            lon, lat = None, None
+        afe_with_loc.append({
+            "letter": ap["letter"],
+            "name": ap["name"],
+            "lz": ap["lz"],
+            "lon": lon,
+            "lat": lat,
+        })
+
     # Determine formations — each gets its own page
     if "Formation" in df.columns:
         formations = sorted(df["Formation"].dropna().astype(str).str.upper().unique().tolist())
@@ -2223,6 +1500,27 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
             for row in interp.tolist():
                 z_data.append([None if (v is None or v != v) else round(v, 4) for v in row])
 
+            # Estimate parameter value at each AFE permit location (interpolation).
+            # Linear first; fall back to nearest if the point sits outside the convex hull.
+            valid_pts = points_fm[mask.values]
+            valid_vals = values[mask].values
+            afe_estimates = []
+            for ap in afe_with_loc:
+                if ap["lon"] is None or ap["lat"] is None:
+                    afe_estimates.append({
+                        "letter": ap["letter"], "name": ap["name"], "lz": ap["lz"], "value": None,
+                    })
+                    continue
+                lin = griddata(valid_pts, valid_vals, ([ap["lon"]], [ap["lat"]]), method="linear")
+                v = float(lin[0]) if lin is not None and not np.isnan(lin[0]) else None
+                if v is None:
+                    nr = griddata(valid_pts, valid_vals, ([ap["lon"]], [ap["lat"]]), method="nearest")
+                    v = float(nr[0]) if nr is not None and not np.isnan(nr[0]) else None
+                afe_estimates.append({
+                    "letter": ap["letter"], "name": ap["name"], "lz": ap["lz"],
+                    "value": None if v is None else round(v, 4),
+                })
+
             # Wellbore traces
             wb_traces = []
             if wb_groups is not None:
@@ -2261,18 +1559,56 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
             figures.append({
                 "title": f"{param_label}{title_suffix} — {mask.sum()} wells",
                 "param": param_label,
+                "param_key": param,
+                "fm_label": fm_label,
                 "z": z_data,
                 "lon": lon_list,
                 "lat": lat_list,
                 "wb_traces": wb_traces,
                 "num_markers": num_markers,
                 "permit_markers": permit_markers,
+                "afe_estimates": afe_estimates,
             })
             print(f"  Prepared {param} [{fm_label or 'ALL'}] ({mask.sum()} wells)")
+
+    # Aggregate AFE subsurface estimates for the Geo Drivers page table.
+    # For each AFE, prefer the heatmap matching its landing-zone formation; fall back
+    # to the all-formations heatmap, then to any available formation for that parameter.
+    afe_subsurface_table_params = [
+        p for p in [
+            "TVD", "TOC_Avg", "SW_Avg", "Porosity_Avg",
+            "Permeability_Avg", "Thickness_Avg", "VClay_Avg", "Brittleness_Avg",
+        ]
+        if p in df.columns
+    ]
+    estimate_index = {}  # (param_key, fm_label) -> {letter: value}
+    for fig in figures:
+        key = (fig["param_key"], fig["fm_label"])
+        estimate_index[key] = {est["letter"]: est["value"] for est in fig.get("afe_estimates", [])}
+
+    afe_subsurface_estimates = []
+    for param in afe_subsurface_table_params:
+        row = {"param": param, "label": _subsurfaceParamLabel(param), "by_letter": {}}
+        for ap in afe_with_loc:
+            val = None
+            if (param, ap["lz"]) in estimate_index:
+                val = estimate_index[(param, ap["lz"])].get(ap["letter"])
+            if val is None and (param, None) in estimate_index:
+                val = estimate_index[(param, None)].get(ap["letter"])
+            if val is None:
+                for (p, _fm), letters in estimate_index.items():
+                    if p == param:
+                        v = letters.get(ap["letter"])
+                        if v is not None:
+                            val = v
+                            break
+            row["by_letter"][ap["letter"]] = val
+        afe_subsurface_estimates.append(row)
 
     # Build geo-driver diagnostic data for a tab inserted before Well Index
     response_param = _geoDriverProductionParam(afeData, df)
     geo_driver_analysis = []
+    afe_estimate_lookup = {row["param"]: row["by_letter"] for row in afe_subsurface_estimates}
     if response_param in df.columns:
         y_all, response_label, estimate_label, afe_lateral_length = _geoDriverResponseSeries(
             df, response_param, afeData
@@ -2308,6 +1644,23 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
                     est10 *= afe_lateral_length
                     est50 *= afe_lateral_length
                     est90 *= afe_lateral_length
+            # AFE markers for this driver — at each AFE's heat-map estimate, with
+            # y from the regression line so the dot sits on the trend.
+            afe_points = []
+            estimate_for_driver = afe_estimate_lookup.get(driver, {})
+            for ap in afe_with_loc:
+                est_x = estimate_for_driver.get(ap["letter"])
+                if est_x is None:
+                    continue
+                pred_y = float(slope * est_x + intercept) if slope is not None else None
+                afe_points.append({
+                    "letter": ap["letter"],
+                    "name": ap["name"],
+                    "lz": ap["lz"],
+                    "x": float(est_x),
+                    "y": pred_y,
+                })
+
             geo_driver_analysis.append({
                 "param": driver,
                 "label": _subsurfaceParamLabel(driver),
@@ -2326,6 +1679,7 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
                 "est_p10": None if est10 is None or est90 is None else max(est10, est90),
                 "est_p50": est50,
                 "est_p90": None if est10 is None or est90 is None else min(est10, est90),
+                "afe_points": afe_points,
                 "estimates": {
                     target: _geoDriverEstimateForTarget(df, driver, target, afe_lateral_length)
                     for target in estimate_targets
@@ -2392,6 +1746,8 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
 const FIGURES = {_json.dumps(figures, separators=(',', ':'))};
 const WELL_INDEX = {_json.dumps(well_index, separators=(',', ':'))};
 const AFE_PERMITS = {_json.dumps(afe_permits, separators=(',', ':'))};
+const AFE_WITH_LOC = {_json.dumps(afe_with_loc, separators=(',', ':'))};
+const AFE_SUBSURFACE_ESTIMATES = {_json.dumps(afe_subsurface_estimates, separators=(',', ':'))};
 const GEO_DRIVER = {_json.dumps(geo_driver_analysis, separators=(',', ':'))};
 
 const tabsEl = document.getElementById('tabs');
@@ -2495,6 +1851,22 @@ function renderGeoDrivers() {{
         showlegend: false,
       }});
     }}
+    // AFE markers — heat-map estimate vs. regression-predicted response.
+    const afePts = (row.afe_points || []).filter(p => p.x !== null && p.x !== undefined && p.y !== null && p.y !== undefined);
+    if (afePts.length > 0) {{
+      traces.push({{
+        type: 'scatter',
+        mode: 'markers+text',
+        x: afePts.map(p => p.x),
+        y: afePts.map(p => p.y),
+        text: afePts.map(p => p.letter),
+        textposition: 'top center',
+        textfont: {{ size: 11, color: '#0a2a5e', family: 'sans-serif', weight: 'bold' }},
+        marker: {{ symbol: 'star', size: 16, color: 'red', line: {{ color: 'black', width: 1 }} }},
+        hovertemplate: '%{{text}} — ' + row.label + ': %{{x:.3f}}<br>Pred ' + row.response + ': %{{y:.3f}}<extra>AFE</extra>',
+        showlegend: false,
+      }});
+    }}
     Plotly.newPlot('driver-plot-' + i, traces, {{
       title: {{ text: '#' + row.rank + ' ' + row.label + '  r=' + row.r.toFixed(2), font: {{ size: 13 }} }},
       xaxis: {{ title: row.label }},
@@ -2516,12 +1888,19 @@ FIGURES.forEach((fig, i) => {{
   const page = document.createElement('div');
   page.className = 'page' + (i === 0 ? ' active' : '');
   page.id = 'page-' + i;
+  const fmtEstVal = v => (v === null || v === undefined || Number.isNaN(v))
+    ? '—'
+    : (Math.abs(v) >= 100 ? Math.round(v).toLocaleString() : Number(v).toFixed(3));
   page.innerHTML = `
     <div class="plot-wrap"><div class="plot-box" id="plot-${{i}}"></div></div>
     <div class="sidebar">
       <div class="panel">
         <h3>AFE Permits</h3>
         ${{AFE_PERMITS.map(p => '<div class="row"><span class="n">' + p.letter + '.</span> ' + p.name + ' [' + p.lz + ']</div>').join('')}}
+      </div>
+      <div class="panel">
+        <h3>AFE Estimate &mdash; ${{fig.param}}</h3>
+        ${{(fig.afe_estimates || []).map(e => '<div class="row"><span class="n">' + (e.letter || '') + '.</span> ' + e.name + ': ' + fmtEstVal(e.value) + '</div>').join('')}}
       </div>
       <div class="panel">
         <h3>Offset Wells (by distance)</h3>
@@ -2532,7 +1911,7 @@ FIGURES.forEach((fig, i) => {{
 }});
 
 // Geo driver diagnostic tab
-if (GEO_DRIVER.length > 0) {{
+if (GEO_DRIVER.length > 0 || AFE_SUBSURFACE_ESTIMATES.length > 0) {{
   const geoBtn = document.createElement('button');
   geoBtn.textContent = 'Geo Drivers';
   geoBtn.dataset.idx = 'geo';
@@ -2541,31 +1920,76 @@ if (GEO_DRIVER.length > 0) {{
   const geoPage = document.createElement('div');
   geoPage.className = 'table-page';
   geoPage.id = 'page-geo';
-  const fmtEst = v => (v === null || Number.isNaN(v)) ? '' : Math.round(v).toLocaleString();
-  let rankHTML = '<table class="driver-rank"><tr><th>Rank</th><th>Property</th><th>Correlation</th></tr>';
+  const fmtEst = v => (v === null || v === undefined || Number.isNaN(v)) ? '' : Math.round(v).toLocaleString();
+  const fmtSub = v => (v === null || v === undefined || Number.isNaN(v)) ? '—' : (Math.abs(v) >= 100 ? Math.round(v).toLocaleString() : Number(v).toFixed(3));
+
+  // Build per-driver predicted-response lookup so the subsurface table can show
+  // each property estimate alongside its implied Cum/ft from the regression.
+  const PRED_BY_DRIVER = {{}};
   GEO_DRIVER.forEach(row => {{
-    rankHTML += '<tr><td>' + row.rank + '</td><td>' + row.label + '</td><td>' + row.r.toFixed(2) + '</td></tr>';
+    PRED_BY_DRIVER[row.param] = {{}};
+    (row.afe_points || []).forEach(p => {{
+      PRED_BY_DRIVER[row.param][p.letter] = p.y;
+    }});
   }});
-  rankHTML += '</table>';
-  const estimateTargets = Object.keys(GEO_DRIVER[0].estimates || {{}}).filter(k => GEO_DRIVER[0].estimates[k]);
-  const targetLabel = key => GEO_DRIVER[0].estimates[key].label;
-  let estimateHTML = '<table class="driver-rank"><tr><th>Rank</th><th>Property</th>' +
-    estimateTargets.map(key => '<th>' + targetLabel(key) + '<br>P10/P50/P90</th>').join('') + '</tr>';
-  GEO_DRIVER.forEach(row => {{
-    estimateHTML += '<tr><td>' + row.rank + '</td><td>' + row.label + '</td>' +
-      estimateTargets.map(key => {{
-        const est = row.estimates[key];
-        return '<td>' + (est ? (fmtEst(est.p10) + ' / ' + fmtEst(est.p50) + ' / ' + fmtEst(est.p90)) : '') + '</td>';
-      }}).join('') + '</tr>';
-  }});
-  estimateHTML += '</table>';
-  const afeLength = GEO_DRIVER[0].afe_lateral_length;
-  const estimateNote = '<div class="estimate-note">Estimated production from linear fit' +
-    ' from linear fit' + (afeLength ? ' normalized to AFE lateral length less 500 ft: ' + Math.round(afeLength).toLocaleString() + ' ft' : '') +
-    '</div>';
-  geoPage.innerHTML = rankHTML + estimateNote + estimateHTML + '<div class="driver-grid">' +
-    GEO_DRIVER.map((row, i) => '<div class="driver-plot" id="driver-plot-' + i + '"></div>').join('') +
-    '</div>';
+  const responseUnit = GEO_DRIVER.length > 0 ? GEO_DRIVER[0].response : 'response';
+
+  // AFE subsurface estimate table — interpolated heat-map value at each AFE permit location.
+  // Each cell shows the property estimate (top) and the regression-predicted response/ft (bottom).
+  let subsurfaceHTML = '';
+  if (AFE_SUBSURFACE_ESTIMATES.length > 0 && AFE_WITH_LOC.length > 0) {{
+    subsurfaceHTML = '<h3 style="margin:0 0 4px 0;font-size:14px;">AFE Subsurface Estimates (heat map at each AFE location)</h3>';
+    subsurfaceHTML += '<div style="font-size:11px;color:#555;margin-bottom:8px;">Top: property estimate. Bottom (gray): predicted ' + responseUnit + ' from this driver\\'s regression.</div>';
+    subsurfaceHTML += '<table class="driver-rank"><tr><th>Property</th>' +
+      AFE_WITH_LOC.map(ap => '<th>' + ap.letter + '. ' + ap.name + (ap.lz ? '<br><span style="font-weight:normal;opacity:0.85;">[' + ap.lz + ']</span>' : '') + '</th>').join('') +
+      '</tr>';
+    AFE_SUBSURFACE_ESTIMATES.forEach(row => {{
+      const pred = PRED_BY_DRIVER[row.param] || null;
+      subsurfaceHTML += '<tr><td>' + row.label + '</td>' +
+        AFE_WITH_LOC.map(ap => {{
+          const propStr = fmtSub(row.by_letter[ap.letter]);
+          const predY = pred ? pred[ap.letter] : undefined;
+          const predStr = (pred && predY !== undefined && predY !== null && !Number.isNaN(predY))
+            ? '<div style="font-size:10px;color:#888;margin-top:2px;">' + fmtSub(predY) + ' /ft</div>'
+            : '';
+          return '<td>' + propStr + predStr + '</td>';
+        }}).join('') +
+        '</tr>';
+    }});
+    subsurfaceHTML += '</table>';
+  }}
+
+  let geoContent = subsurfaceHTML;
+
+  if (GEO_DRIVER.length > 0) {{
+    let rankHTML = '<h3 style="margin:14px 0 8px 0;font-size:14px;">Geo Driver Correlations</h3>';
+    rankHTML += '<table class="driver-rank"><tr><th>Rank</th><th>Property</th><th>Correlation</th></tr>';
+    GEO_DRIVER.forEach(row => {{
+      rankHTML += '<tr><td>' + row.rank + '</td><td>' + row.label + '</td><td>' + row.r.toFixed(2) + '</td></tr>';
+    }});
+    rankHTML += '</table>';
+    const estimateTargets = Object.keys(GEO_DRIVER[0].estimates || {{}}).filter(k => GEO_DRIVER[0].estimates[k]);
+    const targetLabel = key => GEO_DRIVER[0].estimates[key].label;
+    let estimateHTML = '<table class="driver-rank"><tr><th>Rank</th><th>Property</th>' +
+      estimateTargets.map(key => '<th>' + targetLabel(key) + '<br>P10/P50/P90</th>').join('') + '</tr>';
+    GEO_DRIVER.forEach(row => {{
+      estimateHTML += '<tr><td>' + row.rank + '</td><td>' + row.label + '</td>' +
+        estimateTargets.map(key => {{
+          const est = row.estimates[key];
+          return '<td>' + (est ? (fmtEst(est.p10) + ' / ' + fmtEst(est.p50) + ' / ' + fmtEst(est.p90)) : '') + '</td>';
+        }}).join('') + '</tr>';
+    }});
+    estimateHTML += '</table>';
+    const afeLength = GEO_DRIVER[0].afe_lateral_length;
+    const estimateNote = '<div class="estimate-note">Estimated production from linear fit' +
+      (afeLength ? ' normalized to AFE lateral length less 500 ft: ' + Math.round(afeLength).toLocaleString() + ' ft' : '') +
+      '</div>';
+    geoContent += rankHTML + estimateNote + estimateHTML + '<div class="driver-grid">' +
+      GEO_DRIVER.map((row, i) => '<div class="driver-plot" id="driver-plot-' + i + '"></div>').join('') +
+      '</div>';
+  }}
+
+  geoPage.innerHTML = geoContent;
   pagesEl.appendChild(geoPage);
 }}
 
@@ -2920,562 +2344,9 @@ def getPeerAnalysisData(afeData):
     return filtered
 
 
-## Generate operator analysis PDF with completion trends, production performance, spacing impact,
-## and peer comparison pages. Exports to Data/ folder as operator_analysis_{DSU Name}.pdf.
-def plotOperatorAnalysis(analysisData, pathToAfeSummary, peerData=None):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from matplotlib.backends.backend_pdf import PdfPages
-    import numpy as np
-
-    if analysisData is None or analysisData.empty:
-        print("No operator analysis data — skipping PDF export.")
-        return
-
-    # Resolve output path
-    afeDir = os.path.dirname(pathToAfeSummary)
-    afeFilename = os.path.splitext(os.path.basename(pathToAfeSummary))[0]
-    dsuName = afeFilename.split("-", 1)[1].strip() if "-" in afeFilename else afeFilename
-    outputDir = os.path.join(afeDir, "Data")
-    os.makedirs(outputDir, exist_ok=True)
-    pdfPath = os.path.join(outputDir, f"operator_analysis_{dsuName}.pdf")
-
-    operatorMode = analysisData["CurrentOperator"].dropna().mode()
-    operator = operatorMode.iloc[0] if not operatorMode.empty else "Unknown"
-    formations = sorted(analysisData["Formation"].dropna().str.upper().unique().tolist())
-    fm_label = " / ".join(formations) if formations else "ALL"
-
-    df = analysisData.copy()
-    df["Vintage"] = pd.to_numeric(df["FirstProductionYear"], errors="coerce")
-    df = df[df["Vintage"].notna() & (df["Vintage"] >= 2014)].copy()
-    df["Vintage"] = df["Vintage"].astype(int)
-
-    print(f"Generating operator analysis PDF: {pdfPath}")
-    print(f"  Operator: {operator}")
-    print(f"  Formations: {fm_label}")
-    print(f"  Vintage range: {df['Vintage'].min()}-{df['Vintage'].max()}, {len(df):,} wells")
-
-    with PdfPages(pdfPath) as pdf:
-
-        # === PAGE 1: Completion Design Trends ===
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        fig.suptitle(f"Completion Design Trends — {operator}\n{fm_label}", fontsize=13, fontweight="bold")
-
-        # Top row + bottom-left: bar charts by vintage
-        bar_metrics = [
-            ("LateralLength", "Avg Lateral Length (ft)", "steelblue"),
-            ("ProppantLbsPerFt", "Avg Proppant (lbs/ft)", "firebrick"),
-            ("FluidBblPerFt", "Avg Fluid (bbl/ft)", "teal"),
-        ]
-
-        for ax, (col, label, color) in zip([axes[0, 0], axes[0, 1], axes[1, 0]], bar_metrics):
-            col_numeric = pd.to_numeric(df[col], errors="coerce")
-            grouped = df.assign(_val=col_numeric).groupby("Vintage")["_val"]
-            means = grouped.mean()
-            counts = grouped.count()
-            valid = means[counts >= 3].dropna()
-            if valid.empty:
-                ax.text(0.5, 0.5, f"Insufficient data\nfor {label}", ha="center", va="center", transform=ax.transAxes)
-                ax.set_title(label)
-                continue
-            ax.bar(valid.index, valid.values, color=color, alpha=0.8, edgecolor="black", linewidth=0.3)
-            for x, y, n in zip(valid.index, valid.values, counts[valid.index]):
-                ax.annotate(f"n={n}", xy=(x, y), ha="center", va="bottom", fontsize=7, color="#444444")
-            ax.set_title(label)
-            ax.set_xlabel("First Production Year")
-            ax.set_ylabel(label)
-            ax.grid(axis="y", alpha=0.3)
-
-        # Bottom-right: Proppant/Fluid ratio vs EUR 50yr BOE scatter
-        ax = axes[1, 1]
-        prop = pd.to_numeric(df["FirstCompletionProppantMass"], errors="coerce")
-        fluid = pd.to_numeric(df["FirstCompletionFluidVolume"], errors="coerce") / 42.0
-        eur50 = pd.to_numeric(df["EUR50YRBOE"], errors="coerce")
-        prop_fluid = (prop / fluid.replace(0, float("nan")))
-        scatter_mask = prop_fluid.notna() & eur50.notna()
-        if scatter_mask.sum() >= 3:
-            sc = ax.scatter(prop_fluid[scatter_mask], eur50[scatter_mask],
-                           c=df.loc[scatter_mask, "Vintage"], cmap="plasma",
-                           s=20, alpha=0.7, edgecolor="black", linewidth=0.2)
-            plt.colorbar(sc, ax=ax, label="Vintage", shrink=0.8)
-        else:
-            ax.text(0.5, 0.5, "Insufficient data", ha="center", va="center", transform=ax.transAxes)
-        ax.set_title("Proppant/Fluid Ratio vs EUR 50yr BOE")
-        ax.set_xlabel("Proppant / Fluid (lbs/bbl)")
-        ax.set_ylabel("EUR 50yr BOE")
-        ax.grid(alpha=0.3)
-
-        fig.tight_layout(rect=[0, 0, 1, 0.93])
-        pdf.savefig(fig)
-        plt.close(fig)
-        print("  Page 1: Completion Design Trends")
-
-        # === PAGE 2: Production Performance ===
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        fig.suptitle(f"Production Performance — {operator}\n{fm_label}", fontsize=13, fontweight="bold")
-
-        # 2a: Cum12M BOE/ft by vintage — only wells with >= 12 months on production
-        ax = axes[0, 0]
-        months_on = pd.to_numeric(df["LastReportedMonthsOnProduction"], errors="coerce")
-        df_12m = df[months_on >= 12]
-        col_numeric = pd.to_numeric(df_12m["Cum12MBOEPerFt"], errors="coerce")
-        grouped = df_12m.assign(_val=col_numeric).groupby("Vintage")["_val"]
-        means = grouped.mean()
-        counts = grouped.count()
-        valid = means[counts >= 3].dropna()
-        if not valid.empty:
-            ax.bar(valid.index, valid.values, color="steelblue", alpha=0.8, edgecolor="black", linewidth=0.3)
-            for x, y, n in zip(valid.index, valid.values, counts[valid.index]):
-                ax.annotate(f"n={n}", xy=(x, y), ha="center", va="bottom", fontsize=7, color="#444444")
-        ax.set_title("Cum 12M BOE / Lateral Foot")
-        ax.set_xlabel("First Production Year")
-        ax.set_ylabel("BOE/ft")
-        ax.grid(axis="y", alpha=0.3)
-
-        # 2b: EUR50yr vs lateral length scatter — Permian wells use Oil EUR (gas is uneconomic)
-        ax = axes[0, 1]
-        is_permian = _isPermianOilBasin(formations)
-        eur_col = "EUR50YROil" if is_permian else "EUR50YRBOE"
-        eur_label = "EUR 50yr Oil (BO)" if is_permian else "EUR 50yr BOE"
-        eur = pd.to_numeric(df[eur_col], errors="coerce")
-        ll = pd.to_numeric(df["LateralLength"], errors="coerce")
-        scatter_mask = eur.notna() & ll.notna()
-        if scatter_mask.sum() >= 3:
-            sc = ax.scatter(ll[scatter_mask], eur[scatter_mask], c=df.loc[scatter_mask, "Vintage"],
-                           cmap="plasma", s=20, alpha=0.7, edgecolor="black", linewidth=0.2)
-            plt.colorbar(sc, ax=ax, label="Vintage", shrink=0.8)
-            x_fit = ll[scatter_mask].values
-            y_fit = eur[scatter_mask].values
-            slope, intercept, _r2, fit_label = _linearFitWithR2(x_fit, y_fit)
-            x_line = np.array([x_fit.min(), x_fit.max()])
-            ax.plot(x_line, slope * x_line + intercept, color="black", linewidth=1.2,
-                    linestyle="--", label=fit_label)
-            ax.legend(loc="upper left", fontsize=8, framealpha=0.85)
-        ax.set_title(f"{eur_label} vs Lateral Length")
-        ax.set_xlabel("Lateral Length (ft)")
-        ax.set_ylabel(eur_label)
-        ax.grid(alpha=0.3)
-
-        # 2c: Peak month BOE rate by vintage
-        ax = axes[1, 0]
-        col_numeric = pd.to_numeric(df["PeakMonthBOERate"], errors="coerce")
-        grouped = df.assign(_val=col_numeric).groupby("Vintage")["_val"]
-        means = grouped.mean()
-        counts = grouped.count()
-        valid = means[counts >= 3].dropna()
-        if not valid.empty:
-            ax.bar(valid.index, valid.values, color="darkorange", alpha=0.8, edgecolor="black", linewidth=0.3)
-            for x, y, n in zip(valid.index, valid.values, counts[valid.index]):
-                ax.annotate(f"n={n}", xy=(x, y), ha="center", va="bottom", fontsize=7, color="#444444")
-        ax.set_title("Avg Peak Month BOE Rate")
-        ax.set_xlabel("First Production Year")
-        ax.set_ylabel("BOE/month")
-        ax.grid(axis="y", alpha=0.3)
-
-        # 2d: Cum Life GOR by vintage
-        ax = axes[1, 1]
-        col_numeric = pd.to_numeric(df["CumLifeGOR"], errors="coerce")
-        grouped = df.assign(_val=col_numeric).groupby("Vintage")["_val"]
-        means = grouped.mean()
-        counts = grouped.count()
-        valid = means[counts >= 3].dropna()
-        if not valid.empty:
-            ax.bar(valid.index, valid.values, color="gray", alpha=0.8, edgecolor="black", linewidth=0.3)
-            for x, y, n in zip(valid.index, valid.values, counts[valid.index]):
-                ax.annotate(f"n={n}", xy=(x, y), ha="center", va="bottom", fontsize=7, color="#444444")
-        ax.set_title("Avg Cum Life GOR")
-        ax.set_xlabel("First Production Year")
-        ax.set_ylabel("GOR (scf/bbl)")
-        ax.grid(axis="y", alpha=0.3)
-
-        fig.tight_layout(rect=[0, 0, 1, 0.93])
-        pdf.savefig(fig)
-        plt.close(fig)
-        print("  Page 2: Production Performance")
-
-        # === PAGE 3: Spacing Impact ===
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        fig.suptitle(f"Spacing Impact — {operator}\n{fm_label}", fontsize=13, fontweight="bold")
-
-        cum12m = pd.to_numeric(df["Cum12MBOE"], errors="coerce")
-
-        # 3a: Child vs Parent Cum12M BOE
-        ax = axes[0, 0]
-        is_child = df["IsChild"]
-        child_vals = cum12m[is_child == True].dropna()
-        parent_vals = cum12m[is_child == False].dropna()
-        if len(child_vals) >= 3 and len(parent_vals) >= 3:
-            bp = ax.boxplot(
-                [parent_vals.values, child_vals.values],
-                labels=[f"Parent (n={len(parent_vals)})", f"Child (n={len(child_vals)})"],
-                patch_artist=True,
-            )
-            bp["boxes"][0].set_facecolor("steelblue")
-            bp["boxes"][1].set_facecolor("firebrick")
-        else:
-            ax.text(0.5, 0.5, "Insufficient child/parent\ndata for comparison",
-                    ha="center", va="center", transform=ax.transAxes)
-        ax.set_title("Child vs Parent — Cum 12M BOE")
-        ax.set_ylabel("Cum 12M BOE")
-        ax.grid(axis="y", alpha=0.3)
-
-        # 3b: Boundedness Score vs Cum12M BOE
-        ax = axes[0, 1]
-        bound = pd.to_numeric(df["BoundednessScore"], errors="coerce")
-        scatter_mask = bound.notna() & cum12m.notna()
-        if scatter_mask.sum() >= 3:
-            ax.scatter(bound[scatter_mask], cum12m[scatter_mask], s=20, alpha=0.6,
-                      color="teal", edgecolor="black", linewidth=0.2)
-        ax.set_title("Boundedness Score vs Cum 12M BOE")
-        ax.set_xlabel("Boundedness Score")
-        ax.set_ylabel("Cum 12M BOE")
-        ax.grid(alpha=0.3)
-
-        # 3c: Closest Well Distance vs Cum12M BOE
-        ax = axes[1, 0]
-        closest = pd.to_numeric(df["ClosestWellXY"], errors="coerce")
-        scatter_mask = closest.notna() & cum12m.notna()
-        if scatter_mask.sum() >= 3:
-            ax.scatter(closest[scatter_mask], cum12m[scatter_mask], s=20, alpha=0.6,
-                      color="darkorange", edgecolor="black", linewidth=0.2)
-        ax.set_title("Closest Well Distance vs Cum 12M BOE")
-        ax.set_xlabel("Closest Well (ft)")
-        ax.set_ylabel("Cum 12M BOE")
-        ax.grid(alpha=0.3)
-
-        # 3d: Wells in Radius vs Cum12M BOE
-        ax = axes[1, 1]
-        wir = pd.to_numeric(df["WellsInRadius"], errors="coerce")
-        scatter_mask = wir.notna() & cum12m.notna()
-        if scatter_mask.sum() >= 3:
-            ax.scatter(wir[scatter_mask], cum12m[scatter_mask], s=20, alpha=0.6,
-                      color="purple", edgecolor="black", linewidth=0.2)
-        ax.set_title("Wells in Radius vs Cum 12M BOE")
-        ax.set_xlabel("Wells in Radius")
-        ax.set_ylabel("Cum 12M BOE")
-        ax.grid(alpha=0.3)
-
-        fig.tight_layout(rect=[0, 0, 1, 0.93])
-        pdf.savefig(fig)
-        plt.close(fig)
-        print("  Page 3: Spacing Impact")
-
-        # === PAGE 4: Frac Type Analysis ===
-        if "FracType" in df.columns:
-            fig, axes = plt.subplots(1, 2, figsize=(14, 7))
-            fig.suptitle(f"Frac Type Analysis — {operator}\n{fm_label}", fontsize=13, fontweight="bold")
-
-            frac_colors = {"Slickwater": "steelblue", "Gel/Hybrid": "firebrick", "Unknown": "lightgray"}
-
-            # 4a: Frac type breakdown by vintage (stacked bar)
-            ax = axes[0]
-            frac_by_year = df.groupby(["Vintage", "FracType"]).size().unstack(fill_value=0)
-            # Reorder columns for consistent stacking
-            frac_cols = [c for c in ["Slickwater", "Gel/Hybrid", "Unknown"] if c in frac_by_year.columns]
-            if frac_cols:
-                frac_by_year = frac_by_year[frac_cols]
-                frac_by_year.plot(kind="bar", stacked=True, ax=ax,
-                                  color=[frac_colors.get(c, "gray") for c in frac_cols],
-                                  edgecolor="black", linewidth=0.3)
-                ax.legend(fontsize=8)
-            ax.set_title("Frac Type by Vintage Year")
-            ax.set_xlabel("First Production Year")
-            ax.set_ylabel("Well Count")
-            ax.grid(axis="y", alpha=0.3)
-
-            # 4b: Cum12M BOE by frac type (box plot)
-            ax = axes[1]
-            months_on_ft = pd.to_numeric(df["LastReportedMonthsOnProduction"], errors="coerce")
-            df_ft = df[months_on_ft >= 12]
-            frac_types_present = [ft for ft in ["Slickwater", "Gel/Hybrid"] if ft in df_ft["FracType"].values]
-            if len(frac_types_present) >= 1:
-                box_data = [pd.to_numeric(df_ft[df_ft["FracType"] == ft]["Cum12MBOE"], errors="coerce").dropna().values
-                            for ft in frac_types_present]
-                box_labels = [f"{ft}\n(n={len(d)})" for ft, d in zip(frac_types_present, box_data)]
-                bp = ax.boxplot(box_data, labels=box_labels, patch_artist=True)
-                for patch, ft in zip(bp["boxes"], frac_types_present):
-                    patch.set_facecolor(frac_colors.get(ft, "gray"))
-            else:
-                ax.text(0.5, 0.5, "Insufficient data", ha="center", va="center", transform=ax.transAxes)
-            ax.set_title("Cum 12M BOE by Frac Type")
-            ax.set_ylabel("Cum 12M BOE")
-            ax.grid(axis="y", alpha=0.3)
-
-            fig.tight_layout(rect=[0, 0, 1, 0.91])
-            pdf.savefig(fig)
-            plt.close(fig)
-            print("  Page 4: Frac Type Analysis")
-
-        # === PEER COMPARISON PAGES ===
-        if peerData is not None and not peerData.empty:
-            peer = peerData.copy()
-            peer["Vintage"] = pd.to_numeric(peer["FirstProductionYear"], errors="coerce")
-            peer = peer[peer["Vintage"].notna() & (peer["Vintage"] >= 2020)].copy()
-            peer["Vintage"] = peer["Vintage"].astype(int)
-
-            # Only include active operators with 20+ wells since 2020
-            op_counts = peer["CurrentOperator"].value_counts()
-            valid_ops = op_counts[op_counts >= 20].index.tolist()
-            peer = peer[peer["CurrentOperator"].isin(valid_ops)].copy()
-
-            if len(valid_ops) >= 2:
-                # Highlight the AFE operator
-                afe_operator = operator.upper()
-
-                def _op_colors(ops):
-                    colors = []
-                    for op in ops:
-                        if op.upper() == afe_operator.upper():
-                            colors.append("steelblue")
-                        else:
-                            colors.append("lightgray")
-                    return colors
-
-                def _op_short(name, maxlen=20):
-                    return name if len(name) <= maxlen else name[:maxlen - 1] + "…"
-
-                # === PAGE 4: Peer EUR & Production Comparison ===
-                fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-                fig.suptitle(f"Peer Comparison — {fm_label}\n(5-mile radius, 20+ wells since 2020)",
-                             fontsize=13, fontweight="bold")
-
-                # 4a: EUR 50yr BOE/ft by operator
-                ax = axes[0, 0]
-                eur_ft = pd.to_numeric(peer["EUR50YRBOEPerFt"], errors="coerce")
-                grouped = peer.assign(_val=eur_ft).groupby("CurrentOperator")["_val"]
-                means = grouped.mean().dropna().sort_values(ascending=False)
-                if not means.empty:
-                    labels = [_op_short(op) for op in means.index]
-                    colors = _op_colors(means.index)
-                    counts = grouped.count()
-                    ax.barh(range(len(means)), means.values, color=colors, edgecolor="black", linewidth=0.3)
-                    ax.set_yticks(range(len(means)))
-                    ax.set_yticklabels(labels, fontsize=8)
-                    for i, (val, op) in enumerate(zip(means.values, means.index)):
-                        ax.annotate(f"n={counts[op]}", xy=(val, i), va="center", fontsize=7, color="#444444")
-                    ax.invert_yaxis()
-                ax.set_title("EUR 50yr BOE / Lateral Foot")
-                ax.set_xlabel("BOE/ft")
-                ax.grid(axis="x", alpha=0.3)
-
-                # 4b: Cum12M BOE/ft by operator (only wells with 12+ months)
-                ax = axes[0, 1]
-                months_on_peer = pd.to_numeric(peer["LastReportedMonthsOnProduction"], errors="coerce")
-                peer_12m = peer[months_on_peer >= 12]
-                cum_ft = pd.to_numeric(peer_12m["Cum12MBOEPerFt"], errors="coerce")
-                grouped = peer_12m.assign(_val=cum_ft).groupby("CurrentOperator")["_val"]
-                means = grouped.mean().dropna().sort_values(ascending=False)
-                if not means.empty:
-                    labels = [_op_short(op) for op in means.index]
-                    colors = _op_colors(means.index)
-                    counts = grouped.count()
-                    ax.barh(range(len(means)), means.values, color=colors, edgecolor="black", linewidth=0.3)
-                    ax.set_yticks(range(len(means)))
-                    ax.set_yticklabels(labels, fontsize=8)
-                    for i, (val, op) in enumerate(zip(means.values, means.index)):
-                        ax.annotate(f"n={counts[op]}", xy=(val, i), va="center", fontsize=7, color="#444444")
-                    ax.invert_yaxis()
-                ax.set_title("Cum 12M BOE / Lateral Foot")
-                ax.set_xlabel("BOE/ft")
-                ax.grid(axis="x", alpha=0.3)
-
-                # 4c: Peak month BOE rate by operator
-                ax = axes[1, 0]
-                peak = pd.to_numeric(peer["PeakMonthBOERate"], errors="coerce")
-                grouped = peer.assign(_val=peak).groupby("CurrentOperator")["_val"]
-                means = grouped.mean().dropna().sort_values(ascending=False)
-                if not means.empty:
-                    labels = [_op_short(op) for op in means.index]
-                    colors = _op_colors(means.index)
-                    counts = grouped.count()
-                    ax.barh(range(len(means)), means.values, color=colors, edgecolor="black", linewidth=0.3)
-                    ax.set_yticks(range(len(means)))
-                    ax.set_yticklabels(labels, fontsize=8)
-                    for i, (val, op) in enumerate(zip(means.values, means.index)):
-                        ax.annotate(f"n={counts[op]}", xy=(val, i), va="center", fontsize=7, color="#444444")
-                    ax.invert_yaxis()
-                ax.set_title("Avg Peak Month BOE Rate")
-                ax.set_xlabel("BOE/month")
-                ax.grid(axis="x", alpha=0.3)
-
-                # 4d: GOR by operator
-                ax = axes[1, 1]
-                gor = pd.to_numeric(peer["CumLifeGOR"], errors="coerce")
-                grouped = peer.assign(_val=gor).groupby("CurrentOperator")["_val"]
-                means = grouped.mean().dropna().sort_values(ascending=False)
-                if not means.empty:
-                    labels = [_op_short(op) for op in means.index]
-                    colors = _op_colors(means.index)
-                    counts = grouped.count()
-                    ax.barh(range(len(means)), means.values, color=colors, edgecolor="black", linewidth=0.3)
-                    ax.set_yticks(range(len(means)))
-                    ax.set_yticklabels(labels, fontsize=8)
-                    for i, (val, op) in enumerate(zip(means.values, means.index)):
-                        ax.annotate(f"n={counts[op]}", xy=(val, i), va="center", fontsize=7, color="#444444")
-                    ax.invert_yaxis()
-                ax.set_title("Avg Cum Life GOR")
-                ax.set_xlabel("GOR (scf/bbl)")
-                ax.grid(axis="x", alpha=0.3)
-
-                fig.tight_layout(rect=[0, 0, 1, 0.91])
-                pdf.savefig(fig)
-                plt.close(fig)
-                print("  Page 4: Peer EUR & Production Comparison")
-
-                # === PAGE 5: Peer Completion Design Comparison ===
-                fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-                fig.suptitle(f"Peer Completion Design — {fm_label}\n(5-mile radius, 20+ wells since 2020)",
-                             fontsize=13, fontweight="bold")
-
-                # 5a: Avg lateral length by operator
-                ax = axes[0, 0]
-                ll = pd.to_numeric(peer["LateralLength"], errors="coerce")
-                grouped = peer.assign(_val=ll).groupby("CurrentOperator")["_val"]
-                means = grouped.mean().dropna().sort_values(ascending=False)
-                if not means.empty:
-                    labels = [_op_short(op) for op in means.index]
-                    colors = _op_colors(means.index)
-                    counts = grouped.count()
-                    ax.barh(range(len(means)), means.values, color=colors, edgecolor="black", linewidth=0.3)
-                    ax.set_yticks(range(len(means)))
-                    ax.set_yticklabels(labels, fontsize=8)
-                    for i, (val, op) in enumerate(zip(means.values, means.index)):
-                        ax.annotate(f"n={counts[op]}", xy=(val, i), va="center", fontsize=7, color="#444444")
-                    ax.invert_yaxis()
-                ax.set_title("Avg Lateral Length (ft)")
-                ax.set_xlabel("Lateral Length (ft)")
-                ax.grid(axis="x", alpha=0.3)
-
-                # 5b: Avg proppant lbs/ft by operator
-                ax = axes[0, 1]
-                prop = pd.to_numeric(peer["ProppantLbsPerFt"], errors="coerce")
-                grouped = peer.assign(_val=prop).groupby("CurrentOperator")["_val"]
-                means = grouped.mean().dropna().sort_values(ascending=False)
-                if not means.empty:
-                    labels = [_op_short(op) for op in means.index]
-                    colors = _op_colors(means.index)
-                    counts = grouped.count()
-                    ax.barh(range(len(means)), means.values, color=colors, edgecolor="black", linewidth=0.3)
-                    ax.set_yticks(range(len(means)))
-                    ax.set_yticklabels(labels, fontsize=8)
-                    for i, (val, op) in enumerate(zip(means.values, means.index)):
-                        ax.annotate(f"n={counts[op]}", xy=(val, i), va="center", fontsize=7, color="#444444")
-                    ax.invert_yaxis()
-                ax.set_title("Avg Proppant (lbs/ft)")
-                ax.set_xlabel("lbs/ft")
-                ax.grid(axis="x", alpha=0.3)
-
-                # 5c: Avg fluid bbl/ft by operator
-                ax = axes[1, 0]
-                fluid = pd.to_numeric(peer["FluidBblPerFt"], errors="coerce")
-                grouped = peer.assign(_val=fluid).groupby("CurrentOperator")["_val"]
-                means = grouped.mean().dropna().sort_values(ascending=False)
-                if not means.empty:
-                    labels = [_op_short(op) for op in means.index]
-                    colors = _op_colors(means.index)
-                    counts = grouped.count()
-                    ax.barh(range(len(means)), means.values, color=colors, edgecolor="black", linewidth=0.3)
-                    ax.set_yticks(range(len(means)))
-                    ax.set_yticklabels(labels, fontsize=8)
-                    for i, (val, op) in enumerate(zip(means.values, means.index)):
-                        ax.annotate(f"n={counts[op]}", xy=(val, i), va="center", fontsize=7, color="#444444")
-                    ax.invert_yaxis()
-                ax.set_title("Avg Fluid (bbl/ft)")
-                ax.set_xlabel("bbl/ft")
-                ax.grid(axis="x", alpha=0.3)
-
-                # 5d: Proppant/Fluid ratio by operator
-                ax = axes[1, 1]
-                prop_raw = pd.to_numeric(peer["FirstCompletionProppantMass"], errors="coerce")
-                fluid_raw = pd.to_numeric(peer["FirstCompletionFluidVolume"], errors="coerce") / 42.0
-                prop_fluid = prop_raw / fluid_raw.replace(0, float("nan"))
-                grouped = peer.assign(_val=prop_fluid).groupby("CurrentOperator")["_val"]
-                means = grouped.mean().dropna().sort_values(ascending=False)
-                if not means.empty:
-                    labels = [_op_short(op) for op in means.index]
-                    colors = _op_colors(means.index)
-                    counts = grouped.count()
-                    ax.barh(range(len(means)), means.values, color=colors, edgecolor="black", linewidth=0.3)
-                    ax.set_yticks(range(len(means)))
-                    ax.set_yticklabels(labels, fontsize=8)
-                    for i, (val, op) in enumerate(zip(means.values, means.index)):
-                        ax.annotate(f"n={counts[op]}", xy=(val, i), va="center", fontsize=7, color="#444444")
-                    ax.invert_yaxis()
-                ax.set_title("Avg Proppant/Fluid Ratio (lbs/bbl)")
-                ax.set_xlabel("lbs/bbl")
-                ax.grid(axis="x", alpha=0.3)
-
-                fig.tight_layout(rect=[0, 0, 1, 0.91])
-                pdf.savefig(fig)
-                plt.close(fig)
-                print("  Page 5: Peer Completion Design Comparison")
-
-                # === PAGE 6: Peer Frac Type Comparison ===
-                if "FracType" in peer.columns:
-                    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
-                    fig.suptitle(f"Peer Frac Type Comparison — {fm_label}\n(5-mile radius, 20+ wells since 2020)",
-                                 fontsize=13, fontweight="bold")
-
-                    frac_colors = {"Slickwater": "steelblue", "Gel/Hybrid": "firebrick", "Unknown": "lightgray"}
-
-                    # 6a: Frac type % by operator (stacked horizontal bar)
-                    ax = axes[0]
-                    frac_pct = peer.groupby(["CurrentOperator", "FracType"]).size().unstack(fill_value=0)
-                    frac_cols = [c for c in ["Slickwater", "Gel/Hybrid", "Unknown"] if c in frac_pct.columns]
-                    if frac_cols:
-                        frac_pct = frac_pct[frac_cols]
-                        frac_pct_norm = frac_pct.div(frac_pct.sum(axis=1), axis=0) * 100
-                        # Sort by slickwater % descending
-                        sort_col = "Slickwater" if "Slickwater" in frac_pct_norm.columns else frac_cols[0]
-                        frac_pct_norm = frac_pct_norm.sort_values(sort_col, ascending=True)
-                        labels = [_op_short(op) for op in frac_pct_norm.index]
-                        frac_pct_norm.index = labels
-                        frac_pct_norm.plot(kind="barh", stacked=True, ax=ax,
-                                           color=[frac_colors.get(c, "gray") for c in frac_cols],
-                                           edgecolor="black", linewidth=0.3)
-                        # Add well count annotations
-                        totals = frac_pct.sum(axis=1)
-                        for i_bar, (op, total) in enumerate(zip(frac_pct.index, totals)):
-                            short = _op_short(op)
-                            idx = list(frac_pct_norm.index).index(short) if short in frac_pct_norm.index else None
-                            if idx is not None:
-                                ax.annotate(f"n={total}", xy=(101, idx), va="center", fontsize=7, color="#444444")
-                        ax.legend(fontsize=8, loc="lower right")
-                    ax.set_title("Frac Type Mix by Operator (%)")
-                    ax.set_xlabel("% of Wells")
-                    ax.set_xlim(0, 115)
-
-                    # 6b: Cum12M BOE by frac type across all peers (box plot)
-                    ax = axes[1]
-                    months_on_peer2 = pd.to_numeric(peer["LastReportedMonthsOnProduction"], errors="coerce")
-                    peer_12m2 = peer[months_on_peer2 >= 12]
-                    frac_types_present = [ft for ft in ["Slickwater", "Gel/Hybrid"]
-                                          if ft in peer_12m2["FracType"].values]
-                    if len(frac_types_present) >= 1:
-                        box_data = [pd.to_numeric(peer_12m2[peer_12m2["FracType"] == ft]["Cum12MBOE"],
-                                    errors="coerce").dropna().values for ft in frac_types_present]
-                        box_labels = [f"{ft}\n(n={len(d)})" for ft, d in zip(frac_types_present, box_data)]
-                        bp = ax.boxplot(box_data, labels=box_labels, patch_artist=True)
-                        for patch, ft in zip(bp["boxes"], frac_types_present):
-                            patch.set_facecolor(frac_colors.get(ft, "gray"))
-                    else:
-                        ax.text(0.5, 0.5, "Insufficient data", ha="center", va="center", transform=ax.transAxes)
-                    ax.set_title("Cum 12M BOE by Frac Type (All Peers)")
-                    ax.set_ylabel("Cum 12M BOE")
-                    ax.grid(axis="y", alpha=0.3)
-
-                    fig.tight_layout(rect=[0, 0, 1, 0.91])
-                    pdf.savefig(fig)
-                    plt.close(fig)
-                    print("  Page 6: Peer Frac Type Comparison")
-
-            else:
-                print("  Skipping peer pages: fewer than 2 operators with 20+ wells since 2020 in area")
-
-    print(f"Done. Saved operator analysis to {pdfPath}")
-
-
+## Generate an interactive HTML operator analysis: completion trends, production performance,
+## spacing impact, frac type, and peer comparison pages. Uses Plotly.js for zoom/hover charts.
+## Output: operator_analysis_{DSU Name}.html in the AFE Data/ folder.
 def plotOperatorAnalysisHTML(analysisData, pathToAfeSummary, peerData=None):
     import json as _json
     import webbrowser

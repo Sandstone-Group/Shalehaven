@@ -13,10 +13,7 @@ analysisData = novi.getOperatorAnalysisData(afeData)
 # Pull all operators within 5 miles for peer comparison
 peerData = novi.getPeerAnalysisData(afeData)
 
-# Generate operator analysis PDF (completion trends, production performance, spacing impact, peer comparison)
-novi.plotOperatorAnalysis(analysisData, pathToAfeSummary, peerData=peerData)
-
-# Generate interactive HTML version (same charts, Plotly-based)
+# Generate interactive HTML operator analysis (completion trends, production, spacing, peer comparison)
 novi.plotOperatorAnalysisHTML(analysisData, pathToAfeSummary, peerData=peerData)
 
 print("Operator Analysis Pipeline Completed Successfully")

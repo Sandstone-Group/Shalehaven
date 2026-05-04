@@ -115,12 +115,12 @@ def putDataComboCurveDaily(client, data, operator=None):
     successCount = responseJson.get("successCount", 0)
     failedCount = responseJson.get("failedCount", 0)
     operatorLabel = operator or "Unknown"
-    text = f"[{operatorLabel}] Success: {successCount} Failed: {failedCount}"
+    text = f"{operatorLabel} Success: {successCount} Failed: {failedCount}"
     print(text)
     if failedCount > 0:
-        print(f"[{operatorLabel}] Errors: " + str(responseJson.get("results", []))[:500])
+        print(f"{operatorLabel} Errors: " + str(responseJson.get("results", []))[:500])
 
-    print(f"[{operatorLabel}] Finished PUT {len(cleanTotalAssetProduction)} Rows of New Production Data to ComboCurve")
+    print(f"{operatorLabel} Finished PUT {len(cleanTotalAssetProduction)} Rows of New Production Data to ComboCurve")
 
     return text
 

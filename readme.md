@@ -82,15 +82,7 @@ Developed by Michael Tanner. For questions or contributions, contact [Michael Ta
     - `token` (string) — kept for backward compat, unused (reads local TSV)
     - `offsetData` (DataFrame) — offset wells from `getWells()`
     - `scope` (string, optional) — Novi API well scope (default `"us-horizontals"`)
-  - `plotSubsurfaceHeatMaps(subsurfaceData, pathToAfeSummary, parameters=None, permitData=None, wellboreLocationsData=None, offsetData=None, labelNearestN=20, afeData=None)` — Builds a multi-page PDF of interpolated subsurface heat maps with Census TIGER state/county basemaps, the Novi `All.shp` operator-acreage underlay, BLM PLSS township/section overlays (cached on disk; warns when offset wells touch Texas since BLM PLSS doesn't cover it), DSU section boxes derived from the AFE T/R/S, lettered permit locations, and the nearest *N* offset well names
-    - `subsurfaceData` (DataFrame) — formation-aware subsurface rows from `getNoviSubsurface()`
-    - `pathToAfeSummary` (string) — file path to the AFE Summary (used for output naming + DSU parsing)
-    - `parameters` (list, optional) — subsurface columns to plot (default `["TVD", "TOC_Avg", "SW_Avg", "Porosity_Avg", "Permeability_Avg", "Thickness_Avg", "VClay_Avg", "Brittleness_Avg"]`)
-    - `permitData` (DataFrame, optional) — permit locations from `getWellPermits()` for lettered overlays
-    - `wellboreLocationsData` (DataFrame, optional) — wellbore trajectory points from `getNoviWellboreLocations()`
-    - `offsetData` (DataFrame, optional) — offset wells from `getWells()` for nearest-well labels
-    - `labelNearestN` (int, optional) — number of nearest offset wells to label per permit (default `20`)
-    - `afeData` (DataFrame, optional) — AFE Summary data for parsing T/R/S and drawing DSU section boxes
+  - `plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None, permitData=None, wellboreLocationsData=None, offsetData=None, labelNearestN=20, afeData=None)` — Interactive Plotly HTML of interpolated subsurface heat maps with state/county/PLSS basemaps, DSU section boxes, lettered permits, and nearest offset well labels
   - `printData(forecastData, monthlyForecastData, monthlyProductionData, pathToAfeSummary)` — Exports header data (offsets with EUR), monthly forecast, and historical monthly production to Excel files in a `Data/` subfolder next to the AFE Summary, named after the DSU parsed from the AFE filename
     - `forecastData` (DataFrame) — offset wells with EUR from `getNoviYearlyForecast()`
     - `monthlyForecastData` (DataFrame) — monthly forecast rows from `getNoviMonthlyForecast()`
