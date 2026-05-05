@@ -32,10 +32,10 @@ pathToJibMaster = os.getenv("SHALEHAVEN_JIB_MASTER_PATH")
 pathToWellMaster = os.getenv("SHALEHAVEN_WELL_MASTER_PATH")
 
 
-runAfe = False # set to true to run the AFE ETL process, set to false to skip the AFE ETL process
-runJib = False # set to true to run the JIB ETL process, set to false to skip the JIB ETL process
-runRevenue = False # set to true to run the Revenue ETL process, set to false to skip the Revenue ETL process
-runAfeActual = False # set to true to run the AFE vs Actual reconciliation, set to false to skip
+runAfe = True # set to true to run the AFE ETL process, set to false to skip the AFE ETL process
+runJib = True # set to true to run the JIB ETL process, set to false to skip the JIB ETL process
+runRevenue = True # set to true to run the Revenue ETL process, set to false to skip the Revenue ETL process
+runAfeActual = True # set to true to run the AFE vs Actual reconciliation, set to false to skip
 runWellSchedule = True # set to true to roll up the Well Schedule master into a flat CSV, set to false to skip
 print("Begin Shalehaven LOS ETL Process")
 
@@ -77,11 +77,5 @@ if runAfeActual:
     los.generateAfeActualReport(pathToAfeMaster, pathToJibMaster, pathToDatabase)
 else:
     print("Skipping AFE vs Actual Reconciliation")
-
-if runWellSchedule:
-    print("Running Well Schedule Rollup")
-    wellSchedule = los.combineWellSchedule(pathToWellMaster)
-else:
-    print("Skipping Well Schedule Rollup")
 
 print("Shalehaven LOS ETL Process Complete")

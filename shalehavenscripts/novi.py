@@ -1605,17 +1605,24 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
             row["by_letter"][ap["letter"]] = val
         afe_subsurface_estimates.append(row)
 
-    # Build geo-driver diagnostic data for a tab inserted before Well Index
-    response_param = _geoDriverProductionParam(afeData, df)
-    geo_driver_analysis = []
-    afe_estimate_lookup = {row["param"]: row["by_letter"] for row in afe_subsurface_estimates}
-    if response_param in df.columns:
+    # Build geo-driver diagnostic data — sliced by formation when multiple exist.
+    # Mixing zones in one regression dilutes intra-formation signal, so each formation
+    # gets its own bucket plus an "All Formations" view.
+    afe_estimate_lookup_all = {row["param"]: row["by_letter"] for row in afe_subsurface_estimates}
+
+    def _buildGeoDriverAnalysis(df_subset, est_lookup):
+        analyses = []
+        if df_subset is None or df_subset.empty:
+            return analyses
+        response_param_local = _geoDriverProductionParam(afeData, df_subset)
+        if response_param_local not in df_subset.columns:
+            return analyses
         y_all, response_label, estimate_label, afe_lateral_length = _geoDriverResponseSeries(
-            df, response_param, afeData
+            df_subset, response_param_local, afeData
         )
         estimate_targets = _geoDriverEstimateTargets(afeData)
-        for driver in [p for p in GEO_DRIVER_PARAMS if p in df.columns]:
-            x = pd.to_numeric(df[driver], errors="coerce")
+        for driver in [p for p in GEO_DRIVER_PARAMS if p in df_subset.columns]:
+            x = pd.to_numeric(df_subset[driver], errors="coerce")
             y = y_all
             valid = x.notna() & y.notna()
             if valid.sum() < 4:
@@ -1644,10 +1651,8 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
                     est10 *= afe_lateral_length
                     est50 *= afe_lateral_length
                     est90 *= afe_lateral_length
-            # AFE markers for this driver — at each AFE's heat-map estimate, with
-            # y from the regression line so the dot sits on the trend.
             afe_points = []
-            estimate_for_driver = afe_estimate_lookup.get(driver, {})
+            estimate_for_driver = est_lookup.get(driver, {})
             for ap in afe_with_loc:
                 est_x = estimate_for_driver.get(ap["letter"])
                 if est_x is None:
@@ -1660,8 +1665,7 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
                     "x": float(est_x),
                     "y": pred_y,
                 })
-
-            geo_driver_analysis.append({
+            analyses.append({
                 "param": driver,
                 "label": _subsurfaceParamLabel(driver),
                 "response": response_label,
@@ -1681,13 +1685,46 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
                 "est_p90": None if est10 is None or est90 is None else min(est10, est90),
                 "afe_points": afe_points,
                 "estimates": {
-                    target: _geoDriverEstimateForTarget(df, driver, target, afe_lateral_length)
+                    target: _geoDriverEstimateForTarget(df_subset, driver, target, afe_lateral_length)
                     for target in estimate_targets
                 },
             })
-        geo_driver_analysis.sort(key=lambda row: row["r"], reverse=True)
-        for i, row in enumerate(geo_driver_analysis, start=1):
+        analyses.sort(key=lambda row: row["r"], reverse=True)
+        for i, row in enumerate(analyses, start=1):
             row["rank"] = i
+        return analyses
+
+    def _estLookupForFormation(fm_label):
+        # Per-formation: AFE markers sit on this formation's heat-map value at the AFE
+        # location, so the predicted response reflects "what if we drilled this AFE to this zone".
+        out = {}
+        for param in GEO_DRIVER_PARAMS:
+            by_letter = {}
+            idx_entry = estimate_index.get((param, fm_label), {})
+            for ap in afe_with_loc:
+                by_letter[ap["letter"]] = idx_entry.get(ap["letter"])
+            out[param] = by_letter
+        return out
+
+    non_null_formations = [f for f in formations if f is not None]
+    geo_driver_buckets = []
+    all_drivers = _buildGeoDriverAnalysis(df, afe_estimate_lookup_all)
+    if len(non_null_formations) > 1:
+        geo_driver_buckets.append({"label": "All Formations", "fm": None, "drivers": all_drivers})
+        for fm in non_null_formations:
+            df_fm = df[df["Formation"].astype(str).str.upper() == fm]
+            fm_drivers = _buildGeoDriverAnalysis(df_fm, _estLookupForFormation(fm))
+            if fm_drivers:
+                geo_driver_buckets.append({"label": fm, "fm": fm, "drivers": fm_drivers})
+    else:
+        only_fm = non_null_formations[0] if non_null_formations else None
+        only_label = only_fm if only_fm else "All Formations"
+        geo_driver_buckets.append({"label": only_label, "fm": only_fm, "drivers": all_drivers})
+
+    # Drop empty buckets but always keep at least one so JS has something to render.
+    non_empty_buckets = [b for b in geo_driver_buckets if b["drivers"]]
+    if non_empty_buckets:
+        geo_driver_buckets = non_empty_buckets
 
     # Build well index table data
     well_index = numbered_wells
@@ -1714,7 +1751,11 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
   .tabs button.active {{ background: #0a2a5e; color: #fff; border-color: #0a2a5e; }}
   .tabs button:hover:not(.active) {{ background: #eee; }}
   .page {{ display: none; padding: 16px 28px; }}
-  .page.active {{ display: flex; gap: 20px; }}
+  .page.active {{ display: block; }}
+  .page-content {{ display: flex; gap: 20px; }}
+  .fm-bar {{ margin-bottom: 12px; font-size: 12px; }}
+  .fm-bar label {{ font-weight: bold; margin-right: 8px; }}
+  .fm-bar select {{ padding: 4px 10px; font-size: 12px; border: 1px solid #ccc; border-radius: 4px; background: #fff; }}
   .plot-wrap {{ flex: 1; min-width: 0; }}
   .plot-box {{ width: 100%; height: 680px; }}
   .sidebar {{ width: 320px; flex-shrink: 0; }}
@@ -1748,7 +1789,8 @@ const WELL_INDEX = {_json.dumps(well_index, separators=(',', ':'))};
 const AFE_PERMITS = {_json.dumps(afe_permits, separators=(',', ':'))};
 const AFE_WITH_LOC = {_json.dumps(afe_with_loc, separators=(',', ':'))};
 const AFE_SUBSURFACE_ESTIMATES = {_json.dumps(afe_subsurface_estimates, separators=(',', ':'))};
-const GEO_DRIVER = {_json.dumps(geo_driver_analysis, separators=(',', ':'))};
+const GEO_DRIVER_BUCKETS = {_json.dumps(geo_driver_buckets, separators=(',', ':'))};
+const FORMATIONS = {_json.dumps([f for f in formations if f is not None], separators=(',', ':'))};
 
 const tabsEl = document.getElementById('tabs');
 const pagesEl = document.getElementById('pages');
@@ -1829,8 +1871,93 @@ function buildPlot(fig, divId) {{
   Plotly.newPlot(divId, traces, layout, {{ responsive: true }});
 }}
 
-function renderGeoDrivers() {{
-  GEO_DRIVER.forEach((row, i) => {{
+function renderGeoDrivers(bucketIdx) {{
+  const geoPage = document.getElementById('page-geo');
+  if (!geoPage) return;
+  const safeIdx = (bucketIdx >= 0 && bucketIdx < GEO_DRIVER_BUCKETS.length) ? bucketIdx : 0;
+  const bucket = GEO_DRIVER_BUCKETS[safeIdx];
+  const drivers = (bucket && bucket.drivers) || [];
+
+  const fmtEst = v => (v === null || v === undefined || Number.isNaN(v)) ? '' : Math.round(v).toLocaleString();
+  const fmtSub = v => (v === null || v === undefined || Number.isNaN(v)) ? '—' : (Math.abs(v) >= 100 ? Math.round(v).toLocaleString() : Number(v).toFixed(3));
+
+  // Per-driver predicted-response lookup tied to the active bucket.
+  const PRED_BY_DRIVER = {{}};
+  drivers.forEach(row => {{
+    PRED_BY_DRIVER[row.param] = {{}};
+    (row.afe_points || []).forEach(p => {{
+      PRED_BY_DRIVER[row.param][p.letter] = p.y;
+    }});
+  }});
+  const responseUnit = drivers.length > 0 ? drivers[0].response : 'response';
+
+  // Formation dropdown (only when more than one bucket is available).
+  let fmBarHTML = '';
+  if (GEO_DRIVER_BUCKETS.length > 1) {{
+    fmBarHTML = '<div class="fm-bar"><label>Formation:</label><select id="geo-fm-select">' +
+      GEO_DRIVER_BUCKETS.map((b, i) => '<option value="' + i + '"' + (i === safeIdx ? ' selected' : '') + '>' + b.label + ' (' + (b.drivers ? b.drivers.length : 0) + ' drivers)</option>').join('') +
+      '</select></div>';
+  }}
+
+  // AFE subsurface estimate table — per-AFE-LZ estimate; predicted /ft swaps with the active bucket.
+  let subsurfaceHTML = '';
+  if (AFE_SUBSURFACE_ESTIMATES.length > 0 && AFE_WITH_LOC.length > 0) {{
+    subsurfaceHTML = '<h3 style="margin:0 0 4px 0;font-size:14px;">AFE Subsurface Estimates (heat map at each AFE location)</h3>';
+    subsurfaceHTML += '<div style="font-size:11px;color:#555;margin-bottom:8px;">Top: property estimate at AFE landing zone. Bottom (gray): predicted ' + responseUnit + ' from this driver\\'s ' + (bucket ? bucket.label : '') + ' regression.</div>';
+    subsurfaceHTML += '<table class="driver-rank"><tr><th>Property</th>' +
+      AFE_WITH_LOC.map(ap => '<th>' + ap.letter + '. ' + ap.name + (ap.lz ? '<br><span style="font-weight:normal;opacity:0.85;">[' + ap.lz + ']</span>' : '') + '</th>').join('') +
+      '</tr>';
+    AFE_SUBSURFACE_ESTIMATES.forEach(row => {{
+      const pred = PRED_BY_DRIVER[row.param] || null;
+      subsurfaceHTML += '<tr><td>' + row.label + '</td>' +
+        AFE_WITH_LOC.map(ap => {{
+          const propStr = fmtSub(row.by_letter[ap.letter]);
+          const predY = pred ? pred[ap.letter] : undefined;
+          const predStr = (pred && predY !== undefined && predY !== null && !Number.isNaN(predY))
+            ? '<div style="font-size:10px;color:#888;margin-top:2px;">' + fmtSub(predY) + ' /ft</div>'
+            : '';
+          return '<td>' + propStr + predStr + '</td>';
+        }}).join('') +
+        '</tr>';
+    }});
+    subsurfaceHTML += '</table>';
+  }}
+
+  let geoContent = fmBarHTML + subsurfaceHTML;
+
+  if (drivers.length > 0) {{
+    let rankHTML = '<h3 style="margin:14px 0 8px 0;font-size:14px;">Geo Driver Correlations — ' + (bucket ? bucket.label : '') + '</h3>';
+    rankHTML += '<table class="driver-rank"><tr><th>Rank</th><th>Property</th><th>Correlation</th><th>n</th></tr>';
+    drivers.forEach(row => {{
+      rankHTML += '<tr><td>' + row.rank + '</td><td>' + row.label + '</td><td>' + row.r.toFixed(2) + '</td><td>' + row.n + '</td></tr>';
+    }});
+    rankHTML += '</table>';
+    const estimateTargets = Object.keys(drivers[0].estimates || {{}}).filter(k => drivers[0].estimates[k]);
+    const targetLabel = key => drivers[0].estimates[key].label;
+    let estimateHTML = '<table class="driver-rank"><tr><th>Rank</th><th>Property</th>' +
+      estimateTargets.map(key => '<th>' + targetLabel(key) + '<br>P10/P50/P90</th>').join('') + '</tr>';
+    drivers.forEach(row => {{
+      estimateHTML += '<tr><td>' + row.rank + '</td><td>' + row.label + '</td>' +
+        estimateTargets.map(key => {{
+          const est = row.estimates[key];
+          return '<td>' + (est ? (fmtEst(est.p10) + ' / ' + fmtEst(est.p50) + ' / ' + fmtEst(est.p90)) : '') + '</td>';
+        }}).join('') + '</tr>';
+    }});
+    estimateHTML += '</table>';
+    const afeLength = drivers[0].afe_lateral_length;
+    const estimateNote = '<div class="estimate-note">Estimated production from linear fit' +
+      (afeLength ? ' normalized to AFE lateral length less 500 ft: ' + Math.round(afeLength).toLocaleString() + ' ft' : '') +
+      '</div>';
+    geoContent += rankHTML + estimateNote + estimateHTML + '<div class="driver-grid">' +
+      drivers.map((row, i) => '<div class="driver-plot" id="driver-plot-' + i + '"></div>').join('') +
+      '</div>';
+  }} else {{
+    geoContent += '<div style="font-size:13px;color:#666;padding:14px;">No geo-driver data for ' + (bucket ? bucket.label : 'this slice') + ' (need ≥4 wells with both driver and response).</div>';
+  }}
+
+  geoPage.innerHTML = geoContent;
+
+  drivers.forEach((row, i) => {{
     const traces = [{{
       type: 'scatter',
       mode: 'markers',
@@ -1851,7 +1978,6 @@ function renderGeoDrivers() {{
         showlegend: false,
       }});
     }}
-    // AFE markers — heat-map estimate vs. regression-predicted response.
     const afePts = (row.afe_points || []).filter(p => p.x !== null && p.x !== undefined && p.y !== null && p.y !== undefined);
     if (afePts.length > 0) {{
       traces.push({{
@@ -1875,43 +2001,117 @@ function renderGeoDrivers() {{
       hovermode: 'closest',
     }}, {{ responsive: true }});
   }});
+
+  if (GEO_DRIVER_BUCKETS.length > 1) {{
+    const sel = document.getElementById('geo-fm-select');
+    if (sel) {{
+      sel.addEventListener('change', e => {{
+        renderGeoDrivers(parseInt(e.target.value));
+      }});
+    }}
+  }}
 }}
 
-// Build tabs + pages
-FIGURES.forEach((fig, i) => {{
+// Group figures by parameter so each parameter is one tab with a Formation dropdown.
+const FIGURES_BY_PARAM = {{}};
+const PARAM_ORDER = [];
+const PARAM_LABELS = {{}};
+FIGURES.forEach(fig => {{
+  if (!(fig.param_key in FIGURES_BY_PARAM)) {{
+    FIGURES_BY_PARAM[fig.param_key] = [];
+    PARAM_ORDER.push(fig.param_key);
+    PARAM_LABELS[fig.param_key] = fig.param;
+  }}
+  FIGURES_BY_PARAM[fig.param_key].push(fig);
+}});
+
+// Sort each param's variants by FORMATIONS order so the dropdown is consistent across tabs.
+const FORMATION_ORDER_INDEX = {{}};
+FORMATIONS.forEach((f, i) => {{ FORMATION_ORDER_INDEX[f] = i; }});
+PARAM_ORDER.forEach(pk => {{
+  FIGURES_BY_PARAM[pk].sort((a, b) => {{
+    const ai = a.fm_label === null ? -1 : (FORMATION_ORDER_INDEX[a.fm_label] ?? 999);
+    const bi = b.fm_label === null ? -1 : (FORMATION_ORDER_INDEX[b.fm_label] ?? 999);
+    return ai - bi;
+  }});
+}});
+
+const fmtEstVal = v => (v === null || v === undefined || Number.isNaN(v))
+  ? '—'
+  : (Math.abs(v) >= 100 ? Math.round(v).toLocaleString() : Number(v).toFixed(3));
+
+function renderHeatmapPage(paramKey, fmLabel) {{
+  const figs = FIGURES_BY_PARAM[paramKey] || [];
+  let fig = figs.find(f => f.fm_label === fmLabel);
+  if (!fig) fig = figs[0];
+  if (!fig) return;
+  const page = document.getElementById('page-' + paramKey);
+  if (!page) return;
+
+  let fmBarHTML = '';
+  if (figs.length > 1) {{
+    fmBarHTML = '<div class="fm-bar"><label>Formation:</label><select data-param-key="' + paramKey + '">' +
+      figs.map(f => {{
+        const wellMatch = f.title.match(/(\\d+) wells/);
+        const wellCount = wellMatch ? wellMatch[1] : '?';
+        const optLabel = (f.fm_label || 'All') + ' (' + wellCount + ' wells)';
+        const sel = f.fm_label === fig.fm_label ? ' selected' : '';
+        const val = f.fm_label === null ? '__NONE__' : f.fm_label;
+        return '<option value="' + val + '"' + sel + '>' + optLabel + '</option>';
+      }}).join('') +
+      '</select></div>';
+  }}
+
+  const fmSuffix = fig.fm_label ? ' [' + fig.fm_label + ']' : '';
+  page.innerHTML = fmBarHTML + `
+    <div class="page-content">
+      <div class="plot-wrap"><div class="plot-box" id="plot-${{paramKey}}"></div></div>
+      <div class="sidebar">
+        <div class="panel">
+          <h3>AFE Permits</h3>
+          ${{AFE_PERMITS.map(p => '<div class="row"><span class="n">' + p.letter + '.</span> ' + p.name + ' [' + p.lz + ']</div>').join('')}}
+        </div>
+        <div class="panel">
+          <h3>AFE Estimate &mdash; ${{fig.param}}${{fmSuffix}}</h3>
+          ${{(fig.afe_estimates || []).map(e => '<div class="row"><span class="n">' + (e.letter || '') + '.</span> ' + e.name + ': ' + fmtEstVal(e.value) + '</div>').join('')}}
+        </div>
+        <div class="panel">
+          <h3>Offset Wells (by distance)</h3>
+          ${{fig.num_markers.map(m => '<div class="row"><span class="n">' + m.num + '.</span> ' + m.name + '</div>').join('')}}
+        </div>
+      </div>
+    </div>`;
+
+  buildPlot(fig, 'plot-' + paramKey);
+
+  if (figs.length > 1) {{
+    const sel = page.querySelector('.fm-bar select');
+    if (sel) {{
+      sel.addEventListener('change', e => {{
+        const v = e.target.value;
+        renderHeatmapPage(paramKey, v === '__NONE__' ? null : v);
+      }});
+    }}
+  }}
+}}
+
+// Build one tab + empty page per unique parameter
+PARAM_ORDER.forEach((paramKey, i) => {{
   const btn = document.createElement('button');
-  btn.textContent = fig.title.split(' —')[0];
-  btn.dataset.idx = i;
+  btn.textContent = PARAM_LABELS[paramKey];
+  btn.dataset.idx = paramKey;
   if (i === 0) btn.classList.add('active');
   tabsEl.appendChild(btn);
 
   const page = document.createElement('div');
   page.className = 'page' + (i === 0 ? ' active' : '');
-  page.id = 'page-' + i;
-  const fmtEstVal = v => (v === null || v === undefined || Number.isNaN(v))
-    ? '—'
-    : (Math.abs(v) >= 100 ? Math.round(v).toLocaleString() : Number(v).toFixed(3));
-  page.innerHTML = `
-    <div class="plot-wrap"><div class="plot-box" id="plot-${{i}}"></div></div>
-    <div class="sidebar">
-      <div class="panel">
-        <h3>AFE Permits</h3>
-        ${{AFE_PERMITS.map(p => '<div class="row"><span class="n">' + p.letter + '.</span> ' + p.name + ' [' + p.lz + ']</div>').join('')}}
-      </div>
-      <div class="panel">
-        <h3>AFE Estimate &mdash; ${{fig.param}}</h3>
-        ${{(fig.afe_estimates || []).map(e => '<div class="row"><span class="n">' + (e.letter || '') + '.</span> ' + e.name + ': ' + fmtEstVal(e.value) + '</div>').join('')}}
-      </div>
-      <div class="panel">
-        <h3>Offset Wells (by distance)</h3>
-        ${{fig.num_markers.map(m => '<div class="row"><span class="n">' + m.num + '.</span> ' + m.name + '</div>').join('')}}
-      </div>
-    </div>`;
+  page.id = 'page-' + paramKey;
   pagesEl.appendChild(page);
 }});
 
-// Geo driver diagnostic tab
-if (GEO_DRIVER.length > 0 || AFE_SUBSURFACE_ESTIMATES.length > 0) {{
+// Geo driver diagnostic tab — content is built lazily on activation by renderGeoDrivers.
+const hasAnyDrivers = GEO_DRIVER_BUCKETS.some(b => b.drivers && b.drivers.length > 0);
+if (hasAnyDrivers || AFE_SUBSURFACE_ESTIMATES.length > 0) {{
   const geoBtn = document.createElement('button');
   geoBtn.textContent = 'Geo Drivers';
   geoBtn.dataset.idx = 'geo';
@@ -1920,76 +2120,6 @@ if (GEO_DRIVER.length > 0 || AFE_SUBSURFACE_ESTIMATES.length > 0) {{
   const geoPage = document.createElement('div');
   geoPage.className = 'table-page';
   geoPage.id = 'page-geo';
-  const fmtEst = v => (v === null || v === undefined || Number.isNaN(v)) ? '' : Math.round(v).toLocaleString();
-  const fmtSub = v => (v === null || v === undefined || Number.isNaN(v)) ? '—' : (Math.abs(v) >= 100 ? Math.round(v).toLocaleString() : Number(v).toFixed(3));
-
-  // Build per-driver predicted-response lookup so the subsurface table can show
-  // each property estimate alongside its implied Cum/ft from the regression.
-  const PRED_BY_DRIVER = {{}};
-  GEO_DRIVER.forEach(row => {{
-    PRED_BY_DRIVER[row.param] = {{}};
-    (row.afe_points || []).forEach(p => {{
-      PRED_BY_DRIVER[row.param][p.letter] = p.y;
-    }});
-  }});
-  const responseUnit = GEO_DRIVER.length > 0 ? GEO_DRIVER[0].response : 'response';
-
-  // AFE subsurface estimate table — interpolated heat-map value at each AFE permit location.
-  // Each cell shows the property estimate (top) and the regression-predicted response/ft (bottom).
-  let subsurfaceHTML = '';
-  if (AFE_SUBSURFACE_ESTIMATES.length > 0 && AFE_WITH_LOC.length > 0) {{
-    subsurfaceHTML = '<h3 style="margin:0 0 4px 0;font-size:14px;">AFE Subsurface Estimates (heat map at each AFE location)</h3>';
-    subsurfaceHTML += '<div style="font-size:11px;color:#555;margin-bottom:8px;">Top: property estimate. Bottom (gray): predicted ' + responseUnit + ' from this driver\\'s regression.</div>';
-    subsurfaceHTML += '<table class="driver-rank"><tr><th>Property</th>' +
-      AFE_WITH_LOC.map(ap => '<th>' + ap.letter + '. ' + ap.name + (ap.lz ? '<br><span style="font-weight:normal;opacity:0.85;">[' + ap.lz + ']</span>' : '') + '</th>').join('') +
-      '</tr>';
-    AFE_SUBSURFACE_ESTIMATES.forEach(row => {{
-      const pred = PRED_BY_DRIVER[row.param] || null;
-      subsurfaceHTML += '<tr><td>' + row.label + '</td>' +
-        AFE_WITH_LOC.map(ap => {{
-          const propStr = fmtSub(row.by_letter[ap.letter]);
-          const predY = pred ? pred[ap.letter] : undefined;
-          const predStr = (pred && predY !== undefined && predY !== null && !Number.isNaN(predY))
-            ? '<div style="font-size:10px;color:#888;margin-top:2px;">' + fmtSub(predY) + ' /ft</div>'
-            : '';
-          return '<td>' + propStr + predStr + '</td>';
-        }}).join('') +
-        '</tr>';
-    }});
-    subsurfaceHTML += '</table>';
-  }}
-
-  let geoContent = subsurfaceHTML;
-
-  if (GEO_DRIVER.length > 0) {{
-    let rankHTML = '<h3 style="margin:14px 0 8px 0;font-size:14px;">Geo Driver Correlations</h3>';
-    rankHTML += '<table class="driver-rank"><tr><th>Rank</th><th>Property</th><th>Correlation</th></tr>';
-    GEO_DRIVER.forEach(row => {{
-      rankHTML += '<tr><td>' + row.rank + '</td><td>' + row.label + '</td><td>' + row.r.toFixed(2) + '</td></tr>';
-    }});
-    rankHTML += '</table>';
-    const estimateTargets = Object.keys(GEO_DRIVER[0].estimates || {{}}).filter(k => GEO_DRIVER[0].estimates[k]);
-    const targetLabel = key => GEO_DRIVER[0].estimates[key].label;
-    let estimateHTML = '<table class="driver-rank"><tr><th>Rank</th><th>Property</th>' +
-      estimateTargets.map(key => '<th>' + targetLabel(key) + '<br>P10/P50/P90</th>').join('') + '</tr>';
-    GEO_DRIVER.forEach(row => {{
-      estimateHTML += '<tr><td>' + row.rank + '</td><td>' + row.label + '</td>' +
-        estimateTargets.map(key => {{
-          const est = row.estimates[key];
-          return '<td>' + (est ? (fmtEst(est.p10) + ' / ' + fmtEst(est.p50) + ' / ' + fmtEst(est.p90)) : '') + '</td>';
-        }}).join('') + '</tr>';
-    }});
-    estimateHTML += '</table>';
-    const afeLength = GEO_DRIVER[0].afe_lateral_length;
-    const estimateNote = '<div class="estimate-note">Estimated production from linear fit' +
-      (afeLength ? ' normalized to AFE lateral length less 500 ft: ' + Math.round(afeLength).toLocaleString() + ' ft' : '') +
-      '</div>';
-    geoContent += rankHTML + estimateNote + estimateHTML + '<div class="driver-grid">' +
-      GEO_DRIVER.map((row, i) => '<div class="driver-plot" id="driver-plot-' + i + '"></div>').join('') +
-      '</div>';
-  }}
-
-  geoPage.innerHTML = geoContent;
   pagesEl.appendChild(geoPage);
 }}
 
@@ -2022,17 +2152,23 @@ tabsEl.addEventListener('click', e => {{
   const el = document.getElementById('page-' + idx);
   if (el) el.classList.add('active');
   if (idx === 'geo' && !plotted.has(idx)) {{
-    renderGeoDrivers();
+    renderGeoDrivers(0);
     plotted.add(idx);
-  }} else if (idx !== 'idx' && !plotted.has(idx)) {{
-    buildPlot(FIGURES[parseInt(idx)], 'plot-' + idx);
+  }} else if (idx !== 'idx' && idx !== 'geo' && !plotted.has(idx)) {{
+    const figs = FIGURES_BY_PARAM[idx] || [];
+    const initialFm = figs.length > 0 ? figs[0].fm_label : null;
+    renderHeatmapPage(idx, initialFm);
     plotted.add(idx);
   }}
 }});
 
-// Render first plot
-buildPlot(FIGURES[0], 'plot-0');
-plotted.add('0');
+// Render the first parameter's first formation
+if (PARAM_ORDER.length > 0) {{
+  const firstParam = PARAM_ORDER[0];
+  const firstFigs = FIGURES_BY_PARAM[firstParam];
+  renderHeatmapPage(firstParam, firstFigs[0].fm_label);
+  plotted.add(firstParam);
+}}
 </script>
 </body>
 </html>""")
