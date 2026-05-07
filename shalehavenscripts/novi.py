@@ -196,8 +196,25 @@ GEO_DRIVER_PARAMS = [
 
 def _geoDriverProductionParam(afeData=None, basinData=None):
     if _isPermianBasin(basinData):
-        return "Cum24MOil"
-    return "Cum24MGas" if _primaryProductionStream(afeData) == "gas" else "Cum24MOil"
+        primary_is_oil = True
+    else:
+        primary_is_oil = _primaryProductionStream(afeData) != "gas"
+
+    candidates = (
+        ["Cum24MOil", "Cum12MOil", "EUR50YROil"]
+        if primary_is_oil
+        else ["Cum24MGas", "Cum12MGas", "EUR50YRGas"]
+    )
+
+    # Data-aware fallback: pick the first candidate with >= 4 non-null values.
+    # Brand-new wells (common in api_list mode) have no Cum12M/24M yet — falling
+    # back to EUR50YR gives the regression a usable y-axis since Novi populates
+    # the 50-year EUR from the forecast as soon as the well exists.
+    if isinstance(basinData, pd.DataFrame) and not basinData.empty:
+        for col in candidates:
+            if col in basinData.columns and basinData[col].notna().sum() >= 4:
+                return col
+    return candidates[0]
 
 
 def _geoDriverEstimateTargets(afeData=None):
@@ -421,36 +438,23 @@ def authNovi():
     return token
 
 
-## Retrieve offset wells within N miles of permit locations, filtered by formation
-## Reads from local Novi bulk export (D:\novi) — no API call. Run runNoviBulk() first.
+## Retrieve offset wells from local Novi bulk export (D:\novi) — no API call.
+## Two modes:
+##   [R] Radius — bounding box around AFE permits, filtered by Landing Zone formation + FirstProductionYear >= 2018
+##   [A] API10 list — user pastes specific API10 numbers; no formation/vintage filter
+## Search mode is stashed on the returned DataFrame's .attrs so plotSubsurfaceHeatMapsHTML
+## can suffix the output filename and let radius/api-list runs coexist for the same DSU.
 ## token and scope are kept for backward compat with main_model.py but unused.
-## Formation name is pulled from AFE Summary "Landing Zone" column and uppercased to match Novi format
 def getWells(token, permitData, afeData, scope="us-horizontals"):
 
-    # Calculate bounding box around the permit locations
-    # 1 degree latitude ~ 69 miles, 1 degree longitude ~ 69 * cos(lat) miles
-    miles = float(input("Enter search radius in miles: ").strip())
-    lat_offset = miles / 69.0
-    avg_lat = permitData["Latitude"].mean()
-    lon_offset = miles / (69.0 * abs(math.cos(math.radians(avg_lat))))
+    # Mode prompt — default to radius for backward compat
+    print("\nOffset well search mode:")
+    print("  [R] Radius around AFE permits (formation + vintage filter)")
+    print("  [A] Paste specific API10 list (no formation/vintage filter)")
+    mode_input = input("Choose [R/A] (default R): ").strip().upper()
+    searchMode = "api_list" if mode_input == "A" else "radius"
 
-    # Expand permit min/max by offset to create the search boundary
-    min_lat = permitData["Latitude"].min() - lat_offset
-    max_lat = permitData["Latitude"].max() + lat_offset
-    min_lon = permitData["Longitude"].min() - lon_offset
-    max_lon = permitData["Longitude"].max() + lon_offset
-
-    # Pull all unique formations from AFE Summary and uppercase to match Novi format.
-    # Expand aliases so geologically-equivalent zones (e.g. JO MILL <-> LOWER SPRABERRY SAND)
-    # are pulled from Novi together regardless of which name the AFE used.
-    formations = _expandFormations(afeData["Landing Zone"].dropna().str.upper().unique().tolist())
-
-    # Point Pleasant and Utica are treated as separate formations
-
-    print(f"Searching for wells within {miles} miles of permit locations, Formations: {formations}")
-    print(f"Bounding box: Lat [{min_lat:.4f}, {max_lat:.4f}], Lon [{min_lon:.4f}, {max_lon:.4f}]")
-
-    # Load WellDetails from local bulk export
+    # Load WellDetails from local bulk export (shared by both modes)
     paths = getNoviBulkPaths()
     wellDetailsPath = paths["tsv"]["WellDetails"]
 
@@ -459,20 +463,72 @@ def getWells(token, permitData, afeData, scope="us-horizontals"):
     wells = pd.read_csv(wellDetailsPath, sep="\t", low_memory=False, dtype={"API10": "string"})
     print(f"  Loaded {len(wells):,} total wells from bulk export")
 
-    # Apply bounding box + formation + vintage filter
-    # FirstProductionYear >= 2018 keeps modern completions; null years (never produced) are
-    # excluded automatically since NaN >= 2018 evaluates to False
-    mask = (
-        (wells["MPLatitude"] >= min_lat)
-        & (wells["MPLatitude"] <= max_lat)
-        & (wells["MPLongitude"] >= min_lon)
-        & (wells["MPLongitude"] <= max_lon)
-        & (wells["Formation"].isin(formations))
-        & (wells["FirstProductionYear"] >= 2018)
-    )
-    filtered = wells[mask].copy()
+    if searchMode == "api_list":
+        print("\nPaste API10 numbers (comma, space, or newline-separated). End with a blank line:")
+        lines = []
+        while True:
+            try:
+                line = input()
+            except EOFError:
+                break
+            if not line.strip():
+                break
+            lines.append(line)
+        raw = " ".join(lines)
+        # Split on whitespace/commas/semicolons; strip non-digits per token; truncate to API10.
+        # Accepts pasted API12/API14, dashed forms ("42-475-12345"), or bare API10.
+        tokens = [t for t in re.split(r"[,\s;]+", raw) if t.strip()]
+        api_list = []
+        for t in tokens:
+            digits = re.sub(r"\D", "", t)
+            if len(digits) >= 10:
+                api_list.append(digits[:10])
+        api_list_unique = sorted(set(api_list))
+        print(f"  Got {len(api_list_unique)} unique API10 values from input")
 
-    print(f"Done. Retrieved {len(filtered):,} wells matching criteria.")
+        filtered = wells[wells["API10"].isin(api_list_unique)].copy()
+        found_set = set(filtered["API10"].dropna().astype(str).tolist())
+        missing = sorted(set(api_list_unique) - found_set)
+        if missing:
+            preview = ", ".join(missing[:10]) + ("..." if len(missing) > 10 else "")
+            print(f"  WARNING: {len(missing)} API10s not found in bulk export: {preview}")
+        print(f"Done. Retrieved {len(filtered):,} wells matching API10 list.")
+    else:
+        # Radius mode — bounding box around permit locations
+        # 1 degree latitude ~ 69 miles, 1 degree longitude ~ 69 * cos(lat) miles
+        miles = float(input("Enter search radius in miles: ").strip())
+        lat_offset = miles / 69.0
+        avg_lat = permitData["Latitude"].mean()
+        lon_offset = miles / (69.0 * abs(math.cos(math.radians(avg_lat))))
+
+        min_lat = permitData["Latitude"].min() - lat_offset
+        max_lat = permitData["Latitude"].max() + lat_offset
+        min_lon = permitData["Longitude"].min() - lon_offset
+        max_lon = permitData["Longitude"].max() + lon_offset
+
+        # Pull all unique formations from AFE Summary and uppercase to match Novi format.
+        # Expand aliases so geologically-equivalent zones (e.g. JO MILL <-> LOWER SPRABERRY SAND)
+        # are pulled from Novi together regardless of which name the AFE used.
+        formations = _expandFormations(afeData["Landing Zone"].dropna().str.upper().unique().tolist())
+
+        print(f"Searching for wells within {miles} miles of permit locations, Formations: {formations}")
+        print(f"Bounding box: Lat [{min_lat:.4f}, {max_lat:.4f}], Lon [{min_lon:.4f}, {max_lon:.4f}]")
+
+        # FirstProductionYear >= 2018 keeps modern completions; null years (never produced) are
+        # excluded automatically since NaN >= 2018 evaluates to False
+        mask = (
+            (wells["MPLatitude"] >= min_lat)
+            & (wells["MPLatitude"] <= max_lat)
+            & (wells["MPLongitude"] >= min_lon)
+            & (wells["MPLongitude"] <= max_lon)
+            & (wells["Formation"].isin(formations))
+            & (wells["FirstProductionYear"] >= 2018)
+        )
+        filtered = wells[mask].copy()
+        print(f"Done. Retrieved {len(filtered):,} wells matching criteria.")
+
+    # Tag mode so plotSubsurfaceHeatMapsHTML can pick a non-conflicting filename
+    filtered.attrs["searchMode"] = searchMode
     return filtered
 
 
@@ -1311,7 +1367,10 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
     dsuName = afeFilename.split("-", 1)[1].strip() if "-" in afeFilename else afeFilename
     outputDir = os.path.join(afeDir, "Data")
     os.makedirs(outputDir, exist_ok=True)
-    htmlPath = os.path.join(outputDir, f"subsurface_heatmaps_{dsuName}.html")
+    # Suffix when getWells ran in api_list mode so radius and api-list runs coexist
+    searchMode = offsetData.attrs.get("searchMode") if offsetData is not None and hasattr(offsetData, "attrs") else None
+    suffix = "_apilist" if searchMode == "api_list" else ""
+    htmlPath = os.path.join(outputDir, f"subsurface_heatmaps_{dsuName}{suffix}.html")
 
     if subsurfaceData is None or subsurfaceData.empty:
         print("No subsurface data — skipping HTML heat map export.")
@@ -1454,12 +1513,19 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
             "lat": lat,
         })
 
-    # Determine formations — each gets its own page
+    # Determine formations — each gets its own slicer entry. When multiple zones are present,
+    # also emit a None ("All Formations") view so sparse api_list runs (e.g. 5 wells across
+    # 3 Wolfcamp zones, ~2 per zone) still render — per-zone slices fall under the < 4 cutoff
+    # but the aggregate has enough points to interpolate. Geo drivers already does this.
     if "Formation" in df.columns:
-        formations = sorted(df["Formation"].dropna().astype(str).str.upper().unique().tolist())
+        formation_values = sorted(df["Formation"].dropna().astype(str).str.upper().unique().tolist())
     else:
-        formations = []
-    if not formations:
+        formation_values = []
+    if len(formation_values) > 1:
+        formations = [None] + formation_values
+    elif formation_values:
+        formations = formation_values
+    else:
         formations = [None]
 
     api10_to_formation = {}
@@ -1487,6 +1553,7 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
             values = pd.to_numeric(df_fm[param], errors="coerce")
             mask = values.notna()
             if mask.sum() < 4:
+                print(f"  Skipping {param} [{fm_label or 'ALL'}]: only {int(mask.sum())} valid points (need >= 4)")
                 continue
 
             points_fm = df_fm[["Longitude", "Latitude"]].values
