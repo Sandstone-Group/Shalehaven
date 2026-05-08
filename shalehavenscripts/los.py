@@ -346,6 +346,10 @@ AFE_PROPERTY_ALIASES = {
 
 # Manual JIB rollups. Key = source JIB Property Name; value = list of AFE
 # Well Names to re-parent to. 1 target => 1-to-1 move; N targets => 1/N split.
+# Empty list => 1/N split across every AFE well in the JIB row's operator
+# folder (mirrors the AFE_PROPERTY_ALIASES "ALL" behavior — used for CAPEX
+# buckets that an operator codes against a separate placeholder rather than
+# the real well list).
 JIB_PROPERTY_ALIASES = {
     "NICHOLS-TRULSON/PALERMO CTB": ["Nichols-Trulson 156-90-10-14H-1"],
     "PALERMO 3-31 CTB": ["Palermo 156-90-3-31H-2"],
@@ -360,6 +364,10 @@ JIB_PROPERTY_ALIASES = {
         "Palermo 156-90-3-31H-2",
         "Palermo 156-90-3-31H-3",
     ],
+    # ConocoPhillips - "Klondike H Reoccupation (Drill" is a CAPEX bucket
+    # coded against MBS.01036.E.DF01-06 and not tied to a specific well.
+    # Roll across every Drilly Idol AFE in the folder (1/N each).
+    "KLONDIKE H REOCCUPATION (DRILL": [],
 }
 
 # Manual JIB AFE Number -> AFE Well Name map. For JIB rows whose Op AFE
@@ -450,6 +458,25 @@ def normalizePropertyName(val):
         return None
     s = re.sub(r"\s+", " ", str(val).strip().upper())
     return s or None
+
+
+# ConocoPhillips / COG JIB Property Names embed an accounting category
+# code as a trailing ' .XX[.NN] <repeated text>' suffix, e.g.
+#   'DRILLY IDOL A1 5501LH .AL DRILLY IDO ...'   (.AL = artificial lift)
+#   'DRILLY IDOL A1 5501LH .CD DRILLY IDO ...'   (.CD = completion drl)
+#   'DRILLY IDOL B5 5504LH .FC.74 DRILLY  ...'   (.FC.74 = facility)
+# Without stripping, normalizePropertyKey treats every variant as a
+# distinct well, fragmenting one well across 4-5 Property Keys (and the
+# fuzzy reconcile ratio falls below 0.80, so they don't merge back).
+_ACCOUNTING_SUFFIX_RE = re.compile(r"\s+\.[A-Z]{2,4}(?:\.\d{1,3})?\b.*$")
+
+
+def stripAccountingSuffix(val):
+    """Strip COP-style ' .XX[.NN] <text>' accounting tail from a Property
+    Name so all variants of one well collapse to a single Property Key."""
+    if pd.isna(val):
+        return val
+    return _ACCOUNTING_SUFFIX_RE.sub("", str(val)).rstrip()
 
 
 def normalizeOwnerName(val):
@@ -885,9 +912,12 @@ def _applyAfeRollups(afe):
     return afe.reset_index(drop=True)
 
 
-def _applyJibRollups(jib, afe):
+def _applyJibRollups(jib, afe, operatorMap=None):
     """Apply JIB_PROPERTY_ALIASES. Re-parents JIB rows onto real AFE wells,
-    inheriting their Property Key / Property Name / Property Name (Normalized)."""
+    inheriting their Property Key / Property Name / Property Name (Normalized).
+    Explicit target list -> 1-to-1 (single) or 1/N split (multiple).
+    Empty target list -> 1/N split across every AFE well in the row's operator
+    folder (CAPEX bucket pattern; mirrors AFE_PROPERTY_ALIASES empty behavior)."""
     afeWellLookup = {}
     for _, r in afe.iterrows():
         name = r.get("Well Name")
@@ -898,6 +928,16 @@ def _applyJibRollups(jib, afe):
             "Property Name (Normalized)": r.get("Property Name (Normalized)"),
         }
 
+    afeFolderWells = {}
+    if "Folder" in afe.columns:
+        for folder, group in (
+            afe.dropna(subset=["Folder", "Well Name"])
+               .groupby("Folder")["Well Name"]
+        ):
+            afeFolderWells[folder] = sorted({str(w) for w in group.unique()})
+
+    operatorMap = operatorMap or {}
+
     toAdd = []
     toDrop = []
     for src, targets in JIB_PROPERTY_ALIASES.items():
@@ -905,11 +945,24 @@ def _applyJibRollups(jib, afe):
         matches = jib[jib["Property Key"] == srcKey]
         if matches.empty:
             continue
-        valid = [t for t in targets if t in afeWellLookup]
-        if not valid:
-            continue
-        n = len(valid)
+        if targets:
+            staticValid = [t for t in targets if t in afeWellLookup]
+            if not staticValid:
+                continue
+        else:
+            staticValid = None  # resolve per-row from operator's folder
         for idx, row in matches.iterrows():
+            if staticValid is not None:
+                valid = staticValid
+            else:
+                folder = operatorMap.get(row.get("Operator"))
+                valid = [
+                    w for w in afeFolderWells.get(folder, [])
+                    if w in afeWellLookup
+                ]
+                if not valid:
+                    continue
+            n = len(valid)
             gross = row.get("Gross Invoiced") or 0
             net = row.get("Net Expense") or 0
             for tw in valid:
@@ -1142,6 +1195,12 @@ def generateAfeActualReport(afeMasterPath=None, jibMasterPath=None, outputDir=No
         "Detail Line Notation", "Property Code", "Invoice Number",
     ])
 
+    # Strip COP-style accounting suffix from JIB Property Names so all
+    # variants of one well collapse to a single Property Key (otherwise
+    # ConocoPhillips wells fragment 4-5x in the Dimensions sheet).
+    if "Property Name" in jib.columns:
+        jib["Property Name"] = jib["Property Name"].apply(stripAccountingSuffix)
+
     # drop opex JIB rows (no Op AFE number = out of scope) and fully-blank AFE rows
     jib = jib[jib["Op AFE"].notna()].reset_index(drop=True)
     afe = afe[~(afe["AFE Number"].isna() & afe["Well Name"].isna())].reset_index(drop=True)
@@ -1173,7 +1232,7 @@ def generateAfeActualReport(afeMasterPath=None, jibMasterPath=None, outputDir=No
 
     afe = _applyCtbAllocation(afe)
     afe = _applyAfeRollups(afe)
-    jib = _applyJibRollups(jib, afe)
+    jib = _applyJibRollups(jib, afe, operatorMap)
 
     afe["Project"] = afe["Folder"]
     jib["Project"] = jib["Operator"].map(operatorMap).fillna(jib["Operator"])

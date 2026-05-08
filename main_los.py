@@ -36,7 +36,6 @@ runAfe = True # set to true to run the AFE ETL process, set to false to skip the
 runJib = True # set to true to run the JIB ETL process, set to false to skip the JIB ETL process
 runRevenue = True # set to true to run the Revenue ETL process, set to false to skip the Revenue ETL process
 runAfeActual = True # set to true to run the AFE vs Actual reconciliation, set to false to skip
-runWellSchedule = True # set to true to roll up the Well Schedule master into a flat CSV, set to false to skip
 print("Begin Shalehaven LOS ETL Process")
 
 # if runAFE is true, run the AFE ETL process

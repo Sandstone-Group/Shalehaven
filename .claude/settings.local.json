@@ -7,7 +7,10 @@
       "Bash(awk -F'\\\\t' 'NR==1 {next} $1!=\"\" && NR<=5 {print}' \"/d/novi/extracted_2026-04-15_16-56-59/Database/Subsurface.tsv\"2222)",
       "Bash(python -m pytest tests/ -x --tb=short)",
       "Bash(python -m pytest tests/ --tb=short)",
-      "Bash(python *)"
+      "Bash(python *)",
+      "PowerShell($env:SHALEHAVEN_AFE_MASTER_PATH; $env:SHALEHAVEN_JIB_MASTER_PATH; $env:SHALEHAVEN_DATABASE_PATH2)",
+      "PowerShell($path = \"C:\\\\Users\\\\Michael Tanner\\\\OneDrive - Shalehaven Energy & Asset Management LLC\\\\Operations - Documents\\\\AFE\\\\# 2025\\\\ConocoPhillips\\\\afe_drillyidol_02.xlsx\"; python -c \"import pandas as pd; df = pd.read_excel\\(r'$path'\\); print\\('Cols:', df.columns.tolist\\(\\)\\); print\\('Rows:', len\\(df\\)\\); print\\(df[['Well Name','AFE Number']].head\\(40\\).to_string\\(\\)\\) if 'Well Name' in df.columns else print\\(df.head\\(20\\).to_string\\(\\)\\)\")",
+      "PowerShell(Get-ChildItem -Path \"C:\\\\Users\\\\Michael Tanner\\\\OneDrive - Shalehaven Energy & Asset Management LLC\\\\Operations - Documents\\\\JIB\\\\Conoco Phillips\" -Recurse -File | ForEach-Object { Write-Output \\($_.FullName + ' [' + $_.Length + ']'\\) })"
     ]
   }
 }
