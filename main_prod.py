@@ -45,6 +45,7 @@ pathToCopData = os.getenv("SHALEHAVEN_COP_PATH")
 pathToSpurData = os.getenv("SHALEHAVEN_SPUR_PATH")
 pathToBallardData = os.getenv("SHALEHAVEN_BALLARD_PATH")
 pathToKrakenData = os.getenv("SHALEHAVEN_KRAKEN_PATH")
+pathToEogData = os.getenv("SHALEHAVEN_EOG_PATH")
 pathToMonthlyPDSData = os.getenv("SHALEHAVEN_MONTHLY_PDS_PATH")
 pathToDatabase = os.getenv("SHALEHAVEN_DATABASE_PATH")
 pathToDealSheet = os.getenv("SHALEHAVEN_DEAL_SHEET_PATH")
@@ -71,7 +72,8 @@ copWells = wells[wells['currentOperator'] == 'COG OPERATING LLC']
 spurWells = wells[wells['currentOperator'] == 'Spur Energy Partners LLC']
 ballardWells = wells[wells['currentOperator'] == 'Ballard Petroleum']
 krakenWells = wells[wells['currentOperator'] == 'Kraken Operating, LLC']
-fundWells = pd.concat([huntWells, admiralWells, aethonWells, devonWells, copWells, spurWells, ballardWells, krakenWells]) # merge huntWells with admiralWells, devonWells, aethonWells, copWells, spurWells, ballardWells, and krakenWells
+eogWells = wells[wells['currentOperator'] == 'EOG RESOURCES INC']
+fundWells = pd.concat([huntWells, admiralWells, aethonWells, devonWells, copWells, spurWells, ballardWells, krakenWells, eogWells]) # merge huntWells with admiralWells, devonWells, aethonWells, copWells, spurWells, ballardWells, krakenWells, and eogWells
 
 # print fundWells to database
 fundWells.to_excel(os.path.join(pathToDatabase, r"fundWells.xlsx"))
@@ -88,6 +90,7 @@ spurProductionData = production.spurProductionData(pathToSpurData, spurWellMappi
 ballardProductionData = production.ballardProductionData(pathToBallardData)
 krakenWellMapping = dict(zip(krakenWells['wellName'], krakenWells['chosenID']))
 krakenProductionData = production.krakenProductionData(pathToKrakenData, krakenWellMapping)
+eogProductionData = production.eogProductionData(pathToEogData)
 monthlyPds = production.pdsMonthlyData(pathToMonthlyPDSData)
 
 # Put Production Data to ComboCurve
@@ -99,6 +102,7 @@ combocurve.putDataComboCurveDaily(ccClient, copProductionData, operator="ConocoP
 combocurve.putDataComboCurveDaily(ccClient, spurProductionData, operator="Spur")
 combocurve.putDataComboCurveDaily(ccClient, ballardProductionData, operator="Ballard")
 combocurve.putDataComboCurveDaily(ccClient, krakenProductionData, operator="Kraken")
+combocurve.putDataComboCurveDaily(ccClient, eogProductionData, operator="EOG")
 combocurve.putDataComboCurveMonthly(ccClient, monthlyPds)
 
 # Get Daily Productions from ComboCurve for Shalehaven

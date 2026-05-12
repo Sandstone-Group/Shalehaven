@@ -282,7 +282,29 @@ def krakenProductionData(pathToData, wellMapping):
 
     return data
 
+"""
 
+Get EOG Resources Production Data - PDS
+
+"""
+
+def eogProductionData(pathToData):
+
+    print("Getting EOG Resources Production Data")
+
+    pathToData = _latest_file_in_dir(pathToData)
+
+    data = pd.read_csv(pathToData)
+    data = data[:-1]
+
+    # API arrives in scientific notation (e.g. 4.90058E+13); cast through int to drop the exponent.
+    data['API'] = data['API'].astype(float).astype('int64').astype(str).str.zfill(14)
+
+    data = data[['PRODDATE', 'API', 'OIL PROD', 'GAS PROD', 'WATER PROD']]
+    data['dataSource'] = "other"
+    data.columns = COMBOCURVE_COLUMNS
+
+    return data
 
 """
     
