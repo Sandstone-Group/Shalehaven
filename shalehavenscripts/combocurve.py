@@ -206,6 +206,104 @@ def getDailyProductionFromComboCurve(client, wellList, pathToDatabase):
 
 """
 
+## Company-scope econ-model assumption types we pull for AFE economics.
+## Other CC types (capex, ownership-reversions, general-options, etc.) live elsewhere
+## or are set per-AFE rather than as company templates.
+COMPANY_ECON_MODEL_TYPES = [
+    "differentials",
+    "expenses",
+    "pricing",
+    "production-taxes",
+    "stream-properties",
+]
+
+
+## Fetch every company-scope econ-model in the account, grouped by type.
+## Returns dict {modelType: [record, ...]} where each record is the raw CC JSON
+## (carries id, name, and the full assumption payload — ready to pass to econ runs).
+def getCompanyModels(client, types=None):
+    types = types or COMPANY_ECON_MODEL_TYPES
+    out = {}
+    for t in types:
+        records = list(client.paginate(f"/v1/econ-models/{t}", take=200))
+        out[t] = records
+        print(f"  {t}: {len(records)} model(s)")
+    return out
+
+
+## Resolve which company econ-model record to use for each type, given an AFE Summary and basin code.
+## Matching rules:
+##   pricing           → always "SHP"
+##   differentials     → exact match on basinCode (e.g. "PBR")
+##   stream-properties → "{basinCode} - {formation}" (formation from AFE Landing Zone)
+##   expenses          → "{basinCode} - {operator}" (operator from AFE Operator, fuzzy substring)
+##   production-taxes  → state name (full, from AFE State column)
+## Returns dict {modelType: matched_record}; raises KeyError listing every type that didn't resolve.
+def resolveAfeEconModels(afeData, basinCode, companyModels):
+    if afeData is None or afeData.empty:
+        raise ValueError("resolveAfeEconModels: empty afeData")
+
+    def _first_nonnull(col):
+        if col not in afeData.columns:
+            return None
+        s = afeData[col].dropna().astype(str).str.strip()
+        s = s[s != ""]
+        return s.iloc[0] if not s.empty else None
+
+    formation = _first_nonnull("Landing Zone")
+    operator = _first_nonnull("Operator")
+    state = _first_nonnull("State")
+
+    bc = basinCode.strip()
+
+    def _match_exact(records, target):
+        tgt = target.strip().lower()
+        for r in records:
+            if str(r.get("name", "")).strip().lower() == tgt:
+                return r
+        return None
+
+    def _match_basin_suffix(records, suffix):
+        # name like "{basinCode} - {suffix}" with case-insensitive fuzzy substring on the suffix
+        if suffix is None:
+            return None
+        suf = suffix.strip().lower()
+        prefix = f"{bc.lower()} - "
+        candidates = []
+        for r in records:
+            name = str(r.get("name", "")).strip().lower()
+            if not name.startswith(prefix):
+                continue
+            tail = name[len(prefix):]
+            if tail == suf or suf in tail or tail in suf:
+                candidates.append(r)
+        return candidates[0] if candidates else None
+
+    resolved = {
+        "pricing":           _match_exact(companyModels.get("pricing", []),          "SHP"),
+        "differentials":     _match_exact(companyModels.get("differentials", []),    bc),
+        "stream-properties": _match_basin_suffix(companyModels.get("stream-properties", []), formation),
+        "expenses":          _match_basin_suffix(companyModels.get("expenses", []),  operator),
+        "production-taxes":  _match_exact(companyModels.get("production-taxes", []), state) if state else None,
+    }
+
+    missing = []
+    for t, r in resolved.items():
+        if r is None:
+            ctx = {
+                "pricing": "name='SHP'",
+                "differentials": f"name='{bc}'",
+                "stream-properties": f"name='{bc} - {formation}'",
+                "expenses": f"name='{bc} - {operator}'",
+                "production-taxes": f"name='{state}'",
+            }[t]
+            missing.append(f"{t} ({ctx})")
+    if missing:
+        raise KeyError("Unresolved econ models:\n  - " + "\n  - ".join(missing))
+
+    return resolved
+
+
 def getDailyForecastFromComboCurve(client, projectId, forecastId, wellList):
 
     print("Getting Daily Forecast from ComboCurve")

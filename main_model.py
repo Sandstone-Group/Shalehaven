@@ -1,34 +1,90 @@
 ## Shalehaven Main Model Scripts
 ## Developed by Michael Tanner
 
+import re
+
 # Imports - SHEM Scripts
 import shalehavenscripts.novi as novi
-import shalehavenscripts.combocurve as combocurve
+import shalehavenscripts.economics as economics
 import shalehavenscripts.production as production
 
-token = novi.authNovi()
+# ============================================================================
+# All interactive inputs gathered upfront — paste/answer everything in one shot
+# then walk away while the pipeline runs.
+# ============================================================================
 
-print("Successfully Authenticated with Novi Token")
-
-# Read in AFE Summary
 pathToAfeSummary = input("Enter the path to the AFE Summary file: ").strip().strip('"').strip("'")
 runForecasts = input("Run forecasts & production export? (Y/N): ").strip().upper() == "Y"
 runAnalysis = input("Run operator analysis? (Y/N): ").strip().upper() == "Y"
 
-afeData = novi.readAFESummary(pathToAfeSummary) # This should be the AFE Summary file provided by the user, containing at least the "Landing Zone" column.
-permitData = novi.getWellPermits(token, afeData) # This function retrieves well permits from the Novi API based on the landing zone specified in the AFE Summary. It returns a DataFrame with permit locations (latitude and longitude) that will be used to find nearby wells.
+print("\nOffset well search mode:")
+print("  [R] Radius around AFE permits (formation + vintage filter)")
+print("  [A] Paste specific API10 list (no formation/vintage filter)")
+modeInput = input("Choose [R/A] (default R): ").strip().upper()
+searchMode = "api_list" if modeInput == "A" else "radius"
 
-offsetData = novi.getWells(token, permitData, afeData) # This function retrieves wells from the Novi API that are within a 5-mile radius of the permit locations. It uses the bounding box method to filter wells based on their latitude and longitude. The resulting DataFrame contains information about the nearby wells, including their production data.
+apiList = None
+radiusMiles = None
+if searchMode == "api_list":
+    print("\nPaste API10 numbers (comma, space, or newline-separated). End with a blank line:")
+    pastedLines = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if not line.strip():
+            break
+        pastedLines.append(line)
+    raw = " ".join(pastedLines)
+    tokens = [t for t in re.split(r"[,\s;]+", raw) if t.strip()]
+    apiCandidates = []
+    for t in tokens:
+        digits = re.sub(r"\D", "", t)
+        if len(digits) >= 10:
+            apiCandidates.append(digits[:10])
+    apiList = sorted(set(apiCandidates))
+else:
+    radiusMiles = float(input("Enter search radius in miles: ").strip())
+
+basinCode = None
+cashPromote = None
+carry = None
+if runForecasts:
+    basinCode = input("Which Basin: ").strip()
+    cashPromoteRaw = input("Cash Promote (% or decimal, blank=0): ").strip()
+    cashPromote = float(cashPromoteRaw) if cashPromoteRaw else 0.0
+    if cashPromote > 1.0:
+        cashPromote /= 100.0
+    carryRaw = input("Carry Through Tanks (% or decimal, blank=0): ").strip()
+    carry = float(carryRaw) if carryRaw else 0.0
+    if carry > 1.0:
+        carry /= 100.0
+
+# ============================================================================
+# Pipeline — no further prompts beyond this point
+# ============================================================================
+
+token = novi.authNovi()
+print("Successfully Authenticated with Novi Token")
+
+afeData = novi.readAFESummary(pathToAfeSummary) # AFE Summary file — must include Landing Zone, Operator, State, NRI, WI, Net AFE columns.
+permitData = novi.getWellPermits(token, afeData) # Well permits from Novi for landing zone(s) in the AFE Summary.
+offsetData = novi.getWells(token, permitData, afeData, searchMode=searchMode, apiList=apiList, radiusMiles=radiusMiles) # Offset wells from local Novi bulk export (radius or pasted API10 list).
+
+monthlyForecastData = None
+if runForecasts:
+    forecastData = novi.getNoviYearlyForecast(token, offsetData) # Yearly EUR forecast per offset well.
+    monthlyForecastData = novi.getNoviMonthlyForecast(token, forecastData) # Monthly forecast volumes per offset well.
+    monthlyProductionData = novi.getNoviMonthlyProduction(token, offsetData) # Historical monthly production per offset well.
+    novi.printData(forecastData, monthlyForecastData, monthlyProductionData, pathToAfeSummary) # Excel exports to Data/ folder.
+
+subsurfaceData = novi.getNoviSubsurface(token, offsetData) # Subsurface petrophysical data per offset well (formation-aware).
+wellboreLocationsData = novi.getNoviWellboreLocations(token, offsetData) # Lateral path points per offset well.
+monthlyForecastBuckets = novi.plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, permitData=permitData, wellboreLocationsData=wellboreLocationsData, offsetData=offsetData, afeData=afeData, monthlyForecastData=monthlyForecastData) # Interactive HTML heat maps (opens in browser); returns monthly P10/P50/P90 buckets.
 
 if runForecasts:
-    forecastData = novi.getNoviYearlyForecast(token, offsetData) # This function retrieves production forecasts for the nearby wells identified in the previous step. It uses the well IDs from the offsetData DataFrame to query the Novi API and returns a DataFrame with forecasted production data for each well.
-    monthlyForecastData = novi.getNoviMonthlyForecast(token, forecastData) # Retrieve monthly forecast volumes for offset wells
-    monthlyProductionData = novi.getNoviMonthlyProduction(token, offsetData) # Retrieve historical monthly production for offset wells from local bulk export
-    novi.printData(forecastData, monthlyForecastData, monthlyProductionData, pathToAfeSummary) # Export header data, monthly forecast, and monthly production to Excel
-
-subsurfaceData = novi.getNoviSubsurface(token, offsetData) # Retrieve subsurface petrophysical data for offset wells (formation-aware)
-wellboreLocationsData = novi.getNoviWellboreLocations(token, offsetData) # Retrieve lateral path points for offset wells
-novi.plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, permitData=permitData, wellboreLocationsData=wellboreLocationsData, offsetData=offsetData, afeData=afeData) # Interactive HTML heat maps (opens in browser)
+    economics.runAfeEconomics(afeData, monthlyForecastBuckets, pathToAfeSummary, basinCode=basinCode, cashPromote=cashPromote, carry=carry)
 
 if runAnalysis:
     analysisData = novi.getOperatorAnalysisData(afeData)

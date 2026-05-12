@@ -102,7 +102,7 @@ combocurve.putDataComboCurveDaily(ccClient, copProductionData, operator="ConocoP
 combocurve.putDataComboCurveDaily(ccClient, spurProductionData, operator="Spur")
 combocurve.putDataComboCurveDaily(ccClient, ballardProductionData, operator="Ballard")
 combocurve.putDataComboCurveDaily(ccClient, krakenProductionData, operator="Kraken")
-combocurve.putDataComboCurveDaily(ccClient, eogProductionData, operator="EOG")
+combocurve.putDataComboCurveDaily(ccClient, eogProductionData, operator="EOG Resources")
 combocurve.putDataComboCurveMonthly(ccClient, monthlyPds)
 
 # Get Daily Productions from ComboCurve for Shalehaven

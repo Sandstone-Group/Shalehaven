@@ -284,6 +284,151 @@ def _geoDriverEstimateForTarget(df, driver, target_param, afe_lateral_length):
     }
 
 
+## Lateral-normalize peer monthly volumes to the AFE lateral so cross-peer aggregation is apples-to-apples
+def _normalizePeerMonthlyVolumes(monthly_df, peer_lateral_map, afe_lateral_length):
+    if monthly_df is None or monthly_df.empty or not afe_lateral_length:
+        return pd.DataFrame()
+    needed = {"API10", "MonthsOnProduction", "OilPerMonth", "GasPerMonth", "WaterPerMonth"}
+    if not needed.issubset(monthly_df.columns):
+        return pd.DataFrame()
+    df = monthly_df[list(needed)].copy()
+    df["API10"] = df["API10"].astype("string")
+    df["LL"] = df["API10"].map(peer_lateral_map)
+    df = df[df["LL"].notna() & (df["LL"] > 0)]
+    if df.empty:
+        return pd.DataFrame()
+    scaler = afe_lateral_length / df["LL"]
+    df["OilNorm"] = pd.to_numeric(df["OilPerMonth"], errors="coerce") * scaler
+    df["GasNorm"] = pd.to_numeric(df["GasPerMonth"], errors="coerce") * scaler
+    df["WaterNorm"] = pd.to_numeric(df["WaterPerMonth"], errors="coerce") * scaler
+    df["MonthsOnProduction"] = pd.to_numeric(df["MonthsOnProduction"], errors="coerce")
+    df = df[df["MonthsOnProduction"].notna() & (df["MonthsOnProduction"] >= 1)]
+    df["MonthsOnProduction"] = df["MonthsOnProduction"].astype(int)
+    return df[["API10", "MonthsOnProduction", "OilNorm", "GasNorm", "WaterNorm"]]
+
+
+## Aggregate per-peer normalized monthly volumes into P10/P50/P90 across peers at each month index
+## Months with fewer than `min_peers` reporting are dropped (matches geo-driver min-n=4 convention)
+def _aggregatePeerMonthlyPercentiles(normalized_df, min_peers=4):
+    if normalized_df is None or normalized_df.empty:
+        return None
+    rows = []
+    for month, g in normalized_df.groupby("MonthsOnProduction"):
+        n_oil = int(g["OilNorm"].notna().sum())
+        n_gas = int(g["GasNorm"].notna().sum())
+        n_water = int(g["WaterNorm"].notna().sum())
+        n_min = min(n_oil, n_gas, n_water)
+        if n_min < min_peers:
+            continue
+        rows.append({
+            "month": int(month),
+            "n": n_min,
+            "oil_p10": float(g["OilNorm"].quantile(0.10)),
+            "oil_p50": float(g["OilNorm"].quantile(0.50)),
+            "oil_p90": float(g["OilNorm"].quantile(0.90)),
+            "gas_p10": float(g["GasNorm"].quantile(0.10)),
+            "gas_p50": float(g["GasNorm"].quantile(0.50)),
+            "gas_p90": float(g["GasNorm"].quantile(0.90)),
+            "water_p10": float(g["WaterNorm"].quantile(0.10)),
+            "water_p50": float(g["WaterNorm"].quantile(0.50)),
+            "water_p90": float(g["WaterNorm"].quantile(0.90)),
+        })
+    if not rows:
+        return None
+    rows.sort(key=lambda r: r["month"])
+    out = {
+        "months": [r["month"] for r in rows],
+        "n": [r["n"] for r in rows],
+    }
+    for key in ("oil_p10", "oil_p50", "oil_p90",
+                "gas_p10", "gas_p50", "gas_p90",
+                "water_p10", "water_p50", "water_p90"):
+        out[key] = [r[key] for r in rows]
+    return out
+
+
+## R²-weighted geo-driver multiplier: weighted mean of (driver P50 EUR estimate / peer-median EUR at AFE lateral).
+## Quantifies how the AFE's rock properties push EUR vs. the peer-median baseline. Applied uniformly to all
+## phase/percentile curves so peer GOR/WOR ratios are preserved.
+def _computeGeoDriverMultiplier(drivers, df_subset, response_param, afe_lateral_length):
+    if not drivers or not afe_lateral_length:
+        return 1.0, None, 0.0
+    if response_param not in df_subset.columns or "LateralLength" not in df_subset.columns:
+        return 1.0, None, 0.0
+    response = pd.to_numeric(df_subset[response_param], errors="coerce")
+    lateral = pd.to_numeric(df_subset["LateralLength"], errors="coerce").replace(0, float("nan"))
+    per_ft = (response / lateral).dropna()
+    if per_ft.empty:
+        return 1.0, None, 0.0
+    baseline_per_ft = float(per_ft.median())
+    baseline_eur = baseline_per_ft * afe_lateral_length
+    if baseline_eur <= 0:
+        return 1.0, None, 0.0
+    weighted_sum = 0.0
+    weight_total = 0.0
+    for d in drivers:
+        est_p50 = d.get("est_p50")
+        r = d.get("r")
+        if est_p50 is None or r is None:
+            continue
+        r2 = float(r) * float(r)
+        weighted_sum += r2 * (float(est_p50) / baseline_eur)
+        weight_total += r2
+    if weight_total <= 0:
+        return 1.0, baseline_eur, 0.0
+    return weighted_sum / weight_total, baseline_eur, weight_total
+
+
+## Build P10/P50/P90 monthly oil/gas/water curves for one peer subset, scaled by R²-weighted geo-driver multiplier.
+## Returns None when monthly forecast data is missing, AFE lateral is unresolvable, or no peers in the subset have forecasts.
+def _buildMonthlyForecastBucket(df_subset, monthly_df, drivers, afeData):
+    if monthly_df is None or monthly_df.empty or df_subset is None or df_subset.empty:
+        return None
+    afe_lateral_length = _resolveAfeLateralLength(afeData)
+    if not afe_lateral_length:
+        return None
+    if "API10" not in df_subset.columns or "LateralLength" not in df_subset.columns:
+        return None
+    ll_map = (
+        df_subset.dropna(subset=["API10", "LateralLength"])
+        .assign(API10=lambda d: d["API10"].astype("string"))
+        .groupby("API10")["LateralLength"]
+        .mean()
+        .to_dict()
+    )
+    ll_map = {k: float(v) for k, v in ll_map.items() if v and float(v) > 0}
+    if not ll_map:
+        return None
+    peer_monthly = monthly_df[monthly_df["API10"].astype("string").isin(ll_map.keys())]
+    if peer_monthly.empty:
+        return None
+    normalized = _normalizePeerMonthlyVolumes(peer_monthly, ll_map, afe_lateral_length)
+    agg = _aggregatePeerMonthlyPercentiles(normalized)
+    if agg is None:
+        return None
+    response_param = _geoDriverProductionParam(afeData, df_subset)
+    multiplier, baseline_eur, _ = _computeGeoDriverMultiplier(
+        drivers, df_subset, response_param, afe_lateral_length
+    )
+    for key in ("oil_p10", "oil_p50", "oil_p90",
+                "gas_p10", "gas_p50", "gas_p90",
+                "water_p10", "water_p50", "water_p90"):
+        agg[key] = [v * multiplier for v in agg[key]]
+    summary = {}
+    for phase in ("oil", "gas", "water"):
+        for pct in ("p10", "p50", "p90"):
+            summary[f"{phase}_{pct}_cum"] = float(sum(agg[f"{phase}_{pct}"]))
+    agg["summary"] = summary
+    agg["multiplier"] = float(multiplier)
+    agg["baseline_eur"] = float(baseline_eur) if baseline_eur is not None else None
+    agg["response_param"] = response_param
+    agg["response_label"] = _subsurfaceParamLabel(response_param) if response_param else None
+    agg["afe_lateral_length"] = float(afe_lateral_length)
+    agg["peer_count"] = int(len(ll_map))
+    agg["peer_count_with_forecast"] = int(normalized["API10"].nunique())
+    return agg
+
+
 ## Parse township/range string like "18S", "T18S", "18 South", "T-18-S" into (number, direction)
 ## Returns (zero-padded 3-digit string, direction letter) or (None, None) on failure
 def _parse_tr(s, kind):
@@ -445,14 +590,15 @@ def authNovi():
 ## Search mode is stashed on the returned DataFrame's .attrs so plotSubsurfaceHeatMapsHTML
 ## can suffix the output filename and let radius/api-list runs coexist for the same DSU.
 ## token and scope are kept for backward compat with main_model.py but unused.
-def getWells(token, permitData, afeData, scope="us-horizontals"):
+def getWells(token, permitData, afeData, scope="us-horizontals", searchMode=None, apiList=None, radiusMiles=None):
 
-    # Mode prompt — default to radius for backward compat
-    print("\nOffset well search mode:")
-    print("  [R] Radius around AFE permits (formation + vintage filter)")
-    print("  [A] Paste specific API10 list (no formation/vintage filter)")
-    mode_input = input("Choose [R/A] (default R): ").strip().upper()
-    searchMode = "api_list" if mode_input == "A" else "radius"
+    # searchMode / apiList / radiusMiles can be passed in (collected upfront in main_model.py) or prompted here for backward compat.
+    if searchMode is None:
+        print("\nOffset well search mode:")
+        print("  [R] Radius around AFE permits (formation + vintage filter)")
+        print("  [A] Paste specific API10 list (no formation/vintage filter)")
+        mode_input = input("Choose [R/A] (default R): ").strip().upper()
+        searchMode = "api_list" if mode_input == "A" else "radius"
 
     # Load WellDetails from local bulk export (shared by both modes)
     paths = getNoviBulkPaths()
@@ -464,26 +610,29 @@ def getWells(token, permitData, afeData, scope="us-horizontals"):
     print(f"  Loaded {len(wells):,} total wells from bulk export")
 
     if searchMode == "api_list":
-        print("\nPaste API10 numbers (comma, space, or newline-separated). End with a blank line:")
-        lines = []
-        while True:
-            try:
-                line = input()
-            except EOFError:
-                break
-            if not line.strip():
-                break
-            lines.append(line)
-        raw = " ".join(lines)
-        # Split on whitespace/commas/semicolons; strip non-digits per token; truncate to API10.
-        # Accepts pasted API12/API14, dashed forms ("42-475-12345"), or bare API10.
-        tokens = [t for t in re.split(r"[,\s;]+", raw) if t.strip()]
-        api_list = []
-        for t in tokens:
-            digits = re.sub(r"\D", "", t)
-            if len(digits) >= 10:
-                api_list.append(digits[:10])
-        api_list_unique = sorted(set(api_list))
+        if apiList is None:
+            print("\nPaste API10 numbers (comma, space, or newline-separated). End with a blank line:")
+            lines = []
+            while True:
+                try:
+                    line = input()
+                except EOFError:
+                    break
+                if not line.strip():
+                    break
+                lines.append(line)
+            raw = " ".join(lines)
+            # Split on whitespace/commas/semicolons; strip non-digits per token; truncate to API10.
+            # Accepts pasted API12/API14, dashed forms ("42-475-12345"), or bare API10.
+            tokens = [t for t in re.split(r"[,\s;]+", raw) if t.strip()]
+            api_list = []
+            for t in tokens:
+                digits = re.sub(r"\D", "", t)
+                if len(digits) >= 10:
+                    api_list.append(digits[:10])
+            api_list_unique = sorted(set(api_list))
+        else:
+            api_list_unique = sorted(set(apiList))
         print(f"  Got {len(api_list_unique)} unique API10 values from input")
 
         filtered = wells[wells["API10"].isin(api_list_unique)].copy()
@@ -496,7 +645,7 @@ def getWells(token, permitData, afeData, scope="us-horizontals"):
     else:
         # Radius mode — bounding box around permit locations
         # 1 degree latitude ~ 69 miles, 1 degree longitude ~ 69 * cos(lat) miles
-        miles = float(input("Enter search radius in miles: ").strip())
+        miles = float(radiusMiles) if radiusMiles is not None else float(input("Enter search radius in miles: ").strip())
         lat_offset = miles / 69.0
         avg_lat = permitData["Latitude"].mean()
         lon_offset = miles / (69.0 * abs(math.cos(math.radians(avg_lat))))
@@ -1350,7 +1499,8 @@ def _fetchPlssLayers(lon_min, lat_min, lon_max, lat_max, outputDir=None):
 ## permit locations with labels (from getWellPermits). Open the file in any browser.
 ## Output: subsurface_heatmaps_{DSU Name}.html in the AFE Data/ folder.
 def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None, permitData=None,
-                                wellboreLocationsData=None, offsetData=None, labelNearestN=20, afeData=None):
+                                wellboreLocationsData=None, offsetData=None, labelNearestN=20, afeData=None,
+                                monthlyForecastData=None):
     from scipy.interpolate import griddata
     import numpy as np
     import json as _json
@@ -1793,6 +1943,26 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
     if non_empty_buckets:
         geo_driver_buckets = non_empty_buckets
 
+    # Monthly forecast buckets — peer-blended P10/P50/P90 oil/gas/water curves,
+    # lateral-normalized to AFE, then scaled by the R²-weighted geo-driver multiplier.
+    monthly_forecast_buckets = []
+    if monthlyForecastData is not None and not monthlyForecastData.empty:
+        monthly_df = monthlyForecastData.copy()
+        if "API10" in monthly_df.columns:
+            monthly_df["API10"] = monthly_df["API10"].astype("string")
+            for bucket in geo_driver_buckets:
+                fm = bucket.get("fm")
+                df_subset = df if fm is None else df[df["Formation"].astype(str).str.upper() == fm]
+                monthly_bucket = _buildMonthlyForecastBucket(
+                    df_subset, monthly_df, bucket.get("drivers") or [], afeData
+                )
+                if monthly_bucket:
+                    monthly_forecast_buckets.append({
+                        "label": bucket["label"],
+                        "fm": fm,
+                        "curves": monthly_bucket,
+                    })
+
     # Build well index table data
     well_index = numbered_wells
 
@@ -1857,6 +2027,7 @@ const AFE_PERMITS = {_json.dumps(afe_permits, separators=(',', ':'))};
 const AFE_WITH_LOC = {_json.dumps(afe_with_loc, separators=(',', ':'))};
 const AFE_SUBSURFACE_ESTIMATES = {_json.dumps(afe_subsurface_estimates, separators=(',', ':'))};
 const GEO_DRIVER_BUCKETS = {_json.dumps(geo_driver_buckets, separators=(',', ':'))};
+const MONTHLY_FORECAST_BUCKETS = {_json.dumps(monthly_forecast_buckets, separators=(',', ':'))};
 const FORMATIONS = {_json.dumps([f for f in formations if f is not None], separators=(',', ':'))};
 
 const tabsEl = document.getElementById('tabs');
@@ -2079,6 +2250,84 @@ function renderGeoDrivers(bucketIdx) {{
   }}
 }}
 
+function renderMonthlyForecast(bucketIdx) {{
+  const page = document.getElementById('page-mforecast');
+  if (!page) return;
+  const safeIdx = (bucketIdx >= 0 && bucketIdx < MONTHLY_FORECAST_BUCKETS.length) ? bucketIdx : 0;
+  const bucket = MONTHLY_FORECAST_BUCKETS[safeIdx];
+  if (!bucket || !bucket.curves) {{
+    page.innerHTML = '<div style="padding:14px;color:#666;">No monthly forecast data available.</div>';
+    return;
+  }}
+  const c = bucket.curves;
+  const fmtBig = v => Math.round(v).toLocaleString();
+
+  let fmBarHTML = '';
+  if (MONTHLY_FORECAST_BUCKETS.length > 1) {{
+    fmBarHTML = '<div class="fm-bar"><label>Formation:</label><select id="mforecast-fm-select">' +
+      MONTHLY_FORECAST_BUCKETS.map((b, i) =>
+        '<option value="' + i + '"' + (i === safeIdx ? ' selected' : '') + '>' + b.label + '</option>'
+      ).join('') +
+      '</select></div>';
+  }}
+
+  const noteHTML = '<div class="estimate-note">' +
+    'Peer monthly forecasts lateral-normalized to AFE lateral length (' +
+      Math.round(c.afe_lateral_length).toLocaleString() + ' ft, less 500 ft) and scaled by R²-weighted geo-driver multiplier (' +
+      c.multiplier.toFixed(3) + '×). ' +
+      c.peer_count_with_forecast + ' of ' + c.peer_count + ' peer wells in this slice had monthly forecasts.' +
+    '</div>';
+
+  const sum = c.summary;
+  const summaryHTML = '<table class="driver-rank">' +
+    '<tr><th>Phase</th><th>P10 Cum</th><th>P50 Cum</th><th>P90 Cum</th></tr>' +
+    '<tr><td>Oil (bbl)</td><td>' + fmtBig(sum.oil_p10_cum) + '</td><td>' + fmtBig(sum.oil_p50_cum) + '</td><td>' + fmtBig(sum.oil_p90_cum) + '</td></tr>' +
+    '<tr><td>Gas (Mcf)</td><td>' + fmtBig(sum.gas_p10_cum) + '</td><td>' + fmtBig(sum.gas_p50_cum) + '</td><td>' + fmtBig(sum.gas_p90_cum) + '</td></tr>' +
+    '<tr><td>Water (bbl)</td><td>' + fmtBig(sum.water_p10_cum) + '</td><td>' + fmtBig(sum.water_p50_cum) + '</td><td>' + fmtBig(sum.water_p90_cum) + '</td></tr>' +
+    '</table>';
+
+  page.innerHTML = fmBarHTML + noteHTML + summaryHTML +
+    '<div class="driver-grid" style="grid-template-columns:1fr;">' +
+      '<div class="driver-plot" id="mf-plot-oil" style="height:360px;"></div>' +
+      '<div class="driver-plot" id="mf-plot-gas" style="height:360px;"></div>' +
+      '<div class="driver-plot" id="mf-plot-water" style="height:360px;"></div>' +
+    '</div>';
+
+  const phases = [
+    {{id: 'mf-plot-oil',   label: 'Oil',   unit: 'bbl/month', color: '#1f7a1f', keys: ['oil_p10','oil_p50','oil_p90']}},
+    {{id: 'mf-plot-gas',   label: 'Gas',   unit: 'Mcf/month', color: '#d62728', keys: ['gas_p10','gas_p50','gas_p90']}},
+    {{id: 'mf-plot-water', label: 'Water', unit: 'bbl/month', color: '#1f77b4', keys: ['water_p10','water_p50','water_p90']}},
+  ];
+
+  phases.forEach(p => {{
+    const traces = [
+      {{type: 'scatter', mode: 'lines', name: 'P90', x: c.months, y: c[p.keys[2]],
+        line: {{color: p.color, width: 1, dash: 'dot'}}, hovertemplate: 'Mo %{{x}}: %{{y:,.0f}}<extra>P90</extra>'}},
+      {{type: 'scatter', mode: 'lines', name: 'P50', x: c.months, y: c[p.keys[1]],
+        line: {{color: p.color, width: 2.5}}, hovertemplate: 'Mo %{{x}}: %{{y:,.0f}}<extra>P50</extra>'}},
+      {{type: 'scatter', mode: 'lines', name: 'P10', x: c.months, y: c[p.keys[0]],
+        line: {{color: p.color, width: 1, dash: 'dot'}}, hovertemplate: 'Mo %{{x}}: %{{y:,.0f}}<extra>P10</extra>'}},
+    ];
+    Plotly.newPlot(p.id, traces, {{
+      title: {{text: p.label + ' — P10/P50/P90 (' + p.unit + ')', font: {{size: 13}}}},
+      xaxis: {{title: 'Months on Production'}},
+      yaxis: {{title: p.unit, rangemode: 'tozero'}},
+      margin: {{l: 70, r: 16, t: 42, b: 52}},
+      hovermode: 'x unified',
+      legend: {{orientation: 'h', y: -0.18}},
+    }}, {{responsive: true}});
+  }});
+
+  if (MONTHLY_FORECAST_BUCKETS.length > 1) {{
+    const sel = document.getElementById('mforecast-fm-select');
+    if (sel) {{
+      sel.addEventListener('change', e => {{
+        renderMonthlyForecast(parseInt(e.target.value));
+      }});
+    }}
+  }}
+}}
+
 // Group figures by parameter so each parameter is one tab with a Formation dropdown.
 const FIGURES_BY_PARAM = {{}};
 const PARAM_ORDER = [];
@@ -2190,6 +2439,20 @@ if (hasAnyDrivers || AFE_SUBSURFACE_ESTIMATES.length > 0) {{
   pagesEl.appendChild(geoPage);
 }}
 
+// Monthly Forecast tab — peer-blended P10/P50/P90 oil/gas/water, scaled by geo drivers.
+const hasMonthlyForecast = MONTHLY_FORECAST_BUCKETS.length > 0;
+if (hasMonthlyForecast) {{
+  const mfBtn = document.createElement('button');
+  mfBtn.textContent = 'Monthly Forecast';
+  mfBtn.dataset.idx = 'mforecast';
+  tabsEl.appendChild(mfBtn);
+
+  const mfPage = document.createElement('div');
+  mfPage.className = 'table-page';
+  mfPage.id = 'page-mforecast';
+  pagesEl.appendChild(mfPage);
+}}
+
 // Well index tab
 const idxBtn = document.createElement('button');
 idxBtn.textContent = 'Well Index';
@@ -2221,7 +2484,10 @@ tabsEl.addEventListener('click', e => {{
   if (idx === 'geo' && !plotted.has(idx)) {{
     renderGeoDrivers(0);
     plotted.add(idx);
-  }} else if (idx !== 'idx' && idx !== 'geo' && !plotted.has(idx)) {{
+  }} else if (idx === 'mforecast' && !plotted.has(idx)) {{
+    renderMonthlyForecast(0);
+    plotted.add(idx);
+  }} else if (idx !== 'idx' && idx !== 'geo' && idx !== 'mforecast' && !plotted.has(idx)) {{
     const figs = FIGURES_BY_PARAM[idx] || [];
     const initialFm = figs.length > 0 ? figs[0].fm_label : null;
     renderHeatmapPage(idx, initialFm);
@@ -2246,6 +2512,7 @@ if (PARAM_ORDER.length > 0) {{
 
     print(f"Done. Saved interactive heat maps to {htmlPath}")
     webbrowser.open(htmlPath)
+    return monthly_forecast_buckets
 
 
 ## Export header data, monthly forecast data, and monthly production to Excel files
