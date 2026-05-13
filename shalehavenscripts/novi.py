@@ -46,6 +46,8 @@ def _normalizeCounty(county):
 # Alias -> canonical so downstream fetch + plot treat geologically-equivalent zones as one.
 FORMATION_ALIASES = {
     "JO MILL": "LOWER SPRABERRY SAND",
+    "CODELL SANDSTONE": "CODELL",
+    "CODELL SAND": "CODELL",
 }
 _FORMATION_GROUPS = {}
 for _alias, _canon in FORMATION_ALIASES.items():
@@ -307,6 +309,37 @@ def _normalizePeerMonthlyVolumes(monthly_df, peer_lateral_map, afe_lateral_lengt
     return df[["API10", "MonthsOnProduction", "OilNorm", "GasNorm", "WaterNorm"]]
 
 
+## Outlier-only despike for percentile curves.
+## Removes single-month V-blips (e.g. month 4 = 12K when month 3 = 21K and month 5 = 17K) caused
+## by peer-cohort rotation, WITHOUT smoothing the genuine decline shape. For each interior month
+## we compare the value to the centered-3 median; if it deviates by more than thresholdPct it's
+## replaced with the linear interpolation of its two neighbors. Non-outliers are left untouched,
+## so the steep flush-production peak in early months is preserved.
+def _despikePercentileCurves(agg, thresholdPct=0.20):
+    if agg is None:
+        return agg
+    keys = ("oil_p10", "oil_p50", "oil_p90",
+            "gas_p10", "gas_p50", "gas_p90",
+            "water_p10", "water_p50", "water_p90")
+    for k in keys:
+        if k not in agg:
+            continue
+        vals = list(agg[k])
+        n = len(vals)
+        if n < 3:
+            continue
+        out = list(vals)
+        for i in range(1, n - 1):
+            prev_v, this_v, next_v = vals[i - 1], vals[i], vals[i + 1]
+            local_median = sorted((prev_v, this_v, next_v))[1]
+            if local_median <= 0:
+                continue
+            if abs(this_v - local_median) / local_median > thresholdPct:
+                out[i] = (prev_v + next_v) / 2.0
+        agg[k] = out
+    return agg
+
+
 ## Aggregate per-peer normalized monthly volumes into P10/P50/P90 across peers at each month index
 ## Months with fewer than `min_peers` reporting are dropped (matches geo-driver min-n=4 convention)
 def _aggregatePeerMonthlyPercentiles(normalized_df, min_peers=4):
@@ -406,6 +439,7 @@ def _buildMonthlyForecastBucket(df_subset, monthly_df, drivers, afeData):
     agg = _aggregatePeerMonthlyPercentiles(normalized)
     if agg is None:
         return None
+    agg = _despikePercentileCurves(agg, thresholdPct=0.20)
     response_param = _geoDriverProductionParam(afeData, df_subset)
     multiplier, baseline_eur, _ = _computeGeoDriverMultiplier(
         drivers, df_subset, response_param, afe_lateral_length
@@ -585,12 +619,14 @@ def authNovi():
 
 ## Retrieve offset wells from local Novi bulk export (D:\novi) — no API call.
 ## Two modes:
-##   [R] Radius — bounding box around AFE permits, filtered by Landing Zone formation + FirstProductionYear >= 2018
+##   [R] Radius — bounding box around AFE permits, filtered by Landing Zone formation + FirstProductionYear >= vintageCutoff
 ##   [A] API10 list — user pastes specific API10 numbers; no formation/vintage filter
-## Search mode is stashed on the returned DataFrame's .attrs so plotSubsurfaceHeatMapsHTML
-## can suffix the output filename and let radius/api-list runs coexist for the same DSU.
+## Search mode + vintage cutoff are stashed on the returned DataFrame's .attrs so downstream
+## HTML renderers can surface them (subsurface heat map, economics) and so radius/api-list runs
+## can coexist for the same DSU.
 ## token and scope are kept for backward compat with main_model.py but unused.
-def getWells(token, permitData, afeData, scope="us-horizontals", searchMode=None, apiList=None, radiusMiles=None):
+def getWells(token, permitData, afeData, scope="us-horizontals", searchMode=None, apiList=None,
+             radiusMiles=None, vintageCutoff=2018):
 
     # searchMode / apiList / radiusMiles can be passed in (collected upfront in main_model.py) or prompted here for backward compat.
     if searchMode is None:
@@ -663,21 +699,24 @@ def getWells(token, permitData, afeData, scope="us-horizontals", searchMode=None
         print(f"Searching for wells within {miles} miles of permit locations, Formations: {formations}")
         print(f"Bounding box: Lat [{min_lat:.4f}, {max_lat:.4f}], Lon [{min_lon:.4f}, {max_lon:.4f}]")
 
-        # FirstProductionYear >= 2018 keeps modern completions; null years (never produced) are
-        # excluded automatically since NaN >= 2018 evaluates to False
+        # FirstProductionYear >= vintageCutoff keeps modern completions; null years (never produced)
+        # are excluded automatically since NaN >= N evaluates to False.
+        print(f"Vintage cutoff: FirstProductionYear >= {vintageCutoff}")
         mask = (
             (wells["MPLatitude"] >= min_lat)
             & (wells["MPLatitude"] <= max_lat)
             & (wells["MPLongitude"] >= min_lon)
             & (wells["MPLongitude"] <= max_lon)
             & (wells["Formation"].isin(formations))
-            & (wells["FirstProductionYear"] >= 2018)
+            & (wells["FirstProductionYear"] >= vintageCutoff)
         )
         filtered = wells[mask].copy()
         print(f"Done. Retrieved {len(filtered):,} wells matching criteria.")
 
-    # Tag mode so plotSubsurfaceHeatMapsHTML can pick a non-conflicting filename
+    # Tag mode + filter context so downstream HTML renderers can surface them.
+    # vintageCutoff is meaningful only for radius mode; api_list mode stashes None.
     filtered.attrs["searchMode"] = searchMode
+    filtered.attrs["vintageCutoff"] = vintageCutoff if searchMode == "radius" else None
     return filtered
 
 
@@ -1519,8 +1558,21 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
     os.makedirs(outputDir, exist_ok=True)
     # Suffix when getWells ran in api_list mode so radius and api-list runs coexist
     searchMode = offsetData.attrs.get("searchMode") if offsetData is not None and hasattr(offsetData, "attrs") else None
+    vintageCutoff = offsetData.attrs.get("vintageCutoff") if offsetData is not None and hasattr(offsetData, "attrs") else None
     suffix = "_apilist" if searchMode == "api_list" else ""
     htmlPath = os.path.join(outputDir, f"subsurface_heatmaps_{dsuName}{suffix}.html")
+
+    # Formation + vintage cutoff for the header banner so the analyst knows what filter built the cohort.
+    afe_formations_for_header = []
+    if afeData is not None and "Landing Zone" in afeData.columns:
+        afe_formations_for_header = sorted(afeData["Landing Zone"].dropna().astype(str).str.strip().str.upper().unique().tolist())
+    formation_label = ", ".join(afe_formations_for_header) if afe_formations_for_header else "—"
+    if searchMode == "api_list":
+        vintage_label = "API10 list (no vintage filter)"
+    elif vintageCutoff is not None:
+        vintage_label = f"FirstProductionYear ≥ {int(vintageCutoff)}"
+    else:
+        vintage_label = "—"
 
     if subsurfaceData is None or subsurfaceData.empty:
         print("No subsurface data — skipping HTML heat map export.")
@@ -2016,7 +2068,7 @@ def plotSubsurfaceHeatMapsHTML(subsurfaceData, pathToAfeSummary, parameters=None
 <body>
 <div class="header">
   <h1>Subsurface Heat Maps — {dsuName}</h1>
-  <div class="sub">Interactive viewer &middot; Generated by Shalehaven</div>
+  <div class="sub">Formation: {formation_label} &middot; Vintage: {vintage_label} &middot; Interactive viewer &middot; Generated by Shalehaven</div>
 </div>
 <div class="tabs" id="tabs"></div>
 <div id="pages"></div>

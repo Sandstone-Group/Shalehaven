@@ -304,6 +304,51 @@ def resolveAfeEconModels(afeData, basinCode, companyModels):
     return resolved
 
 
+## Fetch a single type curve by its ComboCurve ID (project-scoped).
+## https://docs.api.combocurve.com/api/get-type-curve-by-id
+def getTypeCurveById(client, projectId, typeCurveId):
+    print(f"Getting Type Curve {typeCurveId} from ComboCurve")
+    record = client.get(f"/v1/projects/{projectId}/type-curves/{typeCurveId}").json()
+    print(f"Successfully fetched Type Curve '{record.get('name', typeCurveId)}'")
+    return record
+
+
+## Fetch the representative wells for a type curve.
+## https://docs.api.combocurve.com/api/get-type-curve-representative-wells
+def getTypeCurveRepresentativeWells(client, projectId, typeCurveId):
+    print(f"Getting Representative Wells for Type Curve {typeCurveId}")
+    reps = list(client.paginate(
+        f"/v1/projects/{projectId}/type-curves/{typeCurveId}/representative-wells",
+        take=200,
+    ))
+    print(f"  Type Curve has {len(reps)} representative well(s)")
+    return reps
+
+
+## Resolve a type curve to a DataFrame of wells with their chosenIDs.
+## Walks /v1/wells/{id} for each rep well to surface chosenID/wellName.
+def getTypeCurveWellChosenIds(client, projectId, typeCurveId):
+    reps = getTypeCurveRepresentativeWells(client, projectId, typeCurveId)
+
+    # rep-well payload may carry the well id directly, or nest it under "well"
+    wellIds = []
+    for r in reps:
+        wid = r.get("well") or r.get("wellId") or r.get("id")
+        if wid:
+            wellIds.append(wid)
+    wellIds = list(dict.fromkeys(wellIds))  # dedupe, preserve order
+
+    rows = []
+    for wid in wellIds:
+        rec = client.get(f"/v1/projects/{projectId}/wells/{wid}").json()
+        rows.append({
+            "well":     wid,
+            "wellName": rec.get("wellName"),
+            "chosenID": rec.get("chosenID"),
+        })
+    return pd.DataFrame(rows, columns=["well", "wellName", "chosenID"])
+
+
 def getDailyForecastFromComboCurve(client, projectId, forecastId, wellList):
 
     print("Getting Daily Forecast from ComboCurve")
