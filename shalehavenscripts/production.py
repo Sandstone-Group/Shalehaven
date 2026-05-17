@@ -405,8 +405,538 @@ def cumulativeProduction(data, pathToDatabase):
 
 
 """
-Convert Monthly PDS to ComboCurve Monthly Format    
-    
+
+    7-day net production PDF.
+    Top-level sections by fund (2024 LP, 2025 LP); each fund pulls wells whose
+    fund-specific WI column is > 0 (so a 2024/2025 LP well shows up in BOTH).
+    Within a fund: operator-level summary table + per-operator daily breakdown.
+
+    fundWells column mapping (customString1 is just a label — fund membership is
+    actually carried by these numeric columns):
+        2024 LP: WI = customNumber0, NRI = customNumber1
+        2025 LP: WI = customNumber2, NRI = customNumber3
+
+"""
+
+FUND_COLUMN_MAP = {
+    "2024 LP": {"wi": "customNumber0", "nri": "customNumber1"},
+    "2025 LP": {"wi": "customNumber2", "nri": "customNumber3"},
+}
+
+
+ADMIRAL_OPERATOR_NAME = "ADMIRAL PERMIAN OPERATING LLC"
+
+
+def buildSevenDayNetProductionPdf(dailyProductions, fundWells, outputDir,
+                                  originalTypeCurves=None, updatedTypeCurves=None,
+                                  outputName=None):
+    from io import BytesIO
+    from pathlib import Path
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import LETTER, landscape
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.lib.utils import ImageReader
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak,
+        KeepTogether, Image,
+    )
+
+    logoPath = Path(__file__).resolve().parent.parent / "logos" / "shp.png"
+    pageW, pageH = landscape(LETTER)
+    logoH = 0.7 * inch
+    logoW = logoH * (1600 / 1200)  # preserve 4:3 aspect
+
+    def _drawLogo(canvas, doc):
+        if logoPath.is_file():
+            canvas.drawImage(
+                ImageReader(str(logoPath)),
+                pageW - 0.4*inch - logoW,
+                pageH - 0.3*inch - logoH,
+                width=logoW, height=logoH,
+                mask='auto',
+            )
+
+    print("Building 7-Day Net Production PDF")
+
+    df = dailyProductions.copy()
+    df['date'] = pd.to_datetime(df['date'], utc=True, errors='coerce').dt.tz_localize(None).dt.normalize()
+    df = df.dropna(subset=['date'])
+
+    asOf = df['date'].max()
+    if pd.isna(asOf):
+        raise ValueError("dailyProductions has no parseable dates")
+
+    # Merge in type-curve forecast (oil + gas) on (well, date).
+    # Default source = originalTypeCurves; Admiral Permian wells fall back to
+    # updatedTypeCurves because they don't have an original-TC forecast keyed.
+    admiralWellIds = set(
+        fundWells.loc[fundWells['currentOperator'] == ADMIRAL_OPERATOR_NAME, 'id']
+                 .dropna().tolist()
+    )
+
+    def _normalizeForecast(fc):
+        if fc is None or len(fc) == 0:
+            return None
+        out = fc[['date', 'well', 'oil', 'gas']].copy()
+        out['date'] = pd.to_datetime(out['date'], utc=True, errors='coerce').dt.tz_localize(None).dt.normalize()
+        return out
+
+    origFc = _normalizeForecast(originalTypeCurves)
+    updFc = _normalizeForecast(updatedTypeCurves)
+    parts = []
+    if origFc is not None:
+        # exclude Admiral wells from original; we'll replace with updated below
+        parts.append(origFc[~origFc['well'].isin(admiralWellIds)])
+    if updFc is not None and admiralWellIds:
+        parts.append(updFc[updFc['well'].isin(admiralWellIds)])
+
+    if parts:
+        fc = pd.concat(parts, ignore_index=True)
+        fc = fc.rename(columns={'oil': 'forecast_oil', 'gas': 'forecast_gas'})
+        df = df.merge(fc, on=['date', 'well'], how='left')
+    else:
+        df['forecast_oil'] = float('nan')
+        df['forecast_gas'] = float('nan')
+
+    # Per-well last N days of non-zero production. Operators report on different
+    # cadences (some daily, some lagged), so a calendar-window filter would show
+    # zeros for wells that simply hadn't reported yet. Drop fully-zero days first
+    # (oil+gas+water == 0 ≈ reporting gap), then rank each well's days by recency.
+    # ranks 1–7 = current 7d window (tables/widgets); 8–14 = prior 7d (WoW variance);
+    # 1–30 = chart window.
+    for stream in ('oil', 'gas', 'water'):
+        df[stream] = pd.to_numeric(df[stream], errors='coerce').fillna(0)
+    df = df[(df['oil'] + df['gas'] + df['water']) > 0]
+    dfRanked = df.sort_values('date').copy()
+    dfRanked['rank'] = dfRanked.groupby('well')['date'].rank(method='first', ascending=False)
+
+    wellMeta = fundWells.set_index("id")[
+        ["wellName", "currentOperator",
+         "customNumber0", "customNumber1", "customNumber2", "customNumber3"]
+    ]
+    for col in ["customNumber0", "customNumber1", "customNumber2", "customNumber3"]:
+        dfRanked[col] = dfRanked['well'].map(wellMeta[col]).fillna(0)
+    dfRanked['operator'] = dfRanked['well'].map(wellMeta['currentOperator'])
+    mappedNames = dfRanked['well'].map(wellMeta['wellName'])
+    dfRanked['wellName'] = (
+        mappedNames.fillna(dfRanked['wellName']) if 'wellName' in dfRanked.columns else mappedNames
+    )
+
+    df14 = dfRanked[dfRanked['rank'] <= 14].copy()
+    df14['window'] = df14['rank'].le(7).map({True: 'current', False: 'prior'})
+    df7 = df14[df14['window'] == 'current'].copy()
+    df30 = dfRanked[dfRanked['rank'] <= 30].copy()
+
+    runDate = pd.Timestamp.now().normalize()
+    pdfName = outputName or f"shalehaven_production_{runDate:%Y-%m-%d}.pdf"
+    os.makedirs(outputDir, exist_ok=True)
+    pdfPath = os.path.join(outputDir, pdfName)
+
+    doc = SimpleDocTemplate(
+        pdfPath, pagesize=landscape(LETTER),
+        leftMargin=0.4*inch, rightMargin=0.4*inch,
+        topMargin=1.1*inch, bottomMargin=0.5*inch,
+        title="Shalehaven 7-Day Production Overview",
+    )
+    styles = getSampleStyleSheet()
+    h1, h2, h3, body = styles['Heading1'], styles['Heading2'], styles['Heading3'], styles['BodyText']
+
+    story = [
+        Paragraph("Shalehaven 7-Day Production Overview", h1),
+        Paragraph(
+            f"Report run {asOf:%Y-%m-%d} &nbsp;|&nbsp; per-well: last 7 days of "
+            f"<b>reported</b> production "
+            f"&nbsp;|&nbsp; net = gross &times; NRI",
+            body,
+        ),
+        Spacer(1, 0.2*inch),
+    ]
+
+    headerStyle = TableStyle([
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
+        ('GRID', (0, 0), (-1, -1), 0.25, colors.grey),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+    ])
+
+    detailStyle = TableStyle([
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#2E75B6")),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('ALIGN', (3, 1), (-1, -1), 'RIGHT'),
+        ('GRID', (0, 0), (-1, -1), 0.25, colors.grey),
+        ('FONTSIZE', (0, 0), (-1, -1), 7.5),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+    ])
+
+    def _fmt(x, digits=1):
+        return f"{x:,.{digits}f}"
+
+    def _pct(x):
+        return f"{x:.4%}" if pd.notna(x) and x else "—"
+
+    def _variance(current, prior):
+        if prior is None or pd.isna(prior) or prior == 0:
+            return None
+        return (current - prior) / prior
+
+    def _varStr(v):
+        if v is None or pd.isna(v):
+            return "—"
+        return f"{v:+.1%}"
+
+    def _varColor(v):
+        if v is None or pd.isna(v):
+            return colors.HexColor("#7F7F7F")
+        return colors.HexColor("#2E7D32") if v >= 0 else colors.HexColor("#C62828")
+
+    hdrStyle = ParagraphStyle(
+        'sumHdr', parent=body, fontName='Helvetica-Bold',
+        textColor=colors.white, fontSize=8, leading=10, alignment=1,
+    )
+    wTitleStyle = ParagraphStyle(
+        'wTitle', parent=body, fontName='Helvetica-Bold', fontSize=9,
+        textColor=colors.HexColor('#1F4E79'), alignment=1, leading=11,
+    )
+    wMetricStyle = ParagraphStyle(
+        'wMetric', parent=body, fontName='Helvetica', fontSize=8,
+        textColor=colors.HexColor('#595959'), alignment=1, leading=10,
+    )
+    wValueStyle = ParagraphStyle(
+        'wValue', parent=body, fontName='Helvetica-Bold', fontSize=18,
+        textColor=colors.HexColor('#1F4E79'), alignment=1, leading=22,
+    )
+    wUnitStyle = ParagraphStyle(
+        'wUnit', parent=body, fontName='Helvetica', fontSize=8,
+        textColor=colors.HexColor('#7F7F7F'), alignment=1, leading=10,
+    )
+
+    # ─── Top-of-page KPI widgets: 7d Net Oil/Gas Avg per fund (net = gross × NRI) ───
+    fundTotals = {}
+    for fundLabel, cols in FUND_COLUMN_MAP.items():
+        wiCol, nriCol = cols['wi'], cols['nri']
+        cur = df14[(df14[wiCol] > 0) & (df14['window'] == 'current')]
+        if cur.empty:
+            fundTotals[fundLabel] = {'oil': 0.0, 'gas': 0.0}
+            continue
+        fundTotals[fundLabel] = {
+            'oil': float((cur['oil'] * cur[nriCol]).sum()),
+            'gas': float((cur['gas'] * cur[nriCol]).sum()),
+        }
+
+    def _widgetCell(fundLabel, metric, value, unit):
+        return [
+            Paragraph(fundLabel, wTitleStyle),
+            Paragraph(metric, wMetricStyle),
+            Spacer(1, 4),
+            Paragraph(f"{value/7:,.1f}", wValueStyle),
+            Paragraph(unit, wUnitStyle),
+        ]
+
+    widgetRow = []
+    for fundLabel in FUND_COLUMN_MAP.keys():
+        t = fundTotals.get(fundLabel, {'oil': 0.0, 'gas': 0.0})
+        widgetRow.append(_widgetCell(fundLabel, "7d Net Oil Avg", t['oil'], "bbl/d"))
+        widgetRow.append(_widgetCell(fundLabel, "7d Net Gas Avg", t['gas'], "Mcf/d"))
+
+    widgetTbl = Table([widgetRow], colWidths=[2.4*inch]*4)
+    widgetTbl.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#F8FAFC')),
+        ('BOX', (0, 0), (-1, -1), 0.75, colors.HexColor('#1F4E79')),
+        ('LINEAFTER', (0, 0), (-2, -1), 0.5, colors.HexColor('#BDBDBD')),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 10),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 10),
+        ('TOPPADDING', (0, 0), (-1, -1), 10),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+    ]))
+    story.append(widgetTbl)
+    story.append(Spacer(1, 0.2*inch))
+
+    def _opAgg(d):
+        return d.groupby('operator').agg(
+            wells=('well', 'nunique'),
+            gross_oil=('oil', 'sum'), net_oil=('net_oil', 'sum'),
+            gross_gas=('gas', 'sum'), net_gas=('net_gas', 'sum'),
+        )
+
+    # ─── Pass 1: page-1 fund summary tables (7d totals + daily avg) ───
+    fundContexts = {}  # fundLabel -> dict(fundDf, opSummary, wiCol, nriCol)
+    for fundLabel, cols in FUND_COLUMN_MAP.items():
+        wiCol, nriCol = cols['wi'], cols['nri']
+        fundDf = df14[df14[wiCol] > 0].copy()
+        if fundDf.empty:
+            continue
+        fundDf['net_oil'] = fundDf['oil'] * fundDf[nriCol]
+        fundDf['net_gas'] = fundDf['gas'] * fundDf[nriCol]
+        fundDf['net_water'] = fundDf['water'] * fundDf[nriCol]
+
+        fundBlock = [Paragraph(f"Fund: {fundLabel}", h3)]
+
+        curDf = fundDf[fundDf['window'] == 'current']
+        priorDf = fundDf[fundDf['window'] == 'prior']
+        curAgg = _opAgg(curDf)
+        priorAgg = _opAgg(priorDf).add_suffix('_prior')
+        opSummary = (
+            curAgg.join(priorAgg, how='left')
+                  .fillna({c: 0 for c in priorAgg.columns})
+                  .reset_index()
+                  .sort_values('net_oil', ascending=False)
+        )
+        fundContexts[fundLabel] = {
+            'fundDf': fundDf, 'opSummary': opSummary,
+            'wiCol': wiCol, 'nriCol': nriCol,
+        }
+        summaryHeader = [
+            Paragraph("Operator", hdrStyle),
+            Paragraph("Wells", hdrStyle),
+            Paragraph("Gross Oil<br/>7d (bbl)", hdrStyle),
+            Paragraph("Net Oil<br/>7d (bbl)", hdrStyle),
+            Paragraph("Oil Δ<br/>vs prior 7d", hdrStyle),
+            Paragraph("Gross Gas<br/>7d (Mcf)", hdrStyle),
+            Paragraph("Net Gas<br/>7d (Mcf)", hdrStyle),
+            Paragraph("Gas Δ<br/>vs prior 7d", hdrStyle),
+        ]
+        summaryRows = [summaryHeader]
+        varCellColors = []  # (row, col, color) for per-cell text color on Δ columns
+        for i, (_, r) in enumerate(opSummary.iterrows(), start=1):
+            oilVar = _variance(r['net_oil'], r['net_oil_prior'])
+            gasVar = _variance(r['net_gas'], r['net_gas_prior'])
+            summaryRows.append([
+                r['operator'], f"{int(r['wells']):,}",
+                _fmt(r['gross_oil']), _fmt(r['net_oil']), _varStr(oilVar),
+                _fmt(r['gross_gas']), _fmt(r['net_gas']), _varStr(gasVar),
+            ])
+            varCellColors.append((i, 4, _varColor(oilVar)))
+            varCellColors.append((i, 7, _varColor(gasVar)))
+
+        totalOilCur = opSummary['net_oil'].sum()
+        totalOilPrior = opSummary['net_oil_prior'].sum()
+        totalGasCur = opSummary['net_gas'].sum()
+        totalGasPrior = opSummary['net_gas_prior'].sum()
+        totalOilVar = _variance(totalOilCur, totalOilPrior)
+        totalGasVar = _variance(totalGasCur, totalGasPrior)
+        summaryRows.append([
+            "TOTAL", f"{int(opSummary['wells'].sum()):,}",
+            _fmt(opSummary['gross_oil'].sum()), _fmt(totalOilCur), _varStr(totalOilVar),
+            _fmt(opSummary['gross_gas'].sum()), _fmt(totalGasCur), _varStr(totalGasVar),
+        ])
+        totalRowIdx = len(summaryRows) - 1
+        varCellColors.append((totalRowIdx, 4, _varColor(totalOilVar)))
+        varCellColors.append((totalRowIdx, 7, _varColor(totalGasVar)))
+
+        summaryColWidths = [
+            2.6*inch,  # Operator
+            0.55*inch, # Wells
+            1.05*inch, # 7d Gross Oil
+            1.05*inch, # 7d Net Oil
+            0.95*inch, # Oil Δ
+            1.05*inch, # 7d Gross Gas
+            1.05*inch, # 7d Net Gas
+            0.95*inch, # Gas Δ
+        ]
+        sumTbl = Table(summaryRows, hAlign='LEFT', repeatRows=1, colWidths=summaryColWidths)
+        sumCommands = headerStyle.getCommands() + [
+            ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor("#D9E1F2")),
+            ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 8.5),
+        ]
+        for row, col, color in varCellColors:
+            sumCommands.append(('TEXTCOLOR', (col, row), (col, row), color))
+        sumTbl.setStyle(TableStyle(sumCommands))
+        fundBlock.append(sumTbl)
+        fundBlock.append(Spacer(1, 0.1*inch))
+
+        # Daily average table (7d totals / 7) — same operator order as summary
+        avgHeader = [
+            Paragraph("Operator", hdrStyle),
+            Paragraph("Wells", hdrStyle),
+            Paragraph("Avg Daily<br/>Gross Oil (bbl/d)", hdrStyle),
+            Paragraph("Avg Daily<br/>Net Oil (bbl/d)", hdrStyle),
+            Paragraph("Avg Daily<br/>Gross Gas (Mcf/d)", hdrStyle),
+            Paragraph("Avg Daily<br/>Net Gas (Mcf/d)", hdrStyle),
+        ]
+        avgRows = [avgHeader]
+        for _, r in opSummary.iterrows():
+            avgRows.append([
+                r['operator'], f"{int(r['wells']):,}",
+                _fmt(r['gross_oil']/7), _fmt(r['net_oil']/7),
+                _fmt(r['gross_gas']/7), _fmt(r['net_gas']/7),
+            ])
+        avgRows.append([
+            "TOTAL", f"{int(opSummary['wells'].sum()):,}",
+            _fmt(opSummary['gross_oil'].sum()/7), _fmt(opSummary['net_oil'].sum()/7),
+            _fmt(opSummary['gross_gas'].sum()/7), _fmt(opSummary['net_gas'].sum()/7),
+        ])
+
+        avgColWidths = [2.6*inch, 0.55*inch, 1.5*inch, 1.5*inch, 1.5*inch, 1.5*inch]
+        avgTbl = Table(avgRows, hAlign='LEFT', repeatRows=1, colWidths=avgColWidths)
+        avgTbl.setStyle(TableStyle(headerStyle.getCommands() + [
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#3B6E9C")),
+            ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor("#D9E1F2")),
+            ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 8.5),
+        ]))
+        fundBlock.append(avgTbl)
+        story.append(KeepTogether(fundBlock))
+        story.append(Spacer(1, 0.15*inch))
+
+    if fundContexts:
+        story.append(PageBreak())
+
+    def _lineChartPng(daily, stream, unit, title, figW=4.4, figH=1.85):
+        """Render actual-vs-forecast line chart from a frame with 'date', stream, forecast_{stream}."""
+        fig, ax = plt.subplots(figsize=(figW, figH), dpi=130)
+        dates_ = daily['date'].tolist()
+        ax.plot(dates_, daily[stream], marker='o', linewidth=1.6,
+                color='#1F4E79', label='Actual')
+        fcCol = f'forecast_{stream}'
+        if fcCol in daily.columns and daily[fcCol].notna().any():
+            ax.plot(dates_, daily[fcCol], marker='s', linewidth=1.4,
+                    linestyle='--', color='#C62828', label='Forecast')
+        ax.set_title(f"{title} ({unit})", fontsize=9, loc='left')
+        ax.tick_params(labelsize=7)
+        ax.legend(fontsize=7, loc='best', frameon=False)
+        ax.grid(True, axis='y', alpha=0.3)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
+        ax.set_ylim(bottom=0)
+        fig.autofmt_xdate(rotation=30, ha='right')
+        fig.tight_layout()
+        buf = BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight', dpi=130)
+        plt.close(fig)
+        buf.seek(0)
+        return buf
+
+    def _fundDailyNet(fundDf30, nriCol):
+        """Aggregate fund-scoped df30 into per-date NET actual + forecast (NRI-weighted)."""
+        d = fundDf30.copy()
+        d['net_oil'] = d['oil'] * d[nriCol]
+        d['net_gas'] = d['gas'] * d[nriCol]
+        has_oil_fc = 'forecast_oil' in d.columns
+        has_gas_fc = 'forecast_gas' in d.columns
+        if has_oil_fc:
+            d['net_forecast_oil'] = d['forecast_oil'] * d[nriCol]
+        if has_gas_fc:
+            d['net_forecast_gas'] = d['forecast_gas'] * d[nriCol]
+
+        agg_specs = {'oil': ('net_oil', 'sum'), 'gas': ('net_gas', 'sum')}
+        if has_oil_fc:
+            agg_specs['forecast_oil'] = ('net_forecast_oil', 'sum')
+        if has_gas_fc:
+            agg_specs['forecast_gas'] = ('net_forecast_gas', 'sum')
+        daily = d.groupby('date').agg(**agg_specs).reset_index().sort_values('date')
+
+        # If on a given date no well in the fund had a forecast, the merge filled
+        # NaN → sum = 0. That paints a misleading "zero-forecast" point; replace
+        # those with NaN so the chart skips the marker.
+        if has_oil_fc:
+            counts = d.assign(_has=d['forecast_oil'].notna()).groupby('date')['_has'].sum()
+            daily.loc[daily['date'].map(counts) == 0, 'forecast_oil'] = float('nan')
+        if has_gas_fc:
+            counts = d.assign(_has=d['forecast_gas'].notna()).groupby('date')['_has'].sum()
+            daily.loc[daily['date'].map(counts) == 0, 'forecast_gas'] = float('nan')
+
+        return daily
+
+    def _overUnder(fundDaily, stream):
+        fcCol = f'forecast_{stream}'
+        if fcCol not in fundDaily.columns:
+            return None
+        mask = fundDaily[fcCol].notna()
+        if not mask.any():
+            return None
+        actual = float(fundDaily.loc[mask, stream].sum())
+        forecast = float(fundDaily.loc[mask, fcCol].sum())
+        if forecast == 0:
+            return None
+        return (actual - forecast) / forecast, mask.sum()
+
+    ouStyle = ParagraphStyle(
+        'overUnder', parent=body, fontName='Helvetica-Bold', fontSize=11,
+        alignment=1, leading=14,
+    )
+
+    def _overUnderParagraph(result):
+        if result is None:
+            return Paragraph('<i>no forecast data</i>',
+                             ParagraphStyle('ouNa', parent=body, fontSize=9,
+                                            textColor=colors.HexColor('#7F7F7F'),
+                                            alignment=1))
+        pct, ndays = result
+        color = '#2E7D32' if pct >= 0 else '#C62828'
+        arrow = '▲' if pct >= 0 else '▼'
+        return Paragraph(
+            f'<font color="{color}">{arrow} {abs(pct):.1%} '
+            f'<font size="8" color="#595959">vs forecast over {ndays}d</font></font>',
+            ouStyle,
+        )
+
+    # ─── Pass 2: per-fund 30-day actual vs forecast roll-up (page 2+) ───
+    for fundLabel, ctx in fundContexts.items():
+        wiCol, nriCol = ctx['wiCol'], ctx['nriCol']
+        fundDf30 = df30[df30[wiCol] > 0]
+        if fundDf30.empty:
+            continue
+        fundDaily = _fundDailyNet(fundDf30, nriCol)
+        fundOilImg = Image(
+            _lineChartPng(fundDaily, 'oil', 'bbl/d',
+                          f'{fundLabel} — Net Oil (last 30d)'),
+            width=4.5*inch, height=1.95*inch,
+        )
+        fundGasImg = Image(
+            _lineChartPng(fundDaily, 'gas', 'Mcf/d',
+                          f'{fundLabel} — Net Gas (last 30d)'),
+            width=4.5*inch, height=1.95*inch,
+        )
+        oilOU = _overUnderParagraph(_overUnder(fundDaily, 'oil'))
+        gasOU = _overUnderParagraph(_overUnder(fundDaily, 'gas'))
+
+        fundChartRow = Table(
+            [[fundOilImg, fundGasImg],
+             [oilOU,     gasOU]],
+            colWidths=[4.65*inch, 4.65*inch],
+        )
+        fundChartRow.setStyle(TableStyle([
+            ('VALIGN', (0, 0), (-1, 0), 'TOP'),
+            ('VALIGN', (0, 1), (-1, 1), 'MIDDLE'),
+            ('LEFTPADDING', (0, 0), (-1, -1), 0),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+            ('TOPPADDING', (0, 0), (-1, 0), 0),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 2),
+            ('TOPPADDING', (0, 1), (-1, 1), 2),
+            ('BOTTOMPADDING', (0, 1), (-1, 1), 6),
+        ]))
+        story.append(KeepTogether([
+            Paragraph(f"Fund: {fundLabel} — 30-Day Actual vs Forecast (Net)", h3),
+            fundChartRow,
+            Spacer(1, 0.2*inch),
+        ]))
+
+    doc.build(story, onFirstPage=_drawLogo, onLaterPages=_drawLogo)
+    return {
+        'pdfPath': pdfPath,
+        'kpis': {
+            fundLabel: {
+                'oil_avg_bbl_d': v['oil'] / 7,
+                'gas_avg_mcf_d': v['gas'] / 7,
+            }
+            for fundLabel, v in fundTotals.items()
+        },
+    }
+
+
+"""
+Convert Monthly PDS to ComboCurve Monthly Format
+
 """
 
 def pdsMonthlyData(pathToData):

@@ -6,6 +6,7 @@ import shalehavenscripts.production as production
 import shalehavenscripts.combocurve as combocurve
 import shalehavenscripts.dealsheet as dealsheet
 import shalehavenscripts.novi as novi
+import shalehavenscripts.tech as tech
 
 # Imports - General
 import pandas as pd
@@ -25,6 +26,18 @@ warnings.simplefilter(action='ignore', category=UserWarning)
 print("Begin Shalehaven ETL Process")
 
 load_dotenv()  # load enviroment variables
+
+# ─── Production-report email distribution ───
+# Flip to False when ready to send to the full distribution list.
+# To add a recipient: drop their address into .env as SHALEHAVEN_<NAME>_EMAIL,
+# then append the env-var name to PROD_REPORT_RECIPIENT_KEYS.
+PROD_REPORT_TEST_MODE = False
+PROD_REPORT_RECIPIENT_KEYS = [
+    "SHALEHAVEN_MICHAEL_EMAIL",
+    "SHALEHAVEN_GRAHAM_EMAIL",
+    "SHALEHAVEN_NATHAN_EMAIL",
+]
+PROD_REPORT_TEST_RECIPIENT_KEYS = ["SHALEHAVEN_MICHAEL_EMAIL"]
 
 runMode = input("Run deal pipeline only or full script? Enter D for deal pipeline only, F for full script: ").strip().upper()
 while runMode not in ("D", "F"):
@@ -49,6 +62,7 @@ pathToEogData = os.getenv("SHALEHAVEN_EOG_PATH")
 pathToMonthlyPDSData = os.getenv("SHALEHAVEN_MONTHLY_PDS_PATH")
 pathToDatabase = os.getenv("SHALEHAVEN_DATABASE_PATH")
 pathToDealSheet = os.getenv("SHALEHAVEN_DEAL_SHEET_PATH")
+pathToProdPdf = os.getenv("SHALEHAVEN_PROD_PDF_PATH")
 
 if runMode == "D":
     dealsheet.buildDealPipeline(pathToDealSheet) # runs updating the deal sheet
@@ -111,6 +125,43 @@ dailyProductions = combocurve.getDailyProductionFromComboCurve(ccClient, fundWel
 # Get Updated and Original Type Curves from ComboCurve for Shalehaven LP 2024
 updatedTypeCurves = combocurve.getDailyForecastFromComboCurve(ccClient, shalehavenProjectId, shalehavenForcastIdUpdatedTypeCurve, fundWells)
 originalTypeCurves = combocurve.getDailyForecastFromComboCurve(ccClient, shalehavenProjectId, shalehavenForcastIdOriginalTypeCurve, fundWells)
+
+# 7-day net production PDF (by fund → operator → well; forecast = original TC, Admiral Permian falls back to updated TC)
+prodReport = production.buildSevenDayNetProductionPdf(
+    dailyProductions, fundWells, pathToProdPdf,
+    originalTypeCurves=originalTypeCurves,
+    updatedTypeCurves=updatedTypeCurves,
+)
+prodPdfPath = prodReport['pdfPath']
+prodKpis = prodReport['kpis']
+
+# Email the rendered PDF to the distribution list (or just Michael in test mode)
+_recipientKeys = PROD_REPORT_TEST_RECIPIENT_KEYS if PROD_REPORT_TEST_MODE else PROD_REPORT_RECIPIENT_KEYS
+_recipients = [v for v in (os.getenv(k) for k in _recipientKeys) if v]
+if _recipients:
+    _today = pd.Timestamp.now().strftime("%Y-%m-%d")
+    _kpiLines = []
+    for _fund in ("2024 LP", "2025 LP"):
+        _k = prodKpis.get(_fund, {'oil_avg_bbl_d': 0.0, 'gas_avg_mcf_d': 0.0})
+        _kpiLines.append(
+            f"  {_fund}:  Net Oil {_k['oil_avg_bbl_d']:,.1f} bbl/d   "
+            f"|   Net Gas {_k['gas_avg_mcf_d']:,.1f} Mcf/d"
+        )
+    tech.sendEmail(
+        to=_recipients,
+        subject=f"Shalehaven Daily Production Report — {_today}",
+        body=(
+            f"Shalehaven daily production report for {_today} attached.\n\n"
+            f"7-day average net production (per fund):\n"
+            + "\n".join(_kpiLines) + "\n\n"
+            f"Full report includes 30-day net actual vs forecast roll-up by fund.\n\n"
+            f"Generated automatically by the Shalehaven ETL pipeline."
+        ),
+        attachments=[prodPdfPath],
+    )
+    print(f"Sent production report to {len(_recipients)} recipient(s)")
+else:
+    print("Skipping production report email: no recipient addresses found in environment")
 
 # Merge Type Curves Updated and Orginal
 mergedUpdatedTypeCurves = production.mergeProductionWithTypeCurves(dailyProductions,updatedTypeCurves, originalTypeCurves, fundWells, pathToDatabase)

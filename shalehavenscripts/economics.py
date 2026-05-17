@@ -1697,10 +1697,20 @@ def exportEconomicsPDF(econ, pathToAfeSummary, afeData=None, vintageCutoff=None,
             map_permit_pts.append((float(r["Longitude"]), float(r["Latitude"]),
                                     str(r.get("WellName") or r.get("API10") or "AFE")))
 
+    # Plot dots at the surface hole location (SHL) when available, falling back
+    # to the lateral midpoint (MP) for any rows missing SHL coordinates.
     map_offset_pts = []
-    if offsetData is not None and not offsetData.empty and "MPLatitude" in offsetData.columns and "MPLongitude" in offsetData.columns:
-        for _, r in offsetData.dropna(subset=["MPLatitude", "MPLongitude"]).iterrows():
-            map_offset_pts.append((float(r["MPLongitude"]), float(r["MPLatitude"])))
+    if offsetData is not None and not offsetData.empty:
+        has_shl = "SHLLatitude" in offsetData.columns and "SHLLongitude" in offsetData.columns
+        has_mp  = "MPLatitude"  in offsetData.columns and "MPLongitude"  in offsetData.columns
+        for _, r in offsetData.iterrows():
+            lat = lon = None
+            if has_shl and pd.notna(r.get("SHLLatitude")) and pd.notna(r.get("SHLLongitude")):
+                lat, lon = float(r["SHLLatitude"]), float(r["SHLLongitude"])
+            elif has_mp and pd.notna(r.get("MPLatitude")) and pd.notna(r.get("MPLongitude")):
+                lat, lon = float(r["MPLatitude"]), float(r["MPLongitude"])
+            if lat is not None:
+                map_offset_pts.append((lon, lat))
 
     map_wellbore_groups = []
     if wellboreLocationsData is not None and not wellboreLocationsData.empty \

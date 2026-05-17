@@ -13,7 +13,8 @@
       "PowerShell(Get-ChildItem -Path \"C:\\\\Users\\\\Michael Tanner\\\\OneDrive - Shalehaven Energy & Asset Management LLC\\\\Operations - Documents\\\\JIB\\\\Conoco Phillips\" -Recurse -File | ForEach-Object { Write-Output \\($_.FullName + ' [' + $_.Length + ']'\\) })",
       "WebFetch(domain:docs.api.combocurve.com)",
       "Bash(curl -sSL \"https://docs.api.combocurve.com/downloads/combocurve-api.postman_collection.json\" -o /tmp/combocurve-api.json)",
-      "Read(//tmp/**)"
+      "Read(//tmp/**)",
+      "Bash(pip show *)"
     ]
   }
 }
